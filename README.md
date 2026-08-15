@@ -432,7 +432,7 @@ sequenceDiagram
 - `provider` (VARCHAR): 'local' or 'google'
 - `provider_id` (VARCHAR): GoogleのユーザーID
 - `is_admin` (BOOLEAN): 管理者フラグ
-- `status` (VARCHAR): 'active', 'deleted_data' 등
+- `status` (VARCHAR): 'active', 'deleted_data' 
 
 #### app-db (videos, games, static_sitesテーブル)
 - **videosテーブル**
@@ -464,19 +464,31 @@ sequenceDiagram
 #### sfsp-db (files, scan_jobs, scan_resultsテーブル)
 - **filesテーブル**
     - `id` (UUID, PK): ファイルID
-    - `sha256` (VARCHAR, UNIQUE): ファイルのハッシュ値
+    - `filename` (VARCHAR): 元のファイル名
+    - `filesize` (BIGINT): ファイルサイズ
+    - `mime_type` (VARCHAR): MIMEタイプ
+    - `sha256` (VARCHAR): ファイルのハッシュ値 (UNIQUE制約なし)
     - `storage_path` (VARCHAR): MinIO上のパス
+    - `file_type` (VARCHAR): 'video', 'zip' 等のファイル種別
     - `target_service` (VARCHAR): 'stream', 'game', 'static-site'
+    - `created_at` (TIMESTAMPTZ): 作成日時
 - **scan_jobsテーブル**
     - `id` (UUID, PK): ジョブID
     - `file_id` (UUID, FK): `files.id`への参照
-    - `status` (VARCHAR): 'queued', 'running', 'completed', 'failed'
+    - `status` (VARCHAR): 'queued', 'running', 'completed', 'failed', 'invalid'
+    - `processing_details` (TEXT): 処理状況の詳細
+    - `is_cleaned_up` (BOOLEAN): クリーンアップ済みフラグ
+    - `cleaned_up_at` (TIMESTAMPTZ): クリーンアップ日時
+    - `created_at` (TIMESTAMPTZ): 作成日時
+    - `updated_at` (TIMESTAMPTZ): 更新日時
 - **scan_resultsテーブル**
-    - `id` (SERIAL, PK): 結果ID
+    - `id` (UUID, PK): 結果ID
     - `job_id` (UUID, FK): `scan_jobs.id`への参照
     - `scanner` (VARCHAR): 'clamav', 'yara'
-    - `result` (VARCHAR): 'clean', 'malicious', 'suspicious', 'error'
+    - `result` (VARCHAR): 'clean', 'suspicious', 'malicious', 'error'
     - `details` (TEXT): スキャン結果詳細
+    - `raw_output` (JSONB): スキャナの生出力
+    - `scanned_at` (TIMESTAMPTZ): スキャン実行日時
 
 ### APIエンドポイント仕様
 
