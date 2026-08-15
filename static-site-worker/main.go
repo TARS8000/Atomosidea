@@ -15,9 +15,7 @@ import (
 
 	"github.com/atmosidea/shared/config" // shared/config をインポート
 	"github.com/atmosidea/shared/event"  // shared/event をインポート
-	// "github.com/atmosidea/shared/model"  // shared/model をインポート (未使用のため削除)
 	"github.com/atmosidea/shared/queue"  // shared/queue をインポート
-	// "github.com/go-redis/redis/v8" // redis/v8 を使用 (未使用のため削除)
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq" // PostgreSQL driver
 	"github.com/minio/minio-go/v7"
@@ -195,9 +193,32 @@ func processStaticSiteJob(siteID string, event event.ScanCompletionEvent) {
 	defer os.RemoveAll(unzipPath)
 
 	updateProcessingStatus(siteID, "processing", "クリーンなファイルをダウンロード中...")
-	sfspObjectName := fmt.Sprintf("%s/%s", event.SHA256, event.Filename)
-	if err := sfspMinioClient.FGetObject(ctx, sfspBucketName, sfspObjectName, tempZipPath, minio.GetObjectOptions{}); err != nil {
-		updateProcessingStatus(siteID, "error", fmt.Sprintf("Failed to download clean file from SFSP MinIO: %v", err))
+
+	// --- 修正箇所: FileID / SHA256 の柔軟なダウンロード対応 ---
+	fileIDStr := fmt.Sprintf("%v", event.FileID)
+	sfspObjectName := fmt.Sprintf("%s/%s", fileIDStr, event.Filename)
+
+	// 1st Attempt: FileID/Filename (標準のSFSPパス)
+	downloadErr := sfspMinioClient.FGetObject(ctx, sfspBucketName, sfspObjectName, tempZipPath, minio.GetObjectOptions{})
+	if downloadErr != nil {
+		logger.Warnf("[SiteID: %s] Failed to download with FileID path (%s): %v. Trying SHA256 path...", siteID, sfspObjectName, downloadErr)
+
+		// 2nd Attempt: SHA256/Filename
+		if event.SHA256 != "" {
+			shaObjectName := fmt.Sprintf("%s/%s", event.SHA256, event.Filename)
+			downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, shaObjectName, tempZipPath, minio.GetObjectOptions{})
+		}
+
+		// 3rd Attempt: Raw Filename
+		if downloadErr != nil {
+			logger.Warnf("[SiteID: %s] Trying raw filename %s...", siteID, event.Filename)
+			downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, event.Filename, tempZipPath, minio.GetObjectOptions{})
+		}
+	}
+
+	if downloadErr != nil {
+		updateProcessingStatus(siteID, "error", fmt.Sprintf("Failed to download clean file from SFSP MinIO: %v", downloadErr))
+		logger.Errorf("[SiteID: %s] ERROR: Download from SFSP failed after retries: %v", siteID, downloadErr)
 		return
 	}
 

@@ -85,7 +85,7 @@ const UploadGamePage = () => {
   return (
     <Container maxWidth="sm">
       <Typography variant="h4" component="h1" gutterBottom>
-        ゲームをアップロード
+        ゲームをアップロード(Unity WebGL版のみ)
       </Typography>
       <form onSubmit={handleSubmit}>
         <Box mb={2}>

@@ -17,9 +17,7 @@ import (
 
 	"github.com/atmosidea/shared/config" // shared/config をインポート
 	"github.com/atmosidea/shared/event"  // shared/event をインポート
-	// "github.com/atmosidea/shared/model"  // shared/model をインポート (未使用のため削除)
 	"github.com/atmosidea/shared/queue"  // shared/queue をインポート
-	// "github.com/go-redis/redis/v8" // redis/v8 を使用 (未使用のため削除)
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -27,14 +25,14 @@ import (
 )
 
 var (
-	db               *pgxpool.Pool
-	gameMinioClient  *minio.Client // For uploading final game assets
-	sfspMinioClient  *minio.Client // For downloading the clean file from SFSP
-	gameBucketName   string
-	sfspBucketName   = "clean-files" // Hardcoded as per SFSP design
-	tempDir          = "./temp"
-	appURL           *url.URL
-	logger           *zap.SugaredLogger // logger を追加
+	db              *pgxpool.Pool
+	gameMinioClient *minio.Client // For uploading final game assets
+	sfspMinioClient *minio.Client // For downloading the clean file from SFSP
+	gameBucketName  string
+	sfspBucketName  = "clean-files" // Hardcoded as per SFSP design
+	tempDir         = "./temp"
+	appURL          *url.URL
+	logger          *zap.SugaredLogger // logger を追加
 )
 
 func main() {
@@ -147,7 +145,7 @@ func main() {
 	}
 }
 
-func processGame(ctx context.Context, event *event.ScanCompletionEvent) { // shared/event.ScanCompletionEvent を使用
+func processGame(ctx context.Context, event *event.ScanCompletionEvent) {
 	// Find the game record using the SFSP job ID
 	var gameID string
 	err := db.QueryRow(ctx, "SELECT id FROM games WHERE sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&gameID)
@@ -176,13 +174,34 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) { // sha
 	defer os.Remove(localZipPath)
 	defer os.RemoveAll(unzipPath)
 
-	// Download the clean file from SFSP's clean-files bucket
-	sfspObjectName := fmt.Sprintf("%s/%s", event.SHA256, event.Filename)
+	// --- 修正箇所: FileID / SHA256 の柔軟な指定に対応 ---
+	fileIDStr := fmt.Sprintf("%v", event.FileID)
+	sfspObjectName := fmt.Sprintf("%s/%s", fileIDStr, event.Filename)
+
 	logger.Infof("[GameID: %s] Downloading %s from SFSP MinIO bucket '%s'...", gameID, sfspObjectName, sfspBucketName)
 	updateGameStatus(ctx, gameID, "processing", "クリーンなゲームファイルをダウンロード中...")
-	if err := sfspMinioClient.FGetObject(ctx, sfspBucketName, sfspObjectName, localZipPath, minio.GetObjectOptions{}); err != nil {
-		updateGameStatus(ctx, gameID, "error", fmt.Sprintf("Failed to download clean file from SFSP MinIO: %v", err))
-		logger.Errorf("[GameID: %s] ERROR: Download from SFSP failed: %v", gameID, err)
+
+	// 1st Attempt: FileID/Filename (標準のSFSPパス)
+	downloadErr := sfspMinioClient.FGetObject(ctx, sfspBucketName, sfspObjectName, localZipPath, minio.GetObjectOptions{})
+	if downloadErr != nil {
+		logger.Warnf("[GameID: %s] Failed to download with FileID path (%s): %v. Trying SHA256 path...", gameID, sfspObjectName, downloadErr)
+
+		// 2nd Attempt: SHA256/Filename
+		if event.SHA256 != "" {
+			shaObjectName := fmt.Sprintf("%s/%s", event.SHA256, event.Filename)
+			downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, shaObjectName, localZipPath, minio.GetObjectOptions{})
+		}
+
+		// 3rd Attempt: Raw Filename
+		if downloadErr != nil {
+			logger.Warnf("[GameID: %s] Trying raw filename %s...", gameID, event.Filename)
+			downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, event.Filename, localZipPath, minio.GetObjectOptions{})
+		}
+	}
+
+	if downloadErr != nil {
+		updateGameStatus(ctx, gameID, "error", fmt.Sprintf("Failed to download clean file from SFSP MinIO: %v", downloadErr))
+		logger.Errorf("[GameID: %s] ERROR: Download from SFSP failed after retries: %v", gameID, downloadErr)
 		return
 	}
 	logger.Infof("[GameID: %s] Downloaded clean file to %s", gameID, localZipPath)
@@ -220,8 +239,8 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) { // sha
 		return
 	}
 
-	// publicPathPrefix の定義を、使用される最初の場所よりも前に移動
-	publicPathPrefix := fmt.Sprintf("%s/", gameID) // ここに移動
+	// publicPathPrefix の定義
+	publicPathPrefix := fmt.Sprintf("%s/", gameID)
 
 	hostParts := strings.Split(appURL.Host, ":")
 	domain := hostParts[0]
