@@ -432,7 +432,7 @@ sequenceDiagram
 - `provider` (VARCHAR): 'local' or 'google'
 - `provider_id` (VARCHAR): GoogleのユーザーID
 - `is_admin` (BOOLEAN): 管理者フラグ
-- `status` (VARCHAR): 'active', 'deleted_data' 등
+- `status` (VARCHAR): 'active', 'deleted_data' 
 
 #### app-db (videos, games, static_sitesテーブル)
 - **videosテーブル**
