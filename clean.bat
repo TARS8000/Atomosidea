@@ -13,13 +13,13 @@ docker compose down -v --remove-orphans
 echo.
 
 echo Step 2: Removing named data volumes...
-rem プロジェクトのプレフィックス（atomosidea_ 等）がついている想定です
-rem ※もしエラーが出ても、Step 1で消えていれば問題ありません
+rem Assumes a project prefix like "atomosidea_"
+rem * Don't worry if this step errors; Step 1 may have already removed the volumes
 docker volume rm atomosidea_postgres_data atomosidea_minio_data --force
 echo.
 
 echo Step 3: Removing Docker images for this project...
-rem プロジェクト名を atomosidea に変更しています
+rem Changed project name to "atomosidea"
 docker image prune -a --force --filter "label=com.docker.compose.project=atomosidea"
 echo.
 

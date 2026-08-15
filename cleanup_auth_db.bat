@@ -5,45 +5,45 @@ powershell -command "Write-Host '===============================================
 powershell -command "Write-Host '=           Auth DB Cleanup Script            ='"
 powershell -command "Write-Host '================================================='"
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'このスクリプトは、認証データベース (auth-db) に関連付けられた'"
-powershell -command "Write-Host 'Dockerボリュームを完全に削除します。これにより、すべてのユーザーアカウント、'"
-powershell -command "Write-Host '認証トークン、および関連する個人情報が失われます。'"
+powershell -command "Write-Host 'This script will permanently delete the Docker volume associated'"
+powershell -command "Write-Host 'with the authentication database (auth-db). This will result in the loss'"
+powershell -command "Write-Host 'of all user accounts, authentication tokens, and related personal information.'"
 powershell -command "Write-Host ''"
-powershell -command "Write-Host '警告: この操作は元に戻せません。'"
-powershell -command "Write-Host '他のデータベースレコードやMinIOストレージは更新されません。'"
+powershell -command "Write-Host 'Warning: This action is irreversible.'"
+powershell -command "Write-Host 'It does not update other database records or MinIO storage.'"
 powershell -command "Write-Host ''"
-powershell -command "Write-Host '重要: このスクリプトを実行する前に、すべてのDockerコンテナが停止していることを'"
-powershell -command "Write-Host '確認してください。(例: ''stop.bat'' または ''docker-compose down'' を実行)'"
+powershell -command "Write-Host 'Important: Before running this script, ensure all Docker containers are stopped.'"
+powershell -command "Write-Host '           (e.g., run ''stop.bat'' or ''docker-compose down'')'"
 powershell -command "Write-Host ''"
 
 where docker >nul 2>&1
 if %errorlevel% neq 0 (
-    powershell -command "Write-Host 'エラー: Dockerコマンドが見つかりません。Dockerがインストールされ、PATHに追加されていることを確認してください。'"
+    powershell -command "Write-Host 'Error: Docker command not found. Please ensure Docker is installed and in your PATH.'"
     pause
     goto :eof
 )
 
-set /p "are_you_sure=認証DBのDockerボリュームを削除してもよろしいですか？ (y/n): "
+set /p "are_you_sure=Are you sure you want to delete the Auth DB Docker volume? (y/n): "
 if /i not "%are_you_sure%"=="y" (
-    powershell -command "Write-Host 'クリーンアップはキャンセルされました。'"
+    powershell -command "Write-Host 'Cleanup canceled.'"
     pause
     goto :eof
 )
 
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'Dockerボリューム ''atomosidea_auth_db_data'' を削除しています...'"
+powershell -command "Write-Host 'Deleting Docker volume ''atomosidea_auth_db_data''...'"
 docker volume rm atomosidea_auth_db_data
 
 if %errorlevel% equ 0 (
-    powershell -command "Write-Host '  -> Dockerボリューム ''atomosidea_auth_db_data'' が削除されました。'"
-    powershell -command "Write-Host '     次回 ''docker-compose up'' を実行すると、再作成され初期化されます。'"
+    powershell -command "Write-Host '  -> Docker volume ''atomosidea_auth_db_data'' has been deleted.'"
+    powershell -command "Write-Host '     It will be recreated and initialized the next time you run ''docker-compose up''.'"
 ) else (
-    powershell -command "Write-Host '  -> Dockerボリューム ''atomosidea_auth_db_data'' の削除に失敗しました。'"
-    powershell -command "Write-Host '     Dockerが実行されており、ボリュームが存在することを確認してください。'"
+    powershell -command "Write-Host '  -> Failed to delete Docker volume ''atomosidea_auth_db_data''.'"
+    powershell -command "Write-Host '     Please ensure Docker is running and the volume exists.'"
 )
 
 powershell -command "Write-Host ''"
 powershell -command "Write-Host '================================================='"
-powershell -command "Write-Host '=           Auth DB クリーンアップ完了!           ='"
+powershell -command "Write-Host '=           Auth DB Cleanup Complete!           ='"
 powershell -command "Write-Host '================================================='"
 pause
