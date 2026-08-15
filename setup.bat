@@ -76,14 +76,14 @@ move /Y .env.tmp .env
 echo .env file created successfully.
 
 echo Building Docker images...
-docker-compose build
+docker compose build
 if %errorlevel% neq 0 (
     echo Docker image build failed. Exiting.
     exit /b %errorlevel%
 )
 
 echo Starting Docker services...
-docker-compose up -d
+docker compose up -d
 if %errorlevel% neq 0 (
     echo Docker services failed to start. Exiting.
     exit /b %errorlevel%
@@ -106,7 +106,7 @@ echo Static Site Storage:       http://localhost:9005
 echo SFSP MinIO:                http://localhost:9011
 echo -------------------------------------------------------------------
 echo.
-echo You can check the status of your services with "docker-compose ps".
+echo You can check the status of your services with "docker compose ps".
 
 endlocal
 pause
