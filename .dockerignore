@@ -1,0 +1,40 @@
+# Git files
+.git
+.gitignore
+
+# IDE files
+.idea
+
+# Node.js dependencies
+node_modules
+
+# Temporary files and directories
+tmp
+temp
+
+# Build outputs
+dist
+build
+coverage
+
+# Local environment files
+#.env # コメントアウト
+
+# Large media files and test samples
+# These should be managed by runtime volumes, not embedded in images.
+uploads
+videos
+security/test-samples
+security/reports
+game_storage_db
+profile_storage_db
+static_site_storage_db
+video_storage_db
+
+# Specific media file extensions
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.zip

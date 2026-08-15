@@ -1,0 +1,20 @@
+# IDE - specific
+.idea/
+.vscode/
+*.iml
+
+# Dependencies
+node_modules/
+
+# Local Storage (Docker volumes for MinIO and PostgreSQL data)
+video_storage_data/
+game_storage_data/
+profile_storage_data/
+static_site_storage_data/
+sfsp_db_data/
+sfsp_minio_data/
+auth_db_data/
+app_db_data/
+
+# Environment files
+.env
