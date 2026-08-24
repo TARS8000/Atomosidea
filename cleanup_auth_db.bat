@@ -31,14 +31,18 @@ if /i not "%are_you_sure%"=="y" (
 )
 
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'Deleting Docker volume ''atomosidea_auth_db_data''...'"
-docker volume rm atomosidea_auth_db_data
+
+rem Actual Docker volume name (all lowercase)
+set VOLUME_NAME=atomosidea-master_auth_db_data
+
+powershell -command "Write-Host 'Deleting Docker volume ''%VOLUME_NAME%''...'"
+docker volume rm %VOLUME_NAME%
 
 if %errorlevel% equ 0 (
-    powershell -command "Write-Host '  -> Docker volume ''atomosidea_auth_db_data'' has been deleted.'"
+    powershell -command "Write-Host '  -> Docker volume ''%VOLUME_NAME%'' has been deleted.'"
     powershell -command "Write-Host '     It will be recreated and initialized the next time you run ''docker-compose up''.'"
 ) else (
-    powershell -command "Write-Host '  -> Failed to delete Docker volume ''atomosidea_auth_db_data''.'"
+    powershell -command "Write-Host '  -> Failed to delete Docker volume ''%VOLUME_NAME%''.'"
     powershell -command "Write-Host '     Please ensure Docker is running and the volume exists.'"
 )
 
