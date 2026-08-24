@@ -1,0 +1,865 @@
+services:
+  # ==========================================
+  # Database Services (内部接続のみ)
+  # ==========================================
+  auth-db:
+    image: postgres:16
+    container_name: atmosidea-auth-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: auth_db
+      AUTH_SERVICE_DB_PASSWORD: ${AUTH_SERVICE_DB_PASSWORD}
+      MYPAGE_SERVICE_DB_PASSWORD: ${MYPAGE_SERVICE_DB_PASSWORD}
+    command:
+      - "postgres"
+      - "-c"
+      - "custom.auth_service_db_password=${AUTH_SERVICE_DB_PASSWORD}"
+      - "-c"
+      - "custom.mypage_service_db_password=${MYPAGE_SERVICE_DB_PASSWORD}"
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+      - ./auth-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - backend-db-network
+
+  app-db:
+    image: postgres:16
+    container_name: atmosidea-app-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: app_db
+    volumes:
+      - app_db_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - backend-db-network
+
+  profile-db:
+    image: postgres:16
+    container_name: atmosidea-profile-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: profile_db
+    volumes:
+      - profile_db_data:/var/lib/postgresql/data
+      - ./profile-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - backend-db-network
+
+  sfsp-db:
+    image: postgres:16
+    container_name: sfsp-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: sfsp_db
+    volumes:
+      - sfsp_db_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    networks:
+      - backend-db-network
+      - sfsp-isolated-net
+
+  # ==========================================
+  # Cache Service (内部接続のみ)
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: atmosidea-redis
+    restart: always
+    networks:
+      - atmosidea-network
+      - sfsp-isolated-net
+
+  # ==========================================
+  # Storage Services (内部接続のみ)
+  # ==========================================
+  static-site-storage:
+    image: minio/minio:latest
+    container_name: atmosidea-static-site-storage
+    restart: always
+    command: server /data --console-address ":9001"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+    volumes:
+      - ./static_site_storage_data:/data
+    networks:
+      - atmosidea-network
+
+  video-storage:
+    image: minio/minio:latest
+    container_name: atmosidea-video-storage
+    restart: always
+    command: server /data --console-address ":9003"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
+    volumes:
+      - ./video_storage_data:/data
+    networks:
+      - atmosidea-network
+
+  profile-storage:
+    image: minio/minio:latest
+    container_name: atmosidea-profile-storage
+    restart: always
+    command: server /data --console-address ":9005"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${PROFILE_MINIO_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
+    volumes:
+      - ./profile_storage_data:/data
+    networks:
+      - atmosidea-network
+
+  game-storage:
+    image: minio/minio:latest
+    container_name: atmosidea-game-storage
+    restart: always
+    command: server /data --console-address ":9007"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${GAME_MINIO_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${GAME_MINIO_SECRET_ACCESS_KEY}
+    volumes:
+      - ./game_storage_data:/data
+    networks:
+      - atmosidea-network
+
+  sfsp-raw-minio:
+    image: minio/minio:latest
+    container_name: sfsp-raw-minio
+    restart: always
+    command: server /data --console-address ":9009"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
+    volumes:
+      - ./sfsp_raw_minio_data:/data
+    networks:
+      - sfsp-isolated-net
+
+  sfsp-clean-minio:
+    image: minio/minio:latest
+    container_name: sfsp-clean-minio
+    restart: always
+    command: server /data --console-address ":9011"
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${SFSP_CLEAN_MINIO_ROOT_SECRET_KEY}
+    volumes:
+      - ./sfsp_clean_minio_data:/data
+    networks:
+      - sfsp-isolated-net
+
+  # ==========================================
+  # MinIO バケット自動初期化サービス
+  # ==========================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: atmosidea-minio-init
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      PROFILE_MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
+      PROFILE_MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
+      GAME_MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
+      GAME_MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
+      STATIC_SITE_MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
+      STATIC_SITE_MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
+      VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
+      SFSP_RAW_MINIO_ROOT_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
+      SFSP_RAW_MINIO_ROOT_SECRET_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY: ${SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_ROOT_SECRET_KEY: ${SFSP_CLEAN_MINIO_ROOT_SECRET_KEY}
+      SFSP_UPLOAD_ACCESS_KEY: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_UPLOAD_SECRET_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_API_ACCESS_KEY: ${SFSP_API_ACCESS_KEY}
+      SFSP_API_SECRET_KEY: ${SFSP_API_SECRET_KEY}
+      SFSP_GAME_WORKER_ACCESS_KEY: ${SFSP_GAME_WORKER_ACCESS_KEY}
+      SFSP_GAME_WORKER_SECRET_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
+      SFSP_STATIC_SITE_WORKER_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
+      SFSP_STATIC_SITE_WORKER_SECRET_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
+      SFSP_WORKER_RAW_ACCESS_KEY: ${SFSP_WORKER_RAW_ACCESS_KEY}
+      SFSP_WORKER_RAW_SECRET_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
+      SFSP_WORKER_CLEAN_ACCESS_KEY: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
+      SFSP_WORKER_CLEAN_SECRET_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
+    depends_on:
+      profile-storage:
+        condition: service_started
+      game-storage:
+        condition: service_started
+      static-site-storage:
+        condition: service_started
+      video-storage:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+    entrypoint: |
+      /bin/sh -c "
+      echo 'Waiting for MinIO services...';
+      until mc alias set profile http://profile-storage:9000 \"$PROFILE_MINIO_ACCESS_KEY_ID\" \"$PROFILE_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
+      until mc alias set game http://game-storage:9000 \"$GAME_MINIO_ACCESS_KEY_ID\" \"$GAME_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
+      until mc alias set staticsite http://static-site-storage:9000 \"$STATIC_SITE_MINIO_ACCESS_KEY_ID\" \"$STATIC_SITE_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
+      until mc alias set videostorage http://video-storage:9000 \"${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}\" \"${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}\"; do sleep 1; done;
+      until mc alias set sfsp-raw http://sfsp-raw-minio:9000 \"$SFSP_RAW_MINIO_ROOT_ACCESS_KEY\" \"$SFSP_RAW_MINIO_ROOT_SECRET_KEY\"; do sleep 1; done;
+      until mc alias set sfsp-clean http://sfsp-clean-minio:9000 \"$SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY\" \"$SFSP_CLEAN_MINIO_ROOT_SECRET_KEY\"; do sleep 1; done;
+
+      set -e;
+
+      echo 'Creating buckets...';
+      mc mb --ignore-existing profile/user-profiles;
+      mc anonymous set download profile/user-profiles;
+      mc mb --ignore-existing game/games;
+      mc anonymous set download game/games;
+      mc mb --ignore-existing staticsite/static-sites;
+      mc anonymous set download staticsite/static-sites;
+      mc mb --ignore-existing videostorage/videos;
+      mc mb --ignore-existing videostorage/thumbnails;
+      mc anonymous set download videostorage/videos;
+      mc anonymous set download videostorage/thumbnails;
+
+      mc mb --ignore-existing sfsp-raw/raw-files;
+      mc mb --ignore-existing sfsp-clean/clean-files;
+      mc mb --ignore-existing sfsp-clean/quarantine;
+
+      echo 'Creating and updating policies...';
+      mc admin policy create sfsp-raw sfsp-upload-policy /tmp/sfsp-upload-policy.json;
+      mc admin policy create sfsp-clean sfsp-api-policy /tmp/sfsp-api-policy.json;
+      mc admin policy create sfsp-clean sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
+      mc admin policy create sfsp-clean sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
+      mc admin policy create sfsp-raw sfsp-worker-raw-policy /tmp/sfsp-worker-raw-policy.json;
+      mc admin policy create sfsp-clean sfsp-worker-clean-policy /tmp/sfsp-worker-clean-policy.json;
+
+      echo 'Creating users and attaching policies...';
+      mc admin user add sfsp-raw \"$SFSP_UPLOAD_ACCESS_KEY\" \"$SFSP_UPLOAD_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-raw sfsp-upload-policy --user=\"$SFSP_UPLOAD_ACCESS_KEY\" || true;
+
+      mc admin user add sfsp-clean \"$SFSP_API_ACCESS_KEY\" \"$SFSP_API_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-clean sfsp-api-policy --user=\"$SFSP_API_ACCESS_KEY\" || true;
+
+      mc admin user add sfsp-clean \"$SFSP_GAME_WORKER_ACCESS_KEY\" \"$SFSP_GAME_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-clean sfsp-game-worker-policy --user=\"$SFSP_GAME_WORKER_ACCESS_KEY\" || true;
+
+      mc admin user add sfsp-clean \"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" \"$SFSP_STATIC_SITE_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-clean sfsp-static-site-worker-policy --user=\"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" || true;
+
+      mc admin user add sfsp-raw \"$SFSP_WORKER_RAW_ACCESS_KEY\" \"$SFSP_WORKER_RAW_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-raw sfsp-worker-raw-policy --user=\"$SFSP_WORKER_RAW_ACCESS_KEY\" || true;
+
+      mc admin user add sfsp-clean \"$SFSP_WORKER_CLEAN_ACCESS_KEY\" \"$SFSP_WORKER_CLEAN_SECRET_KEY\" || true;
+      mc admin policy attach sfsp-clean sfsp-worker-clean-policy --user=\"$SFSP_WORKER_CLEAN_ACCESS_KEY\" || true;
+
+      echo 'All MinIO buckets and SFSP policies/users initialized successfully!';
+      "
+    volumes:
+      - ./minio-init/sfsp-upload-policy.json:/tmp/sfsp-upload-policy.json:ro
+      - ./minio-init/sfsp-api-policy.json:/tmp/sfsp-api-policy.json:ro
+      - ./minio-init/sfsp-game-worker-policy.json:/tmp/sfsp-game-worker-policy.json:ro
+      - ./minio-init/sfsp-static-site-worker-policy.json:/tmp/sfsp-static-site-worker-policy.json:ro
+      - ./minio-init/sfsp-worker-raw-policy.json:/tmp/sfsp-worker-raw-policy.json:ro
+      - ./minio-init/sfsp-worker-clean-policy.json:/tmp/sfsp-worker-clean-policy.json:ro
+    networks:
+      - atmosidea-network
+      - sfsp-isolated-net
+
+  # ==========================================
+  # Application Services & Microservices
+  # ==========================================
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        CACHE_BUSTER: ${CACHE_BUSTER}
+        VITE_STATIC_SITE_DOMAIN: ${STATIC_SITE_DOMAIN}
+    container_name: atmosidea-frontend
+    restart: always
+    ports:
+      - "3001:80"
+    volumes:
+      - ./video_storage_data/videos:/storage/videos:ro
+      - ./video_storage_data/thumbnails:/storage/thumbnails:ro
+      - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      auth-service:
+        condition: service_started
+      upload-service:
+        condition: service_started
+      stream-service:
+        condition: service_started
+      game-upload-api:
+        condition: service_started
+      mypage-service:
+        condition: service_started
+      profile-service:
+        condition: service_started
+      static-site-upload-api:
+        condition: service_started
+    networks:
+      - atmosidea-network
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    container_name: atmosidea-auth-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      auth-db:
+        condition: service_started
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      profile-storage:
+        condition: service_started
+      game-storage:
+        condition: service_started
+      static-site-storage:
+        condition: service_started
+      profile-service:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      PROFILE_SERVICE_URL: "http://profile-service:8084"
+      DATABASE_URL: "postgres://auth_service_user:${AUTH_SERVICE_DB_PASSWORD}@auth-db:5432/auth_db?sslmode=disable"
+      APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      APP_URL: ${APP_URL}
+      ADMIN_REGISTRATION_CODE: ${ADMIN_REGISTRATION_CODE}
+      MINIO_ENDPOINT: profile-storage:9000
+      PROFILE_MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
+      PROFILE_MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
+      GAME_MINIO_ENDPOINT: game-storage:9000
+      GAME_MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
+      GAME_MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
+      STATIC_SITE_MINIO_ENDPOINT: static-site-storage:9000
+      STATIC_SITE_MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
+      STATIC_SITE_MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+    networks:
+      - atmosidea-network
+      - backend-db-network
+
+  profile-service:
+    build:
+      context: .
+      dockerfile: profile-service/Dockerfile
+    container_name: atmosidea-profile-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      profile-db:
+        condition: service_started
+      profile-storage:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@profile-db:5432/profile_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+      MINIO_ENDPOINT: profile-storage:9000
+      MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
+      MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
+      MINIO_BUCKET_NAME: user-profiles
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+    networks:
+      - atmosidea-network
+      - backend-db-network
+
+  upload-service:
+    build:
+      context: .
+      dockerfile: upload-service/Dockerfile
+    container_name: atmosidea-upload-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      video-storage:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      sfsp-api:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+      UPLOAD_DIR: /storage/videos
+      THUMBNAIL_DIR: /storage/thumbnails
+      VIDEO_MINIO_ENDPOINT: video-storage:9000
+      VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
+      VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
+      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      SFSP_API_URL: http://sfsp-api:8080
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./video_storage_data/videos:/storage/videos
+      - ./video_storage_data/thumbnails:/storage/thumbnails
+    networks:
+      - atmosidea-network
+      - backend-db-network
+      - sfsp-isolated-net
+
+  stream-service:
+    build:
+      context: .
+      dockerfile: stream-service/Dockerfile
+    container_name: atmosidea-stream-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      video-storage:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      UPLOAD_DIR: /storage/videos
+      VIDEO_MINIO_ENDPOINT: video-storage:9000
+      VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
+      VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
+    volumes:
+      - ./video_storage_data/videos:/storage/videos:ro
+    networks:
+      - atmosidea-network
+      - backend-db-network
+
+  game-upload-api:
+    build:
+      context: .
+      dockerfile: game-upload-api/Dockerfile
+    container_name: atmosidea-game-upload-api
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      game-storage:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      sfsp-api:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+      MINIO_ENDPOINT: game-storage:9000
+      MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
+      MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
+      MINIO_BUCKET_NAME: games
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      SFSP_API_URL: http://sfsp-api:8080
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+    networks:
+      - atmosidea-network
+      - backend-db-network
+      - sfsp-isolated-net
+
+  game-worker:
+    build:
+      context: .
+      dockerfile: game-worker/Dockerfile
+    container_name: atmosidea-game-worker
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      game-storage:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      MINIO_ENDPOINT: game-storage:9000
+      MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
+      MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
+      MINIO_BUCKET_NAME: games
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      APP_URL: ${APP_URL}
+    networks:
+      - atmosidea-network
+      - backend-db-network
+      - sfsp-isolated-net
+
+  static-site-upload-api:
+    build:
+      context: .
+      dockerfile: static-site-upload-api/Dockerfile
+    container_name: atmosidea-static-site-upload-api
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      static-site-storage:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      sfsp-api:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+      MINIO_ENDPOINT: static-site-storage:9000
+      MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
+      MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      MINIO_BUCKET_NAME: static-sites
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      SFSP_API_URL: http://sfsp-api:8080
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+    networks:
+      - atmosidea-network
+      - backend-db-network
+      - sfsp-isolated-net
+
+  static-site-worker:
+    build:
+      context: .
+      dockerfile: static-site-worker/Dockerfile
+    container_name: atmosidea-static-site-worker
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      static-site-storage:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      MINIO_ENDPOINT: static-site-storage:9000
+      MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
+      MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      MINIO_BUCKET_NAME: static-sites
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      APP_URL: ${APP_URL}
+    networks:
+      - atmosidea-network
+      - backend-db-network
+      - sfsp-isolated-net
+
+  mypage-service:
+    build:
+      context: .
+      dockerfile: mypage-service/Dockerfile
+    container_name: atmosidea-mypage-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      auth-db:
+        condition: service_started
+      app-db:
+        condition: service_started
+    environment:
+      AUTH_DATABASE_URL: "postgres://mypage_service_user:${MYPAGE_SERVICE_DB_PASSWORD}@auth-db:5432/auth_db?sslmode=disable"
+      APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+    networks:
+      - atmosidea-network
+      - backend-db-network
+
+  # ==========================================
+  # Security (SFSP Services)
+  # ==========================================
+  sfsp-api:
+    build:
+      context: .
+      dockerfile: security/docker/api/Dockerfile
+    container_name: sfsp-api
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      sfsp-db:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
+
+      # RAW MinIO 設定 (ROOT 権限キーに変更)
+      SFSP_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
+
+      # Clean MinIO 設定
+      SFSP_CLEAN_MINIO_ENDPOINT: "sfsp-clean-minio:9000"
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_API_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_API_SECRET_KEY}
+
+      SFSP_MINIO_USE_SSL: "false"
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+      SFSP_MINIO_BUCKET_RAW_FILES: raw-files
+      SFSP_MINIO_BUCKET_CLEAN_FILES: clean-files
+      SFSP_MINIO_BUCKET_QUARANTINE: quarantine
+    networks:
+      - sfsp-isolated-net
+      - backend-db-network
+
+  sfsp-worker:
+    build:
+      context: .
+      dockerfile: security/docker/worker/Dockerfile
+    container_name: sfsp-worker
+    restart: always
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    depends_on:
+      sfsp-db:
+        condition: service_started
+      app-db:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      redis:
+        condition: service_started
+      sfsp-clamav-client:
+        condition: service_started
+      sfsp-yara-client:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
+      APP_DATABASE_URL: "postgres://${SFSP_WORKER_DB_USER:-sfsp_worker}:${SFSP_WORKER_DB_PASSWORD:-sfsp_worker_password}@app-db:5432/app_db?sslmode=disable"
+
+      # デフォルトエンドポイントを sfsp-raw-minio:9000 に指定
+      SFSP_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_RAW_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
+
+      # Explicit source (raw) and destination (clean) endpoints
+      SFSP_RAW_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_CLEAN_MINIO_ENDPOINT: "sfsp-clean-minio:9000"
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_RAW_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+      DOCKER_HOST: unix:///var/run/docker.sock
+      SFSP_SCANNER_CLAMAV_IMAGE: "${SFSP_SCANNER_CLAMAV_IMAGE:-sfsp-clamav-client:latest}"
+      SFSP_SCANNER_YARA_IMAGE: "${SFSP_SCANNER_YARA_IMAGE:-sfsp-yara-client:latest}"
+      SFSP_SCANNER_YARA_RULES_PATH: "${SFSP_SCANNER_YARA_RULES_PATH:-/etc/yara-rules/general.yar}"
+      SFSP_SCAN_VOLUME_NAME: sfsp_temp_scan
+      SFSP_MINIO_BUCKET_RAW_FILES: raw-files
+      SFSP_MINIO_BUCKET_CLEAN_FILES: clean-files
+      SFSP_MINIO_BUCKET_QUARANTINE: quarantine
+    volumes:
+      - ./.env:/app/.env:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./security/yara-rules:/etc/yara-rules:ro
+      - sfsp_temp_scan:/tmp/sfsp-scan
+    networks:
+      - sfsp-isolated-net
+      - backend-db-network
+
+  sfsp-clamav-client:
+    build:
+      context: .
+      dockerfile: security/docker/clamav-client/Dockerfile
+    image: sfsp-clamav-client:latest
+    container_name: sfsp-clamav-client-builder
+    restart: "no"
+    command: ["echo", "ClamAV client image built"]
+
+  sfsp-yara-client:
+    build:
+      context: .
+      dockerfile: security/docker/yara-client/Dockerfile
+    image: sfsp-yara-client:latest
+    container_name: sfsp-yara-client-builder
+    restart: "no"
+    command: ["echo", "YARA client image built"]
+
+# ==========================================
+# Networks & Volumes
+# ==========================================
+networks:
+  atmosidea-network:
+    driver: bridge
+    name: atmosidea-network
+  backend-db-network:
+    driver: bridge
+    name: backend-db-network
+  sfsp-isolated-net:
+    driver: bridge
+    name: sfsp-isolated-net
+
+volumes:
+  sfsp_temp_scan:
+    name: sfsp_temp_scan
+  auth_db_data:
+  app_db_data:
+  profile_db_data:
+  sfsp_db_data:

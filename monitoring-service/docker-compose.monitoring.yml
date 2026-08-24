@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  mon-nginx:
+    image: nginx:alpine
+    container_name: mon-nginx
+    restart: always
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/var/www/html:ro # mon-frontendによって生成されるホストのdistディレクトリをマウント
+    depends_on:
+      - mon-backend
+      - mon-frontend # mon-frontendのビルドが完了してから起動
+    networks:
+      - monitoring-network
+
+  mon-backend:
+    build:
+      context: ./backend
+    container_name: mon-backend
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring-network
+      - atmosidea-network # 既存のネットワークに接続
+
+  mon-frontend:
+    build:
+      context: ./frontend
+    container_name: mon-frontend-builder
+    volumes:
+      - ./frontend:/app # ホストのfrontendディレクトリをコンテナの/appにマウント
+      - ./frontend/dist:/app/dist # ビルド成果物をホストのfrontend/distに出力
+      - /app/node_modules # node_modulesは匿名ボリュームとして扱い、ホストを汚染しない
+    command: npm run build # ビルドコマンドを実行
+    # このサービスはビルドが完了したら終了します。
+    # mon-nginxがdepends_onでこのサービスの完了を待つため、ビルドされたファイルが利用可能になります。
+
+networks:
+  monitoring-network:
+    driver: bridge
+  atmosidea-network:
+    external: true
+    name: atmosidea-network
