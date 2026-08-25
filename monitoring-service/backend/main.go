@@ -9,9 +9,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
@@ -19,6 +22,13 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// ... (他の構造体定義は変更なし)
+type ContainerStats struct {
+	CPUPercent float64 `json:"cpuPercent"`
+	MemUsage   float64 `json:"memUsage"`
+	MemLimit   float64 `json:"memLimit"`
+}
 
 type LogMessage struct {
 	ContainerID   string    `json:"containerId"`
@@ -76,7 +86,9 @@ func main() {
 	})
 
 	router.HandleFunc("/api/containers", getContainers(cli)).Methods("GET")
+	router.HandleFunc("/api/containers/stats", getContainerStats(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/restart/{name}", restartContainer(cli)).Methods("POST", "OPTIONS")
+	router.HandleFunc("/api/connections/count", getActiveUserCount(cli)).Methods("GET")
 
 	// ルーティング修正: パス変数とクエリパラメーターの両方に対応
 	router.HandleFunc("/ws/logs", serveWs(cli)).Methods("GET")
@@ -89,6 +101,132 @@ func main() {
 
 	log.Println("Monitoring backend started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
+}
+
+func getContainerStats(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		containers, err := cli.ContainerList(ctx, container.ListOptions{})
+		if err != nil {
+			http.Error(w, "Failed to list containers", http.StatusInternalServerError)
+			return
+		}
+
+		statsMap := make(map[string]ContainerStats)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
+		for _, c := range containers {
+			if c.State != "running" {
+				continue
+			}
+			wg.Add(1)
+			go func(c types.Container) {
+				defer wg.Done()
+				stats, err := cli.ContainerStats(ctx, c.ID, false)
+				if err != nil {
+					log.Printf("Failed to get stats for container %s: %v", c.ID, err)
+					return
+				}
+				defer stats.Body.Close()
+
+				var v types.StatsJSON
+				if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
+					log.Printf("Failed to decode stats for container %s: %v", c.ID, err)
+					return
+				}
+
+				cpuPercent := calculateCPUPercent(&v)
+				memUsage := float64(v.MemoryStats.Usage)
+				memLimit := float64(v.MemoryStats.Limit)
+
+				mu.Lock()
+				name := strings.TrimPrefix(c.Names[0], "/")
+				statsMap[name] = ContainerStats{
+					CPUPercent: cpuPercent,
+					MemUsage:   memUsage,
+					MemLimit:   memLimit,
+				}
+				mu.Unlock()
+			}(c)
+		}
+
+		wg.Wait()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(statsMap)
+	}
+}
+
+func calculateCPUPercent(v *types.StatsJSON) float64 {
+	cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage) - float64(v.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(v.CPUStats.SystemUsage) - float64(v.PreCPUStats.SystemUsage)
+
+	if systemDelta > 0.0 && cpuDelta > 0.0 {
+		return (cpuDelta / systemDelta) * float64(len(v.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+	}
+	return 0.0
+}
+
+func getActiveUserCount(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		options := container.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Since:      "5m", // 直近5分間のログを取得
+		}
+
+		// "atmosidea-frontend" という名前のコンテナを探す
+		containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+		if err != nil {
+			http.Error(w, "Failed to list containers", http.StatusInternalServerError)
+			return
+		}
+
+		var frontendContainerID string
+		for _, c := range containers {
+			for _, name := range c.Names {
+				if strings.Contains(name, "atmosidea-frontend") {
+					frontendContainerID = c.ID
+					break
+				}
+			}
+			if frontendContainerID != "" {
+				break
+			}
+		}
+
+		if frontendContainerID == "" {
+			http.Error(w, "atmosidea-frontend container not found", http.StatusNotFound)
+			return
+		}
+
+		reader, err := cli.ContainerLogs(ctx, frontendContainerID, options)
+		if err != nil {
+			http.Error(w, "Failed to get logs for frontend container", http.StatusInternalServerError)
+			return
+		}
+		defer reader.Close()
+
+		ipRegex := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+		uniqueIPs := make(map[string]bool)
+
+		scanner := bufio.NewScanner(reader)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Dockerログのヘッダー（8バイト）をスキップ
+			if len(line) > 8 {
+				line = line[8:]
+			}
+			matches := ipRegex.FindStringSubmatch(line)
+			if len(matches) > 1 {
+				uniqueIPs[matches[1]] = true
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"count": len(uniqueIPs)})
+	}
 }
 
 func getContainers(cli *client.Client) http.HandlerFunc {

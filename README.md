@@ -19,6 +19,7 @@
   - [マイページ (mypage-service)](#マイページ-mypage-service)
   - [セキュリティスキャン受付 (sfsp-api)](#セキュリティスキャン受付-sfsp-api)
   - [セキュリティスキャン実行 (sfsp-worker)](#セキュリティスキャン実行-sfsp-worker)
+  - [システム監視 (monitoring-service)](#システム監視-monitoring-service)
 - [3. アーキテクチャと技術スタック](#3-アーキテクチャと技術スタック)
   - [システム全体のアーキテクチャ概要](#システム全体のアーキテクチャ概要)
   - [使用技術・ライブラリとその選定理由・役割一覧](#使用技術ライブラリとその選定理由役割一覧)
@@ -192,6 +193,19 @@ Atomosideaは、動画共有、ゲーム配信、静的サイトホスティン�
     6. 最終結果を`ScanCompletionEvent`として、対象サービス（`stream`, `game`, `static-site`）ごとのRedisキューに発行する。
 - **関連ファイル:** `security/cmd/sfsp-worker/main.go`, `security/internal/worker/worker.go`
 
+### システム監視 (monitoring-service)
+- **機能概要:** 開発者向けの運用・監視ダッシュボード。プロジェクト全体のマイクロサービスの稼働状況、リソース使用率、ログなどをリアルタイムで可視化する。
+- **主な機能:**
+    - **システムマップ:** 全コンテナを機能（UI, API, Worker等）ごとに階層化して自動レイアウトし、サービス間の連携を視覚的に表示。
+    - **リアルタイム監視:** 各コンテナのCPU・メモリ使用率、稼働状態、ログの流量（LPS）、エラー発生状況をリアルタイムに更新。
+    - **統合ダッシュボード:** システム全体の負荷、アクティブユーザー数（推定）などを集約して表示。
+    - **インタラクティブ操作:**
+        - **ログストリーミング:** コンテナのノードをクリックすると、リアルタイムでログを閲覧できる。
+        - **コンテナ再起動:** ダッシュボード上から特定のコンテナを再起動する機能。
+        - **ストレージブラウザ:** MinIOコンテナのノードからは、バケットやオブジェクトをGUIで直接閲覧・アップロード・削除できる。
+- **アクセス:** `http://localhost:8090`
+- **関連ファイル:** `monitoring-service/`
+
 ## 3. アーキテクチャと技術スタック
 
 ### システム全体のアーキテクチャ概要
@@ -202,6 +216,10 @@ Atomosideaは、Docker Composeによって管理されるマイクロサービ�
 graph TD
     subgraph "User Facing"
         Frontend(Frontend - React/Vite/Nginx)
+    end
+
+    subgraph "Developer Facing"
+        MonitoringService(Monitoring Service)
     end
 
     subgraph "API Services"
@@ -304,6 +322,29 @@ graph TD
     StaticSiteWorker --> AppDB
     StaticSiteWorker --> SFSP_MinIO
     StaticSiteWorker --> StaticSiteStorage
+
+    MonitoringService -->|Docker Socket| AuthService
+    MonitoringService -->|Docker Socket| ProfileService
+    MonitoringService -->|Docker Socket| UploadService
+    MonitoringService -->|Docker Socket| StreamService
+    MonitoringService -->|Docker Socket| GameUploadAPI
+    MonitoringService -->|Docker Socket| StaticSiteUploadAPI
+    MonitoringService -->|Docker Socket| MyPageService
+    MonitoringService -->|Docker Socket| VideoWorker
+    MonitoringService -->|Docker Socket| GameWorker
+    MonitoringService -->|Docker Socket| StaticSiteWorker
+    MonitoringService -->|Docker Socket| SFSP_API
+    MonitoringService -->|Docker Socket| SFSP_Worker
+    MonitoringService -->|Docker Socket| AuthDB
+    MonitoringService -->|Docker Socket| AppDB
+    MonitoringService -->|Docker Socket| ProfileDB
+    MonitoringService -->|Docker Socket| SFSP_DB
+    MonitoringService -->|Docker Socket| Redis
+    MonitoringService -->|Docker Socket| ProfileStorage
+    MonitoringService -->|Docker Socket| GameStorage
+    MonitoringService -->|Docker Socket| StaticSiteStorage
+    MonitoringService -->|Docker Socket| VideoStorage
+    MonitoringService -->|Docker Socket| SFSP_MinIO
 ```
 
 ### 使用技術・ライブラリとその選定理由・役割一覧
@@ -311,11 +352,11 @@ graph TD
 | カテゴリ | 技術・ライブラリ | 選定理由・役割 |
 |---|---|---|
 | **フロントエンド** | React, Vite, TypeScript | モダンで高速なUI開発を実現。型安全なコードで大規模開発にも対応。 |
-| | Material-UI | 高品質なUIコンポーネントを迅速に構築するため。 |
+| | Material-UI, Lucide React | 高品質なUIコンポーネントやアイコンを迅速に構築するため。 |
 | | Axios | HTTPリクエストを簡単かつ堅牢に処理するため。 |
 | | React Router | シングルページアプリケーション（SPA）のルーティングを管理するため。 |
 | **バックエンド** | Go (Golang) | 高パフォーマンス、並行処理能力、静的型付けによる堅牢性を評価。マイクロサービスに適している。 |
-| | Gin-Gonic | Go言語で高速なHTTPルーターとミドルウェアを提供。API開発を効率化。 |
+| | Gin-Gonic, Gorilla Mux | Go言語で高速なHTTPルーターとミドルウェアを提供。API開発を効率化。 |
 | **データベース** | PostgreSQL | 高機能で信頼性の高いリレーショナルデータベース。トランザクションの整合性を保証。 |
 | | Redis | 高速なインメモリデータストア。キャッシュ（JWTブロックリスト）やメッセージキュー（スキャンジョブ/完了イベント）として利用し、システムの応答性を向上。 |
 | **ストレージ** | MinIO | S3互換のオブジェクトストレージ。大量の非構造化データ（動画、画像、ゲームファイル等）をスケーラブルに管理。 |
@@ -378,6 +419,11 @@ sequenceDiagram
 │   └── main.go
 ├── game-worker/               # ゲーム処理ワーカー
 │   └── main.go
+├── monitoring-service/        # 運用・監視ダッシュボード
+│   ├── backend/               # バックエンド (Go)
+│   ├── frontend/              # フロントエンド (React)
+│   ├── docker-compose.monitoring.yml # 監視サービス専用の構成
+│   └── nginx.conf
 ├── mypage-service/            # マイページサービス
 │   └── main.go
 ├── profile-service/           # プロフィールサービス
@@ -594,6 +640,23 @@ sequenceDiagram
 | `GET` | `/results/:id` | 内部 | **スキャン結果取得**。完了したジョブIDのスキャン結果（ClamAV, YARAなど）の詳細を返します。 | (なし) | `[{"scanner": "clamav", "result": "clean", ...}]` |
 | `GET` | `/health` | 不要 | **ヘルスチェック**。サービスの稼働状況を確認します。 | (なし) | `{"status": "ok"}` |
 
+---
+
+#### **Monitoring Service** (`monitoring-service`)
+- **ベースパス:** `/api` (監視サービス内部)
+- **責務:** 開発者向けにシステム全体の状態を提供
+
+| メソッド | エンドポイント | 説明 |
+|---|---|---|
+| `GET` | `/containers` | 稼働中の全コンテナのリスト（ID, 名前, 状態など）を取得します。 |
+| `GET` | `/containers/stats` | 全コンテナのCPU・メモリ使用率などのリソース統計情報を取得します。 |
+| `POST` | `/containers/restart/{name}` | 指定した名前のコンテナを再起動します。 |
+| `GET` | `/connections/count` | `atmosidea-frontend`のログを解析し、直近5分間のユニークIPアドレス数をカウントしてアクティブユーザー数を推定します。 |
+| `GET` | `/minio/list/{containerName}` | 指定したMinIOコンテナ内のバケットやオブジェクトを一覧表示します。 (クエリ: `bucket`, `prefix`) |
+| `POST` | `/minio/upload/{containerName}` | 指定したMinIOコンテナのバケットにファイルをアップロードします。 (クエリ: `bucket`, `prefix`) |
+| `DELETE`| `/minio/delete/{containerName}` | 指定したMinIOコンテナのバケットからオブジェクトを削除します。 (クエリ: `bucket`, `key`) |
+| `GET` | `/ws/logs` | WebSocket接続を確立し、指定したコンテナのログをリアルタイムにストリーミングします。 (クエリ: `container`) |
+
 
 ## 6. セットアップ・環境構築・開発手順
 
@@ -622,8 +685,9 @@ sequenceDiagram
 ### 6.4. 起動手順
 1. `setup.bat`を実行して初期設定と初回起動を行います。
 2. 2回目以降は`start.bat`で起動、`stop.bat`で停止します。
-3. `http://localhost:3001` にアクセスしてフロントエンドが表示されることを確認します。
-4. 各サービスのログは `docker-compose logs -f <service_name>` で確認できます。
+3. `http://localhost:3001` にアクセスしてメインのフロントエンドが表示されることを確認します。
+4. **(任意)** 監視ダッシュボードを利用する場合は、`monitoring-service`ディレクトリ内で`docker-compose -f docker-compose.monitoring.yml up -d --build`を実行し、`http://localhost:8090`にアクセスします。
+5. 各サービスのログは `docker-compose logs -f <service_name>` で確認できます。監視ダッシュボードからもリアルタイムで閲覧可能です。
 
 ## 7. デプロイ・運用・トラブルシューティング
 
@@ -637,10 +701,10 @@ sequenceDiagram
   5. 本番環境で `docker-compose pull` と `docker-compose up -d --no-deps <service_name>` を実行し、サービスをローリングアップデート。
 
 ### トラブルシューティング
-- **サービスが起動しない:** `docker-compose logs <service_name>` でエラーログを確認してください。多くの場合、環境変数の設定ミスや、依存サービス（DBなど）の起動失敗が原因です。
+- **サービスが起動しない:** `docker-compose logs <service_name>` でエラーログを確認してください。多くの場合、環境変数の設定ミスや、依存サービス（DBなど）の起動失敗が原因です。監視ダッシュボードが起動している場合は、コンテナの状態やログから原因を特定できることがあります。
 - **ファイルがアップロードできない:** `upload-service`や`sfsp-api`のログを確認してください。SFSPサービスが利用できない、またはMinIOへの接続に失敗している可能性があります。
 - **動画・ゲームが処理されない:** `sfsp-worker`や各コンテンツの`worker`（`game-worker`など）のログを確認してください。Redisへの接続、スキャンプロセスのエラー、FFmpegの実行エラーなどが考えられます。
-- **コンテンツが表示されない:** `frontend`のNginx設定や、各`storage`のバケットポリシー、ファイルパスが正しいか確認してください。
+- **コンテンツが表示されない:** `frontend`のNginx設定や、各`storage`のバケットポリシー、ファイルパスが正しいか確認してください。監視ダッシュボードのストレージブラウザ機能で、MinIO上にファイルが正しく配置されているか確認できます。
 
 ## 8. コントリビューション・開発規約
 
