@@ -257,6 +257,57 @@ func generateRandomID() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+func uploadToSFSP(ctx context.Context, tmpFile *os.File, header *multipart.FileHeader, targetService string, resp *SfspUploadResponse) error {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if err := writer.WriteField("target_service", targetService); err != nil {
+		return fmt.Errorf("failed to write target_service: %w", err)
+	}
+
+	part, err := writer.CreateFormFile("file", header.Filename)
+	if err != nil {
+		return fmt.Errorf("failed to create form: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to reset file reader: %w", err)
+	}
+
+	if _, err := io.Copy(part, tmpFile); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+	writer.Close()
+
+	sfspRequest, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", body)
+	if err != nil {
+		return fmt.Errorf("failed to create SFSP request: %w", err)
+	}
+	sfspRequest.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	sfspResponse, err := client.Do(sfspRequest)
+	if err != nil {
+		return fmt.Errorf("SFSP request failed: %w", err)
+	}
+	defer sfspResponse.Body.Close()
+
+	respBytes, err := io.ReadAll(sfspResponse.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read SFSP response: %w", err)
+	}
+
+	if sfspResponse.StatusCode < 200 || sfspResponse.StatusCode >= 300 {
+		return fmt.Errorf("SFSP returned non-2xx status %d: %s", sfspResponse.StatusCode, string(respBytes))
+	}
+
+	if err := json.Unmarshal(respBytes, resp); err != nil {
+		return fmt.Errorf("failed to decode SFSP response: %w", err)
+	}
+
+	return nil
+}
+
 func uploadStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	userIDStr := c.GetString("userID")
@@ -375,6 +426,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 	}
 
 	thumbnailHeader, err := c.FormFile("thumbnail")
+	var thumbnailSFSPJobID *uuid.UUID
 	var thumbnailURL string
 	if err == nil {
 		thumbnailSrc, err := thumbnailHeader.Open()
@@ -384,16 +436,60 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		}
 		defer thumbnailSrc.Close()
 
-		thumbnailObjectName := fmt.Sprintf("thumbnails/%s%s", siteID, filepath.Ext(thumbnailHeader.Filename))
-		_, err = minioClient.PutObject(reqCtx, minioBucket, thumbnailObjectName, thumbnailSrc, thumbnailHeader.Size, minio.PutObjectOptions{
-			ContentType: thumbnailHeader.Header.Get("Content-Type"),
-		})
+		tmpThumbFile, err := os.CreateTemp("", "sfsp-thumbnail-*.tmp")
 		if err != nil {
-			logger.Errorf("ERROR: Failed to upload thumbnail to MinIO: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload thumbnail to storage"})
+			logger.Errorf("Failed to create temp file for thumbnail SFSP upload: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
 			return
 		}
-		thumbnailURL = fmt.Sprintf("/static-sites/thumbnails/%s%s", siteID, filepath.Ext(thumbnailHeader.Filename))
+		defer os.Remove(tmpThumbFile.Name())
+		defer tmpThumbFile.Close()
+
+		if _, err := io.Copy(tmpThumbFile, thumbnailSrc); err != nil {
+			logger.Errorf("Failed to copy thumbnail to temp file: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+			return
+		}
+		if _, err := tmpThumbFile.Seek(0, io.SeekStart); err != nil {
+			logger.Errorf("Failed to reset temp thumbnail file: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+			return
+		}
+
+		var thumbSfspResp SfspUploadResponse
+		if err := uploadToSFSP(reqCtx, tmpThumbFile, thumbnailHeader, "thumbnail", &thumbSfspResp); err != nil {
+			logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
+			return
+		}
+
+		parsedThumbJobID, err := uuid.Parse(thumbSfspResp.JobID)
+		if err != nil {
+			logger.Errorf("Invalid Thumbnail Job ID from SFSP: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid thumbnail job ID from SFSP"})
+			return
+		}
+		thumbnailSFSPJobID = &parsedThumbJobID
+
+		if sfspResponse.StatusCode == http.StatusOK && strings.ToLower(thumbSfspResp.Status) == "clean" {
+			thumbFileID, err := uuid.Parse(thumbSfspResp.FileID)
+			if err == nil {
+				event := event.ScanCompletionEvent{
+					JobID:         parsedThumbJobID,
+					FileID:        thumbFileID,
+					FinalStatus:   "clean",
+					ScannedAt:     time.Now().UTC(),
+					SHA256:        thumbSfspResp.SHA256,
+					Filename:      thumbnailHeader.Filename,
+					TargetService: "thumbnail",
+				}
+				if err := queue.EnqueueScanCompletionEvent(reqCtx, event); err != nil {
+					logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for duplicate clean file: %v", err)
+				} else {
+					logger.Infof("Re-published thumbnail completion event for existing clean file, job %s", thumbSfspResp.JobID)
+				}
+			}
+		}
 	}
 
 	sfspJobID, err := uuid.Parse(sfspRespData.JobID)
@@ -404,8 +500,8 @@ func uploadStaticSiteHandler(c *gin.Context) {
 	}
 
 	_, err = db.ExecContext(reqCtx,
-		"INSERT INTO static_sites (id, user_id, title, description, status, sfsp_job_id, minio_path, thumbnail_url, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, NOW(), NOW())",
-		siteID, userUUID, title, description, sfspJobID, "", thumbnailURL)
+		"INSERT INTO static_sites (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, minio_path, thumbnail_url, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, $8, NOW(), NOW())",
+		siteID, userUUID, title, description, sfspJobID, thumbnailSFSPJobID, "", thumbnailURL)
 	if err != nil {
 		logger.Errorf("ERROR: Failed to insert static site into DB: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register static site"})

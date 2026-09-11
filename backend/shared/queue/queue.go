@@ -28,6 +28,7 @@ const (
 	GameCompletionQueue       = "sfsp:completed:game"
 	StreamCompletionQueue     = "sfsp:completed:stream"
 	ProfileCompletionQueue    = "sfsp:completed:profile"
+	ThumbnailCompletionQueue  = "sfsp:completed:thumbnail"
 )
 
 // ConnectRedis initializes the Redis client
@@ -123,6 +124,8 @@ func EnqueueScanCompletionEvent(ctx context.Context, e event.ScanCompletionEvent
 		queueName = StreamCompletionQueue
 	case "profile":
 		queueName = ProfileCompletionQueue
+	case "thumbnail":
+		queueName = ThumbnailCompletionQueue
 	default:
 		Logger.Warnw("Event discarded: unknown target_service",
 			"job_id", e.JobID,

@@ -56,10 +56,11 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		"game":        true,
 		"stream":      true,
 		"profile":     true,
+		"thumbnail":   true,
 	}
 	if !allowedServices[targetService] {
 		a.Logger.Errorf("Invalid target_service: %s", targetService)
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid target_service: %s. Allowed values are 'static-site', 'game', 'stream'", targetService)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid target_service: %s. Allowed values are 'static-site', 'game', 'stream', 'profile', 'thumbnail'", targetService)})
 		return
 	}
 

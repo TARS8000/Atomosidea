@@ -161,6 +161,8 @@ func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.P
 		tableName = "public.games"
 	case "static_site", "static_sites", "static-site", "staticsite":
 		tableName = "public.static_sites"
+	case "thumbnail":
+		tableName = ""
 	}
 
 	if tableName != "" {

@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -121,9 +123,10 @@ func main() {
 	logger.Info("Static Site Worker started. Waiting for jobs...")
 
 	staticSiteCompletionQueue := queue.StaticSiteCompletionQueue
+	thumbnailCompletionQueue := queue.ThumbnailCompletionQueue
 
 	for {
-		result, err := queue.RedisClient.BRPop(context.Background(), 0, staticSiteCompletionQueue).Result()
+		result, err := queue.RedisClient.BRPop(context.Background(), 0, staticSiteCompletionQueue, thumbnailCompletionQueue).Result()
 		if err != nil {
 			logger.Errorf("Error popping job from Redis: %v", err)
 			time.Sleep(5 * time.Second)
@@ -131,37 +134,46 @@ func main() {
 		}
 		logger.Debugf("Received Redis message: %+v", result)
 
+		queueName := result[0]
+		eventPayload := result[1]
+
 		var event event.ScanCompletionEvent
-		if err := json.Unmarshal([]byte(result[1]), &event); err != nil {
+		if err := json.Unmarshal([]byte(eventPayload), &event); err != nil {
 			logger.Errorf("Error unmarshalling event payload: %v", err)
 			continue
 		}
 		logger.Debugf("Parsed event: %+v", event)
 
-		if event.TargetService != "static-site" {
-			logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a static site event.", event.TargetService, event.JobID)
-			continue
-		}
-
-		var siteID string
-		logger.Debugf("Looking up site by JobID=%s", event.JobID)
-		err = db.QueryRow("SELECT id FROM static_sites WHERE sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&siteID)
-		if err != nil {
-			logger.Errorf("[SFSP JobID: %s] ERROR: Could not find a matching static_site record in app-db: %v", event.JobID, err)
-			continue
-		}
-
-		if event.FinalStatus != "clean" {
-			logger.Infof("[SiteID: %s] Scan result is '%s'. Aborting processing.", siteID, event.FinalStatus)
-			finalStatus := event.FinalStatus
-			if finalStatus == "malicious" || finalStatus == "suspicious" {
-				finalStatus = "quarantined"
+		switch queueName {
+		case staticSiteCompletionQueue:
+			if event.TargetService != "static-site" {
+				logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a static site event.", event.TargetService, event.JobID)
+				continue
 			}
-			updateProcessingStatus(siteID, finalStatus, fmt.Sprintf("File scan failed with status: %s", event.FinalStatus))
-			continue
-		}
+			var siteID string
+			logger.Debugf("Looking up site by JobID=%s", event.JobID)
+			err = db.QueryRow("SELECT id FROM static_sites WHERE sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&siteID)
+			if err != nil {
+				logger.Errorf("[SFSP JobID: %s] ERROR: Could not find a matching static_site record in app-db: %v", event.JobID, err)
+				continue
+			}
 
-		go processStaticSiteJob(siteID, event)
+			if event.FinalStatus != "clean" {
+				logger.Infof("[SiteID: %s] Scan result is '%s'. Aborting processing.", siteID, event.FinalStatus)
+				finalStatus := event.FinalStatus
+				if finalStatus == "malicious" || finalStatus == "suspicious" {
+					finalStatus = "quarantined"
+				}
+				updateProcessingStatus(siteID, finalStatus, fmt.Sprintf("File scan failed with status: %s", event.FinalStatus))
+				continue
+			}
+
+			go processStaticSiteJob(siteID, event)
+		case thumbnailCompletionQueue:
+			processStaticSiteThumbnail(context.Background(), &event)
+		default:
+			logger.Infof("INFO: Skipping event from unknown queue: %s", queueName)
+		}
 	}
 }
 
@@ -321,4 +333,100 @@ func processStaticSiteJob(siteID string, event event.ScanCompletionEvent) {
 	}
 
 	logger.Infof("Successfully processed static site job for SiteID: %s", siteID)
+}
+
+func processStaticSiteThumbnail(ctx context.Context, event *event.ScanCompletionEvent) {
+	var siteID string
+	logger.Debugf("Looking up static site by thumbnail JobID=%s", event.JobID)
+	err := db.QueryRow("SELECT id FROM static_sites WHERE thumbnail_sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&siteID)
+	if err != nil {
+		logger.Errorf("[Thumbnail JobID: %s] ERROR: Could not find a matching static_site record: %v", event.JobID, err)
+		return
+	}
+	logger.Infof("[SiteID: %s] Found matching static site record for thumbnail SFSP JobID %s", siteID, event.JobID)
+
+	if event.FinalStatus != "clean" {
+		logger.Infof("[SiteID: %s] Thumbnail scan result is '%s'. Aborting thumbnail processing.", siteID, event.FinalStatus)
+		_, err = db.Exec(ctx, "UPDATE static_sites SET thumbnail_sfsp_job_id = NULL WHERE id = $1", siteID)
+		if err != nil {
+			logger.Errorf("[SiteID: %s] Failed to clear thumbnail scan job: %v", siteID, err)
+		}
+		return
+	}
+
+	logger.Infof("[SiteID: %s] Thumbnail is clean. Processing thumbnail...", siteID)
+
+	fileIDStr := fmt.Sprintf("%v", event.FileID)
+	var keysToTry []string
+	if fileIDStr != "" && fileIDStr != "<nil>" {
+		keysToTry = append(keysToTry, fileIDStr)
+		keysToTry = append(keysToTry, fmt.Sprintf("%s/%s", fileIDStr, event.Filename))
+	}
+	if event.SHA256 != "" {
+		keysToTry = append(keysToTry, fmt.Sprintf("%s/%s", event.SHA256, event.Filename))
+		keysToTry = append(keysToTry, event.SHA256)
+	}
+	if event.Filename != "" {
+		keysToTry = append(keysToTry, event.Filename)
+	}
+
+	tempThumbPath := filepath.Join(os.TempDir(), fmt.Sprintf("site-thumb-%s-%s", siteID, event.Filename))
+	var downloadErr error
+	downloadSuccess := false
+
+	for _, sfspObjectName := range keysToTry {
+		logger.Infof("[SiteID: %s] Attempting thumbnail download with key: %s", siteID, sfspObjectName)
+		downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, sfspObjectName, tempThumbPath, minio.GetObjectOptions{})
+		if downloadErr == nil {
+			downloadSuccess = true
+			logger.Infof("[SiteID: %s] Successfully downloaded thumbnail %s from SFSP", siteID, sfspObjectName)
+			break
+		}
+		logger.Warnf("[SiteID: %s] Failed to download thumbnail with key (%s): %v", siteID, sfspObjectName, downloadErr)
+	}
+
+	if !downloadSuccess {
+		logger.Errorf("[SiteID: %s] ERROR: Download thumbnail from SFSP failed after retries: %v", siteID, downloadErr)
+		return
+	}
+	defer os.Remove(tempThumbPath)
+
+	f, err := os.Open(tempThumbPath)
+	if err != nil {
+		logger.Errorf("[SiteID: %s] ERROR: Failed to open downloaded thumbnail: %v", siteID, err)
+		return
+	}
+	defer f.Close()
+
+	buffer := make([]byte, 512)
+	n, _ := f.Read(buffer)
+	contentType := http.DetectContentType(buffer[:n])
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		logger.Errorf("[SiteID: %s] ERROR: Failed to reset thumbnail file: %v", siteID, err)
+		return
+	}
+
+	stat, err := f.Stat()
+	if err != nil {
+		logger.Errorf("[SiteID: %s] ERROR: Failed to stat thumbnail file: %v", siteID, err)
+		return
+	}
+
+	thumbnailObjectName := fmt.Sprintf("thumbnails/%s%s", siteID, filepath.Ext(event.Filename))
+	_, err = minioClient.PutObject(ctx, minioBucket, thumbnailObjectName, f, stat.Size(), minio.PutObjectOptions{
+		ContentType: contentType,
+	})
+	if err != nil {
+		logger.Errorf("[SiteID: %s] ERROR: Failed to upload thumbnail to static-site MinIO: %v", siteID, err)
+		return
+	}
+
+	thumbnailURL := fmt.Sprintf("/static-sites/thumbnails/%s%s", siteID, filepath.Ext(event.Filename))
+	_, err = db.Exec(ctx, "UPDATE static_sites SET thumbnail_url = $1, thumbnail_sfsp_job_id = NULL WHERE id = $2", thumbnailURL, siteID)
+	if err != nil {
+		logger.Errorf("[SiteID: %s] ERROR: Failed to update thumbnail URL in DB: %v", siteID, err)
+		return
+	}
+
+	logger.Infof("[SiteID: %s] Thumbnail processing complete.", siteID)
 }

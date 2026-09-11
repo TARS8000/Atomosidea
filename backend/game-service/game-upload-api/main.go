@@ -88,6 +88,57 @@ func generateRandomID() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+func uploadToSFSP(ctx context.Context, tmpFile *os.File, header *multipart.FileHeader, targetService string, resp *SfspUploadResponse) error {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if err := writer.WriteField("target_service", targetService); err != nil {
+		return fmt.Errorf("failed to write target_service: %w", err)
+	}
+
+	part, err := writer.CreateFormFile("file", header.Filename)
+	if err != nil {
+		return fmt.Errorf("failed to create form: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to reset file reader: %w", err)
+	}
+
+	if _, err := io.Copy(part, tmpFile); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
+	}
+	writer.Close()
+
+	sfspRequest, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", body)
+	if err != nil {
+		return fmt.Errorf("failed to create SFSP request: %w", err)
+	}
+	sfspRequest.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	sfspResponse, err := client.Do(sfspRequest)
+	if err != nil {
+		return fmt.Errorf("SFSP request failed: %w", err)
+	}
+	defer sfspResponse.Body.Close()
+
+	respBytes, err := io.ReadAll(sfspResponse.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read SFSP response: %w", err)
+	}
+
+	if sfspResponse.StatusCode < 200 || sfspResponse.StatusCode >= 300 {
+		return fmt.Errorf("SFSP returned non-2xx status %d: %s", sfspResponse.StatusCode, string(respBytes))
+	}
+
+	if err := json.Unmarshal(respBytes, resp); err != nil {
+		return fmt.Errorf("failed to decode SFSP response: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
@@ -291,18 +342,66 @@ func uploadGameHandler(c *gin.Context) {
 		sfspRespData.Status,
 	)
 
+	var thumbnailSFSPJobID *uuid.UUID
 	var thumbnailURL string
 	thumbnailFile, thumbnailHeader, err_thumb := c.Request.FormFile("thumbnail")
 	if err_thumb == nil {
 		defer thumbnailFile.Close()
-		thumbnailObjectName := fmt.Sprintf("thumbnails/%s-%s", uuid.New().String(), thumbnailHeader.Filename)
-		_, err_put := minioClient.PutObject(context.Background(), bucketName, thumbnailObjectName, thumbnailFile, thumbnailHeader.Size, minio.PutObjectOptions{})
-		if err_put != nil {
-			logger.Errorf("Error uploading thumbnail to MinIO: %v", err_put)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store thumbnail file"})
+
+		tmpThumbFile, err := os.CreateTemp("", "sfsp-thumbnail-*.tmp")
+		if err != nil {
+			logger.Errorf("Failed to create temp file for thumbnail SFSP upload: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
 			return
 		}
-		thumbnailURL = fmt.Sprintf("/games/%s", thumbnailObjectName)
+		defer os.Remove(tmpThumbFile.Name())
+		defer tmpThumbFile.Close()
+
+		if _, err := io.Copy(tmpThumbFile, thumbnailFile); err != nil {
+			logger.Errorf("Failed to copy thumbnail to temp file: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+			return
+		}
+		if _, err := tmpThumbFile.Seek(0, io.SeekStart); err != nil {
+			logger.Errorf("Failed to reset temp thumbnail file: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+			return
+		}
+
+		var thumbSfspResp SfspUploadResponse
+		if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "thumbnail", &thumbSfspResp); err != nil {
+			logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
+			return
+		}
+
+		parsedThumbJobID, err := uuid.Parse(thumbSfspResp.JobID)
+		if err != nil {
+			logger.Errorf("Invalid Thumbnail Job ID from SFSP: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid thumbnail job ID from SFSP"})
+			return
+		}
+		thumbnailSFSPJobID = &parsedThumbJobID
+
+		if sfspResponse.StatusCode == http.StatusOK && strings.ToLower(thumbSfspResp.Status) == "clean" {
+			thumbFileID, err := uuid.Parse(thumbSfspResp.FileID)
+			if err == nil {
+				event := event.ScanCompletionEvent{
+					JobID:         parsedThumbJobID,
+					FileID:        thumbFileID,
+					FinalStatus:   "clean",
+					ScannedAt:     time.Now().UTC(),
+					SHA256:        thumbSfspResp.SHA256,
+					Filename:      thumbnailHeader.Filename,
+					TargetService: "thumbnail",
+				}
+				if err := queue.EnqueueScanCompletionEvent(context.Background(), event); err != nil {
+					logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for duplicate clean file: %v", err)
+				} else {
+					logger.Infof("Re-published thumbnail completion event for existing clean file, job %s", thumbSfspResp.JobID)
+				}
+			}
+		}
 	} else if err_thumb != http.ErrMissingFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid thumbnail file"})
 		return
@@ -335,14 +434,15 @@ func uploadGameHandler(c *gin.Context) {
 	_, err = db.Exec(
 		context.Background(),
 		`INSERT INTO games
-       (id, user_id, title, description, status, sfsp_job_id, thumbnail_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+       (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, thumbnail_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		gameID,
 		userUUID,
 		title,
 		description,
 		gameStatus,
 		sfspJobID,
+		thumbnailSFSPJobID,
 		thumbnailURL,
 	)
 	if err != nil {
