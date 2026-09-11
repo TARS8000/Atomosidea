@@ -19,6 +19,7 @@
   - [マイページ (mypage-service)](#マイページ-mypage-service)
   - [セキュリティスキャン受付 (sfsp-api)](#セキュリティスキャン受付-sfsp-api)
   - [セキュリティスキャン実行 (sfsp-worker)](#セキュリティスキャン実行-sfsp-worker)
+  - [システム監視 (monitoring-service)](#システム監視-monitoring-service)
 - [3. アーキテクチャと技術スタック](#3-アーキテクチャと技術スタック)
   - [システム全体のアーキテクチャ概要](#システム全体のアーキテクチャ概要)
   - [使用技術・ライブラリとその選定理由・役割一覧](#使用技術ライブラリとその選定理由役割一覧)
@@ -81,16 +82,20 @@ Atomosideaは、動画共有、ゲーム配信、静的サイトホスティン�
 - **関連ファイル:** `auth-service/main.go`
 
 ### プロフィール管理 (profile-service)
-- **機能概要:** ユーザーのプロフィール情報（ユーザー名、自己紹介、アイコン、背景画像）を管理。
+- **機能概要:** ユーザーのプロフィール情報（ユーザー名、自己紹介、アイコン、背景画像）を管理。アイコン・背景画像のアップロードはSFSPを介してセキュリティスキャンを実施します。
 - **トリガー:**
     - `/api/profile/me`: 認証済みユーザー自身のプロフィールを取得。
     - `/api/profile/:userId`: 特定ユーザーのプロフィールを取得。
     - `/api/profile`: プロフィール情報（ユーザー名、自己紹介）を更新。
-    - `/api/profile/icon`, `/api/profile/background`: アイコンと背景画像を更新。
+    - `/api/profile/icon`, `/api/profile/background`: アイコンと背景画像をアップロードし、SFSPでスキャン後に反映。
     - `/api/profile/internal/create`: `auth-service`からの内部呼び出しで初期プロフィールを作成。
 - **内部処理ロジック:**
     - プロフィール情報は`profile-db`の`users`テーブルに保存。
-    - 画像ファイルは`profile-storage` (MinIO)にアップロードされ、URLがDBに保存される。
+    - 画像アップロード時、`sfsp-api`にファイルを転送し、ClamAV/YARAスキャンを実施。
+    - スキャン完了後、`sfsp-worker`から`sfsp:completed:profile`キューを介して完了イベントを受け取る。
+    - スキャン結果が`clean`の場合、SFSP Clean MinIOから画像をダウンロードし、`profile-storage` (MinIO)に保存後、DBのURLを更新。
+    - 変更前の画像は、新しい画像の反映時にMinIOから削除される。
+    - フロントエンドはスキャン中、ローカルプレビューを表示し、ポーリングで完了を検知する。
 - **関連ファイル:** `profile-service/main.go`
 
 ### 動画アップロード (upload-service)
@@ -189,8 +194,21 @@ Atomosideaは、動画共有、ゲーム配信、静的サイトホスティン�
     3. Docker Sandbox内でClamAVとYARAをコンテナとして実行し、ファイルをスキャン。
     4. スキャン結果を`scan_results`テーブルに保存。
     5. 総合結果に基づき、ファイルを`clean-files`または`quarantine`バケットにコピーし、`raw-files`から削除。
-    6. 最終結果を`ScanCompletionEvent`として、対象サービス（`stream`, `game`, `static-site`）ごとのRedisキューに発行する。
+     6. 最終結果を`ScanCompletionEvent`として、対象サービス（`stream`, `game`, `static-site`, `profile`）ごとのRedisキューに発行する。
 - **関連ファイル:** `security/cmd/sfsp-worker/main.go`, `security/internal/worker/worker.go`
+
+### システム監視 (monitoring-service)
+- **機能概要:** 開発者向けの運用・監視ダッシュボード。プロジェクト全体のマイクロサービスの稼働状況、リソース使用率、ログなどをリアルタイムで可視化する。
+- **主な機能:**
+    - **システムマップ:** 全コンテナを機能（UI, API, Worker等）ごとに階層化して自動レイアウトし、サービス間の連携を視覚的に表示。
+    - **リアルタイム監視:** 各コンテナのCPU・メモリ使用率、稼働状態、ログの流量（LPS）、エラー発生状況をリアルタイムに更新。
+    - **統合ダッシュボード:** システム全体の負荷、アクティブユーザー数（推定）などを集約して表示。
+    - **インタラクティブ操作:**
+        - **ログストリーミング:** コンテナのノードをクリックすると、リアルタイムでログを閲覧できる。
+        - **コンテナ再起動:** ダッシュボード上から特定のコンテナを再起動する機能。
+        - **ストレージブラウザ:** MinIOコンテナのノードからは、バケットやオブジェクトをGUIで直接閲覧・アップロード・削除できる。
+- **アクセス:** `http://localhost:8090`
+- **関連ファイル:** `monitoring-service/`
 
 ## 3. アーキテクチャと技術スタック
 
@@ -202,6 +220,10 @@ Atomosideaは、Docker Composeによって管理されるマイクロサービ�
 graph TD
     subgraph "User Facing"
         Frontend(Frontend - React/Vite/Nginx)
+    end
+
+    subgraph "Developer Facing"
+        MonitoringService(Monitoring Service)
     end
 
     subgraph "API Services"
@@ -218,6 +240,7 @@ graph TD
         VideoWorker(Video Worker)
         GameWorker(Game Worker)
         StaticSiteWorker(Static Site Worker)
+        ProfileWorker(Profile Worker)
     end
 
     subgraph "Security Services (SFSP)"
@@ -260,6 +283,8 @@ graph TD
 
     ProfileService --> ProfileDB
     ProfileService --> ProfileStorage
+    ProfileService -->|HTTP Call| SFSP_API
+    ProfileService --> Redis
 
     UploadService --> AppDB
     UploadService --> Redis
@@ -304,6 +329,34 @@ graph TD
     StaticSiteWorker --> AppDB
     StaticSiteWorker --> SFSP_MinIO
     StaticSiteWorker --> StaticSiteStorage
+
+    ProfileWorker -->|Dequeue Event| Redis
+    ProfileWorker --> ProfileDB
+    ProfileWorker --> SFSP_MinIO
+    ProfileWorker --> ProfileStorage
+
+    MonitoringService -->|Docker Socket| AuthService
+    MonitoringService -->|Docker Socket| ProfileService
+    MonitoringService -->|Docker Socket| UploadService
+    MonitoringService -->|Docker Socket| StreamService
+    MonitoringService -->|Docker Socket| GameUploadAPI
+    MonitoringService -->|Docker Socket| StaticSiteUploadAPI
+    MonitoringService -->|Docker Socket| MyPageService
+    MonitoringService -->|Docker Socket| VideoWorker
+    MonitoringService -->|Docker Socket| GameWorker
+    MonitoringService -->|Docker Socket| StaticSiteWorker
+    MonitoringService -->|Docker Socket| SFSP_API
+    MonitoringService -->|Docker Socket| SFSP_Worker
+    MonitoringService -->|Docker Socket| AuthDB
+    MonitoringService -->|Docker Socket| AppDB
+    MonitoringService -->|Docker Socket| ProfileDB
+    MonitoringService -->|Docker Socket| SFSP_DB
+    MonitoringService -->|Docker Socket| Redis
+    MonitoringService -->|Docker Socket| ProfileStorage
+    MonitoringService -->|Docker Socket| GameStorage
+    MonitoringService -->|Docker Socket| StaticSiteStorage
+    MonitoringService -->|Docker Socket| VideoStorage
+    MonitoringService -->|Docker Socket| SFSP_MinIO
 ```
 
 ### 使用技術・ライブラリとその選定理由・役割一覧
@@ -311,11 +364,11 @@ graph TD
 | カテゴリ | 技術・ライブラリ | 選定理由・役割 |
 |---|---|---|
 | **フロントエンド** | React, Vite, TypeScript | モダンで高速なUI開発を実現。型安全なコードで大規模開発にも対応。 |
-| | Material-UI | 高品質なUIコンポーネントを迅速に構築するため。 |
+| | Material-UI, Lucide React | 高品質なUIコンポーネントやアイコンを迅速に構築するため。 |
 | | Axios | HTTPリクエストを簡単かつ堅牢に処理するため。 |
 | | React Router | シングルページアプリケーション（SPA）のルーティングを管理するため。 |
 | **バックエンド** | Go (Golang) | 高パフォーマンス、並行処理能力、静的型付けによる堅牢性を評価。マイクロサービスに適している。 |
-| | Gin-Gonic | Go言語で高速なHTTPルーターとミドルウェアを提供。API開発を効率化。 |
+| | Gin-Gonic, Gorilla Mux | Go言語で高速なHTTPルーターとミドルウェアを提供。API開発を効率化。 |
 | **データベース** | PostgreSQL | 高機能で信頼性の高いリレーショナルデータベース。トランザクションの整合性を保証。 |
 | | Redis | 高速なインメモリデータストア。キャッシュ（JWTブロックリスト）やメッセージキュー（スキャンジョブ/完了イベント）として利用し、システムの応答性を向上。 |
 | **ストレージ** | MinIO | S3互換のオブジェクトストレージ。大量の非構造化データ（動画、画像、ゲームファイル等）をスケーラブルに管理。 |
@@ -372,52 +425,88 @@ sequenceDiagram
 
 ```
 .
-├── auth-service/              # 認証サービス
-│   └── main.go
-├── game-upload-api/           # ゲームアップロードAPI
-│   └── main.go
-├── game-worker/               # ゲーム処理ワーカー
-│   └── main.go
-├── mypage-service/            # マイページサービス
-│   └── main.go
-├── profile-service/           # プロフィールサービス
-│   └── main.go
-├── security/                  # セキュリティサービス (SFSP)
-│   ├── cmd/
-│   │   ├── sfsp-api/          # SFSP APIエントリーポイント
+├── backend/                     # Goバックエンドサービス群
+│   ├── auth/
+│   │   ├── auth-datebase/       # DB関連
+│   │   │   └── profile-db/
+│   │   │       └── init.sql
+│   │   ├── auth-storage/        # MinIOデータ永続化
+│   │   │   └── profile_storage_data/
+│   │   └── auth-worker/         # ワーカー・サービス
+│   │       ├── auth-service/
+│   │       │   └── main.go
+│   │       └── profile-service/
+│   │           └── main.go
+│   ├── game-service/
+│   │   ├── game-upload-api/
 │   │   │   └── main.go
-│   │   └── sfsp-worker/       # SFSP Workerエントリーポイント
-│   │       └── main.go
-│   ├── internal/              # SFSP 内部ロジック
-│   │   ├── api/
-│   │   │   └── handlers.go    # APIリクエストハンドラ
-│   │   ├── sandbox/
-│   │   │   └── docker.go      # Docker Sandbox実装
-│   │   ├── scanner/
-│   │   │   ├── clamav.go      # ClamAVスキャナ実装
-│   │   │   └── yara.go        # YARAスキャナ実装
-│   │   └── worker/
-│   │       └── worker.go      # Workerコアロジック
-│   └── yara-rules/            # YARAルールセット
-├── shared/                    # サービス間共有コード
-│   ├── config/
-│   ├── event/
-│   ├── model/
-│   └── queue/
-├── static-site-upload-api/    # 静的サイトアップロードAPI
-│   └── main.go
-├── static-site-worker/        # 静的サイト処理ワーカー
-│   └── main.go
-├── stream-service/            # 動画メタデータ提供サービス
-│   └── main.go
-├── upload-service/            # 動画アップロードサービス
-│   └── main.go
-├── frontend/                  # フロントエンド (React/Vite)
+│   │   ├── game-worker/
+│   │   │   └── main.go
+│   │   └── game-storage/
+│   ├── static-site-service/
+│   │   ├── static-site-upload-api/
+│   │   │   └── main.go
+│   │   ├── static-site-worker/
+│   │   │   └── main.go
+│   │   └── static-site-storage/
+│   ├── video-service/
+│   │   ├── video-upload-api/
+│   │   │   └── main.go
+│   │   ├── video-worker/
+│   │   │   └── main.go
+│   │   └── video-storage/
+│   ├── security/
+│   │   └── sfsp/                # セキュリティサービス (SFSP)
+│   │       ├── cmd/
+│   │       │   ├── sfsp-api/
+│   │       │   │   └── main.go
+│   │       │   └── sfsp-worker/
+│   │       │       └── main.go
+│   │       ├── internal/
+│   │       │   ├── api/
+│   │       │   │   └── handlers.go
+│   │       │   ├── sandbox/
+│   │       │   │   └── docker.go
+│   │       │   ├── scanner/
+│   │       │   │   ├── clamav.go
+│   │       │   │   └── yara.go
+│   │       │   └── worker/
+│   │       │       └── worker.go
+│   │       ├── yara-rules/
+│   │       │   └── general.yar
+│   │       └── docker/
+│   │           ├── api/
+│   │           │   └── Dockerfile
+│   │           └── worker/
+│   │               └── Dockerfile
+│   ├── shared/                  # サービス間共有コード
+│   │   ├── config/
+│   │   ├── event/
+│   │   │   └── event.go
+│   │   ├── model/
+│   │   └── queue/
+│   │       └── queue.go
+│   └── mypage-worker/
+│       └── main.go
+├── frontend/                    # フロントエンド (React/Vite)
 │   ├── src/
 │   ├── package.json
-│   └── nginx.conf             # HLS配信も担うNginx設定
-├── docker-compose.yml         # 全サービスの構成定義
-└── .env.example               # 環境変数テンプレート
+│   └── nginx.conf               # HLS配信も担うNginx設定
+├── monitoring-service/          # 運用・監視ダッシュボード
+│   ├── backend/
+│   ├── frontend/
+│   ├── docker-compose.monitoring.yml
+│   └── nginx.conf
+├── minio-init/                  # MinIO初期化スクリプト/ポリシー
+│   ├── initialize.sh
+│   ├── sfsp-worker-raw-policy.json
+│   ├── sfsp-static-site-worker-policy.json
+│   ├── sfsp-profile-worker-policy.json
+│   └── sfsp-clean-policy.json
+├── test_field/                  # テスト用アップロードファイル置き場
+├── docker-compose.yml           # 全サービスの構成定義
+├── .env.example                 # 環境変数テンプレート
+└── README.md
 ```
 
 ## 5. データ構造・型定義・API仕様
@@ -432,7 +521,19 @@ sequenceDiagram
 - `provider` (VARCHAR): 'local' or 'google'
 - `provider_id` (VARCHAR): GoogleのユーザーID
 - `is_admin` (BOOLEAN): 管理者フラグ
-- `status` (VARCHAR): 'active', 'deleted_data' 
+- `status` (VARCHAR): 'active', 'deleted_data'
+
+#### profile-db (usersテーブル)
+- `id` (UUID, PK): ユーザーID
+- `username` (VARCHAR): ユーザー名
+- `bio` (TEXT): 自己紹介
+- `icon_url` (TEXT): アイコン画像のURL
+- `background_image_url` (TEXT): 背景画像のURL
+- `icon_sfsp_job_id` (UUID): アイコンのSFSPジョブID
+- `background_sfsp_job_id` (UUID): 背景画像のSFSPジョブID
+- `status` (VARCHAR): 'offline', 'active', 'pending' 等
+- `created_at` (TIMESTAMP): 作成日時
+- `updated_at` (TIMESTAMP): 更新日時 
 
 #### app-db (videos, games, static_sitesテーブル)
 - **videosテーブル**
@@ -470,7 +571,7 @@ sequenceDiagram
     - `sha256` (VARCHAR): ファイルのハッシュ値 (UNIQUE制約なし)
     - `storage_path` (VARCHAR): MinIO上のパス
     - `file_type` (VARCHAR): 'video', 'zip' 等のファイル種別
-    - `target_service` (VARCHAR): 'stream', 'game', 'static-site'
+    - `target_service` (VARCHAR): 'stream', 'game', 'static-site', 'profile'
     - `created_at` (TIMESTAMPTZ): 作成日時
 - **scan_jobsテーブル**
     - `id` (UUID, PK): ジョブID
@@ -522,8 +623,8 @@ sequenceDiagram
 | `GET` | `/:userId` | 不要 | **特定ユーザーのプロフィール取得**。指定したユーザーIDの公開プロフィール情報を取得します。 | (なし) | `{"id": "...", "username": "...", "bio": "...", ...}` |
 | `GET` | `/status` | JWT | **自分のステータス取得**。認証ユーザーのアカウントステータスを取得します。 | (なし) | `{"status": "active"}` |
 | `PUT` | `` | JWT | **プロフィール更新**。認証ユーザーのユーザー名と自己紹介を更新します。 | `{"username": "New Name", "bio": "New Bio"}` | `{"message": "Profile updated successfully"}` |
-| `PUT` | `/icon` | JWT | **アイコン更新**。認証ユーザーのプロフィールアイコンを更新します。 | `multipart/form-data` (key: `icon`) | `{"message": "Icon updated successfully", "icon_url": "..."}` |
-| `PUT` | `/background` | JWT | **背景画像更新**。認証ユーザーの背景画像を更新します。 | `multipart/form-data` (key: `background`) | `{"message": "Background image updated successfully", "background_image_url": "..."}` |
+| `PUT` | `/icon` | JWT | **アイコン更新**。認証ユーザーのプロフィールアイコンをSFSPでスキャン後に更新します。 | `multipart/form-data` (key: `icon`) | `{"message": "Icon upload accepted for scanning", "job_id": "...", "status": "scanning"}` |
+| `PUT` | `/background` | JWT | **背景画像更新**。認証ユーザーの背景画像をSFSPでスキャン後に更新します。 | `multipart/form-data` (key: `background`) | `{"message": "Background upload accepted for scanning", "job_id": "...", "status": "scanning"}` |
 | `POST` | `/internal/create` | 内部 | **内部用プロフィール作成**。`auth-service`からのリクエストで、新規ユーザーの初期プロフィールレコードを作成します。 | `{"user_id": "...", "username": "..."}` | `{"message": "Profile initialized successfully"}` |
 
 ---
@@ -594,6 +695,23 @@ sequenceDiagram
 | `GET` | `/results/:id` | 内部 | **スキャン結果取得**。完了したジョブIDのスキャン結果（ClamAV, YARAなど）の詳細を返します。 | (なし) | `[{"scanner": "clamav", "result": "clean", ...}]` |
 | `GET` | `/health` | 不要 | **ヘルスチェック**。サービスの稼働状況を確認します。 | (なし) | `{"status": "ok"}` |
 
+---
+
+#### **Monitoring Service** (`monitoring-service`)
+- **ベースパス:** `/api` (監視サービス内部)
+- **責務:** 開発者向けにシステム全体の状態を提供
+
+| メソッド | エンドポイント | 説明 |
+|---|---|---|
+| `GET` | `/containers` | 稼働中の全コンテナのリスト（ID, 名前, 状態など）を取得します。 |
+| `GET` | `/containers/stats` | 全コンテナのCPU・メモリ使用率などのリソース統計情報を取得します。 |
+| `POST` | `/containers/restart/{name}` | 指定した名前のコンテナを再起動します。 |
+| `GET` | `/connections/count` | `atmosidea-frontend`のログを解析し、直近5分間のユニークIPアドレス数をカウントしてアクティブユーザー数を推定します。 |
+| `GET` | `/minio/list/{containerName}` | 指定したMinIOコンテナ内のバケットやオブジェクトを一覧表示します。 (クエリ: `bucket`, `prefix`) |
+| `POST` | `/minio/upload/{containerName}` | 指定したMinIOコンテナのバケットにファイルをアップロードします。 (クエリ: `bucket`, `prefix`) |
+| `DELETE`| `/minio/delete/{containerName}` | 指定したMinIOコンテナのバケットからオブジェクトを削除します。 (クエリ: `bucket`, `key`) |
+| `GET` | `/ws/logs` | WebSocket接続を確立し、指定したコンテナのログをリアルタイムにストリーミングします。 (クエリ: `container`) |
+
 
 ## 6. セットアップ・環境構築・開発手順
 
@@ -609,22 +727,23 @@ sequenceDiagram
 ### 6.3. スクリプトと開発タスク
 プロジェクトルートには、開発を効率化するためのバッチスクリプトが用意されています。
 
-| スクリプト | 説明 |
-|---|---|
-| `setup.bat` | **初回セットアップ用**。Google OAuth情報を対話的に設定し、`.env`ファイルを生成後、全サービスのDockerイメージをビルドして起動します。最初に一度だけ実行すれば十分です。 |
-| `start.bat` | **通常起動用**。`docker-compose up -d`を実行し、すべてのコンテナをバックグラウンドで起動します。 |
-| `update.bat` | **完全再起動用**。すべてのコンテナをシャットダウンしたのち、キャッシュを用いらない完全再起動を行います。 |
-| `stop.bat` | **通常停止用**。`docker-compose down`を実行し、すべてのコンテナを停止・削除します。 |
-| `clean.bat` | **完全クリーンアップ用**。コンテナ、ネットワーク、**すべてのボリューム（DBデータ含む）**、イメージを完全に削除します。環境をリセットしたい場合に使用します。**データがすべて失われるため注意してください。** |
-| `cleanup_games.bat` | ゲームのデータ（DBレコードとMinIO上のファイル）のみをすべて削除します。 |
-| `cleanup_videos.bat` | ローカルストレージに保存されている動画とサムネイルのファイルのみをすべて削除します。（DBレコードは残ります） |
-| `cleanup_static_sites.bat` | 静的サイトのデータ（DBレコードとMinIO上のファイル）のみをすべて削除します。 |
+| スクリプト                     | 説明                                                                                                     |
+|---------------------------|--------------------------------------------------------------------------------------------------------|
+| `setup.bat`               | **初回セットアップ用**。Google OAuth情報を対話的に設定し、`.env`ファイルを生成後、全サービスのDockerイメージをビルドして起動します。最初に一度だけ実行すれば十分です。      |
+| `start.bat`               | **通常起動用**。`docker-compose up -d`を実行し、すべてのコンテナをバックグラウンドで起動します。                                          |
+| `update.bat`              | **完全再起動用**。すべてのコンテナを落としたのち、キャッシュを使わない完全な再起動を行います。変更を反映させるために使用するデバッグ用です。                               |
+| `stop.bat`                | **通常停止用**。`docker-compose down`を実行し、すべてのコンテナを停止・削除します。                                                 |
+| `clean.bat`               | **完全クリーンアップ用**。コンテナ、ネットワーク、**すべてのボリューム（DBデータ含む）**、イメージを完全に削除します。環境をリセットしたい場合に使用します。**データがすべて失われるため注意してください。** |
+| `cleanup_games.bat`       | ゲームのデータ（DBレコードとMinIO上のファイル）のみをすべて削除します。                                                                |
+| `cleanup_videos.bat`      | ローカルストレージに保存されている動画とサムネイルのファイルのみをすべて削除します。（DBレコードは残ります）                                                |
+| `cleanup_static_sites.bat` | 静的サイトのデータ（DBレコードとMinIO上のファイル）のみをすべて削除します。                                                              |
 
 ### 6.4. 起動手順
 1. `setup.bat`を実行して初期設定と初回起動を行います。
 2. 2回目以降は`start.bat`で起動、`stop.bat`で停止します。
-3. `http://localhost:3001` にアクセスしてフロントエンドが表示されることを確認します。
-4. 各サービスのログは `docker-compose logs -f <service_name>` で確認できます。
+3. `http://localhost:3001` にアクセスしてメインのフロントエンドが表示されることを確認します。
+4. **(任意)** 監視ダッシュボードを利用する場合は、`monitoring-service`ディレクトリ内で`docker-compose -f docker-compose.monitoring.yml up -d --build`を実行し、`http://localhost:8090`にアクセスします。
+5. 各サービスのログは `docker-compose logs -f <service_name>` で確認できます。監視ダッシュボードからもリアルタイムで閲覧可能です。
 
 ## 7. デプロイ・運用・トラブルシューティング
 
@@ -638,10 +757,10 @@ sequenceDiagram
   5. 本番環境で `docker-compose pull` と `docker-compose up -d --no-deps <service_name>` を実行し、サービスをローリングアップデート。
 
 ### トラブルシューティング
-- **サービスが起動しない:** `docker-compose logs <service_name>` でエラーログを確認してください。多くの場合、環境変数の設定ミスや、依存サービス（DBなど）の起動失敗が原因です。
+- **サービスが起動しない:** `docker-compose logs <service_name>` でエラーログを確認してください。多くの場合、環境変数の設定ミスや、依存サービス（DBなど）の起動失敗が原因です。監視ダッシュボードが起動している場合は、コンテナの状態やログから原因を特定できることがあります。
 - **ファイルがアップロードできない:** `upload-service`や`sfsp-api`のログを確認してください。SFSPサービスが利用できない、またはMinIOへの接続に失敗している可能性があります。
 - **動画・ゲームが処理されない:** `sfsp-worker`や各コンテンツの`worker`（`game-worker`など）のログを確認してください。Redisへの接続、スキャンプロセスのエラー、FFmpegの実行エラーなどが考えられます。
-- **コンテンツが表示されない:** `frontend`のNginx設定や、各`storage`のバケットポリシー、ファイルパスが正しいか確認してください。
+- **コンテンツが表示されない:** `frontend`のNginx設定や、各`storage`のバケットポリシー、ファイルパスが正しいか確認してください。監視ダッシュボードのストレージブラウザ機能で、MinIO上にファイルが正しく配置されているか確認できます。
 
 ## 8. コントリビューション・開発規約
 

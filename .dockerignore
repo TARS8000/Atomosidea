@@ -24,12 +24,12 @@ coverage
 # These should be managed by runtime volumes, not embedded in images.
 uploads
 videos
-security/test-samples
-security/reports
+backend/security/sfsp/test-samples
+backend/security/sfsp/reports
 game_storage_db
-profile_storage_db
-static_site_storage_db
-video_storage_db
+backend/auth/auth-storage/profile_storage_db
+backend/static-site-service/static_site_storage_db
+backend/video-service/video_storage_db
 
 # Specific media file extensions
 *.mp4

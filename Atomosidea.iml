@@ -3,15 +3,15 @@
   <component name="NewModuleRootManager" inherit-compiler-output="true">
     <exclude-output />
     <content url="file://$MODULE_DIR$">
-      <excludeFolder url="file://$MODULE_DIR$/static_site_storage_db" />
-      <excludeFolder url="file://$MODULE_DIR$/video_storage_db/videos" />
-      <excludeFolder url="file://$MODULE_DIR$/game_storage_data" />
       <excludeFolder url="file://$MODULE_DIR$/game_storage_db" />
-      <excludeFolder url="file://$MODULE_DIR$/profile_storage_data" />
-      <excludeFolder url="file://$MODULE_DIR$/profile_storage_db" />
-      <excludeFolder url="file://$MODULE_DIR$/static_site_storage_data" />
-      <excludeFolder url="file://$MODULE_DIR$/video_storage_data" />
-      <excludeFolder url="file://$MODULE_DIR$/video_storage_db" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/auth/auth-storage/profile_storage_data" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/auth/auth-storage/profile_storage_db" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/game-service/game_storage_data" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/static-site-service/static_site_storage_data" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/static-site-service/static_site_storage_db" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/video-service/video_storage_data" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/video-service/video_storage_db" />
+      <excludeFolder url="file://$MODULE_DIR$/backend/video-service/video_storage_db/videos" />
     </content>
     <orderEntry type="sourceFolder" forTests="false" />
   </component>

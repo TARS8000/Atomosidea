@@ -6,15 +6,39 @@
 # Dependencies
 node_modules/
 
-# Local Storage (Docker volumes for MinIO and PostgreSQL data)
-video_storage_data/
-game_storage_data/
-profile_storage_data/
-static_site_storage_data/
-sfsp_db_data/
-sfsp_minio_data/
-auth_db_data/
-app_db_data/
+# Build outputs
+/build/
+/dist/
+*.exe
+*.out
+
+# Local Docker data volumes
+# These directories are generated locally to store persistent data for databases and storage.
+/auth_db_data/
+/app_db_data/
+/profile_db_data/
+/sfsp_db_data/
+/video_storage_data/
+/game_storage_data/
+/profile_storage_data/
+/static_site_storage_data/
+/backend/auth/auth-storage/profile_storage_data/
+/backend/security/sfsp-storage/
+/sfsp_minio_data/
+/sfsp_raw_minio_data/
+/sfsp_clean_minio_data/
+/test_field/
+
+# Deprecated local storage folders (if any)
+/backend/datebase/app_storage_db/
 
 # Environment files
+# Contains sensitive credentials and local settings.
+# A .env.example file should be committed instead.
 .env
+.env.*
+!.env.example
+
+# Log files
+*.log
+logs/

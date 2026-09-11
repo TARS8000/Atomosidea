@@ -1,178 +1,147 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import { Container, TextField, Button, Typography, Box, CircularProgress, Alert, Paper, Grid } from '@mui/material';
+import { Container, TextField, Button, Typography, Box, CircularProgress, Alert } from '@mui/material';
 import { useAuth } from '../context/AuthContext';
 
-interface Video {
-  title: string;
-  description: string;
-  thumbnail_path?: string;
-}
-
 const EditVideoPage = () => {
-  const { id } = useParams<{ id: string }>();
+  const { id } = useParams();
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [thumbnail, setThumbnail] = useState<File | null>(null);
+  const [existingThumbnailUrl, setExistingThumbnailUrl] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [updating, setUpdating] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const navigate = useNavigate();
   const { token } = useAuth();
 
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [currentThumbnail, setCurrentThumbnail] = useState<string>('');
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
-
   useEffect(() => {
-    if (!id) {
-      setLoading(true);
-      return;
-    }
     const fetchVideo = async () => {
       try {
-        setLoading(true);
-        const response = await axios.get(`/api/videos/${id}`);
-        const video: Video = response.data;
-        setTitle(video.title);
-        setDescription(video.description || '');
-        if (video.thumbnail_path) {
-          setCurrentThumbnail(video.thumbnail_path);
-        }
+        const response = await axios.get(`/api/videos/${id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setTitle(response.data.title);
+        setDescription(response.data.description);
+        setExistingThumbnailUrl(response.data.thumbnail_path);
       } catch (err) {
-        setError('動画詳細の読み込みに失敗しました。');
+        setError('ビデオ情報の取得に失敗しました。');
       } finally {
         setLoading(false);
       }
     };
     fetchVideo();
-  }, [id]);
+  }, [id, token]);
 
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!title.trim()) {
-      setError('タイトルを入力してください。');
-      return;
+  const handleThumbnailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      setThumbnail(e.target.files[0]);
     }
+  };
 
-    setSaving(true);
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUpdating(true);
     setError('');
     setSuccess('');
 
-    try {
-      // バックエンドの JSON バインディング形式に合わせて送信
-      await axios.put(
-          `/api/videos/${id}`,
-          {
-            title: title,
-            description: description,
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-          }
-      );
+    const formData = new FormData();
+    formData.append('title', title);
+    formData.append('description', description);
+    if (thumbnail) {
+      formData.append('thumbnail', thumbnail);
+    }
 
-      setSuccess('動画詳細を更新しました！');
-      setTimeout(() => navigate(`/videos/${id}`), 1500);
+    try {
+      // Note: axios will set the correct Content-Type for FormData
+      await axios.put(`/api/videos/${id}`, formData, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      setSuccess('ビデオ情報が更新されました。');
+      setTimeout(() => navigate(`/videos/${id}`), 2000);
     } catch (err) {
-      if (axios.isAxiosError(err) && err.response) {
-        setError(err.response.data.error || '動画の更新に失敗しました。');
-      } else {
-        setError('不明なエラーが発生しました。');
-      }
+      setError('更新に失敗しました。');
     } finally {
-      setSaving(false);
+      setUpdating(false);
+    }
+  };
+
+  const handleDeleteThumbnail = async () => {
+    if (!window.confirm('本当にサムネイルを削除しますか？')) {
+      return;
+    }
+    setUpdating(true);
+    try {
+      await axios.delete(`/api/videos/${id}/thumbnail`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setExistingThumbnailUrl('');
+      setSuccess('サムネイルが削除されました。');
+    } catch (err) {
+      setError('サムネイルの削除に失敗しました。');
+    } finally {
+      setUpdating(false);
     }
   };
 
   if (loading) {
-    return (
-        <Box display="flex" justifyContent="center" my={4}>
-          <CircularProgress />
-        </Box>
-    );
-  }
-
-  if (error && !title) {
-    return (
-        <Container maxWidth="md">
-          <Alert severity="error">{error}</Alert>
-        </Container>
-    );
+    return <CircularProgress />;
   }
 
   return (
-      <Container maxWidth="md">
-        <Typography variant="h4" component="h1" gutterBottom sx={{ mt: 2 }}>
-          動画詳細を編集
-        </Typography>
-        <form onSubmit={handleSave}>
-          <Grid container spacing={3}>
-            <Grid item xs={12} md={8}>
-              <Box mb={2}>
-                <TextField
-                    label="タイトル"
-                    variant="outlined"
-                    fullWidth
-                    required
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                />
-              </Box>
-              <Box mb={2}>
-                <TextField
-                    label="説明"
-                    variant="outlined"
-                    fullWidth
-                    multiline
-                    rows={10}
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                />
-              </Box>
-            </Grid>
-            <Grid item xs={12} md={4}>
-              <Typography variant="subtitle1" gutterBottom>サムネイル</Typography>
-              <Paper
-                  variant="outlined"
-                  sx={{
-                    p: 1,
-                    mb: 2,
-                    height: 194,
-                    display: 'flex',
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                    backgroundColor: '#f5f5f5',
-                  }}
-              >
-                {currentThumbnail ? (
-                    <img src={currentThumbnail} alt="Thumbnail preview" style={{ maxHeight: '100%', maxWidth: '100%' }} />
-                ) : (
-                    <Typography color="text.secondary">サムネイルなし</Typography>
-                )}
-              </Paper>
-            </Grid>
-          </Grid>
-          <Box mt={4} display="flex" justifyContent="center" gap={2}>
-            <Button
-                variant="outlined"
-                size="large"
-                onClick={() => navigate(`/videos/${id}`)}
-                disabled={saving}
-            >
-              キャンセル
-            </Button>
-            <Button type="submit" variant="contained" color="primary" size="large" disabled={saving}>
-              {saving ? <CircularProgress size={24} /> : '変更を保存'}
+    <Container maxWidth="sm">
+      <Typography variant="h4" component="h1" gutterBottom>
+        ビデオ情報を編集
+      </Typography>
+      <form onSubmit={handleSubmit}>
+        <Box mb={2}>
+          <TextField
+            label="タイトル"
+            variant="outlined"
+            fullWidth
+            required
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+        </Box>
+        <Box mb={2}>
+          <TextField
+            label="説明"
+            variant="outlined"
+            fullWidth
+            multiline
+            rows={4}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </Box>
+        <Box mb={2}>
+          <Button variant="contained" component="label">
+            新しいサムネイルを選択
+            <input type="file" hidden accept="image/*" onChange={handleThumbnailChange} />
+          </Button>
+          {thumbnail && <Typography sx={{ ml: 2, display: 'inline' }}>{thumbnail.name}</Typography>}
+        </Box>
+        {existingThumbnailUrl && (
+          <Box mb={2}>
+            <Typography variant="subtitle1">現在のサムネイル</Typography>
+            <img src={existingThumbnailUrl} alt="Thumbnail" style={{ maxWidth: '100%', height: 'auto' }} />
+            <Button variant="outlined" color="secondary" onClick={handleDeleteThumbnail} sx={{ mt: 1 }}>
+              サムネイルを削除
             </Button>
           </Box>
-          {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
-          {success && <Alert severity="success" sx={{ mt: 2 }}>{success}</Alert>}
-        </form>
-      </Container>
+        )}
+        <Button type="submit" variant="contained" color="primary" disabled={updating}>
+          {updating ? <CircularProgress size={24} /> : '更新'}
+        </Button>
+        {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
+        {success && <Alert severity="success" sx={{ mt: 2 }}>{success}</Alert>}
+      </form>
+    </Container>
   );
 };
 

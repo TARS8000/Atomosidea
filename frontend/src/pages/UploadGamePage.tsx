@@ -56,7 +56,7 @@ const UploadGamePage = () => {
     try {
       const response = await axios.post('/api/games/upload', formData, {
         headers: {
-          'Content-Type': 'multipart/form-data',
+          // 'Content-Type': 'multipart/form-data', // この行を削除
           Authorization: `Bearer ${token}`,
         },
         onUploadProgress: (progressEvent) => {

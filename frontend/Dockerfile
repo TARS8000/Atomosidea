@@ -1,5 +1,5 @@
-# Build stage
-FROM node:18-alpine AS builder
+# Build stage (Node.js 20 へ変更)
+FROM node:20-alpine AS builder
 WORKDIR /app
 
 # Set build arguments
@@ -10,8 +10,8 @@ ARG VITE_STATIC_SITE_DOMAIN
 ENV VITE_STATIC_SITE_DOMAIN=${VITE_STATIC_SITE_DOMAIN}
 
 COPY package*.json ./
-# Explicitly remove node_modules before npm install to prevent ETXTBSY errors
-RUN rm -rf node_modules && npm install
+# npm キャッシュのクリアと安定版オプションでのインストール
+RUN npm cache clean --force && rm -rf node_modules && npm install --legacy-peer-deps
 COPY . .
 
 # Run the build command
