@@ -11,7 +11,7 @@ set DOCKER_BUILDKIT=1
 set COMPOSE_DOCKER_CLI_BUILD=1
 
 echo Step 1: Pulling latest changes from Git...
-git pull
+git pull || echo [WARN] git pull failed (uncommitted local changes present?). Continuing with current working tree - rebuild will use the local code.
 echo.
 
 echo Step 2: Stopping old containers...

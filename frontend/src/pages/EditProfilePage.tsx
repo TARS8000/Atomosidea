@@ -8,15 +8,15 @@ import ImageCropperModal from '../components/ImageCropperModal';
 const EditProfilePage = () => {
   const { token, user, updateUser } = useAuth();
   const navigate = useNavigate();
-  
+
   const [username, setUsername] = useState('');
   const [bio, setBio] = useState('');
-  
+
   const [icon, setIcon] = useState<File | null>(null);
   const [iconPreview, setIconPreview] = useState('');
   const [background, setBackground] = useState<File | null>(null);
   const [backgroundPreview, setBackgroundPreview] = useState('');
-  
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -25,6 +25,9 @@ const EditProfilePage = () => {
   const [imageToCrop, setImageToCrop] = useState('');
   const [cropAspect, setCropAspect] = useState(1);
   const [editingImageType, setEditingImageType] = useState<'icon' | 'background' | null>(null);
+
+  const [isScanningIcon, setIsScanningIcon] = useState(false);
+  const [isScanningBackground, setIsScanningBackground] = useState(false);
 
   useEffect(() => {
     const fetchProfile = async () => {
@@ -73,40 +76,93 @@ const EditProfilePage = () => {
     setCropperOpen(false);
   };
 
+  const pollProfile = async (signal: AbortSignal): Promise<{ iconUrl?: string; backgroundImageUrl?: string }> => {
+    return new Promise((resolve, reject) => {
+      const pollInterval = setInterval(async () => {
+        try {
+          const profileRes = await axios.get(`/api/profile/${user?.userID}`, { signal });
+          const profile = profileRes.data;
+          if (!profile.icon_sfsp_job_id && !profile.background_sfsp_job_id) {
+            clearInterval(pollInterval);
+            resolve({
+              iconUrl: profile.icon_url || iconPreview,
+              backgroundImageUrl: profile.background_image_url || backgroundPreview,
+            });
+          }
+        } catch (err) {
+          if (!axios.isCancel(err)) {
+            console.error('Polling profile failed:', err);
+          }
+        }
+      }, 2000);
+
+      signal.addEventListener('abort', () => {
+        clearInterval(pollInterval);
+        reject(new Error('Polling aborted'));
+      });
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
 
+    const controller = new AbortController();
+
     try {
       await axios.put('/api/profile', { username, bio }, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
       });
 
       let newIconUrl = iconPreview;
+      let newBackgroundUrl = backgroundPreview;
+
       if (icon) {
+        setIsScanningIcon(true);
         const formData = new FormData();
         formData.append('icon', icon);
         const res = await axios.put('/api/profile/icon', formData, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'multipart/form-data' },
+          signal: controller.signal,
         });
-        newIconUrl = res.data.icon_url;
+        if (res.data.status === 'scanning') {
+          const result = await pollProfile(controller.signal);
+          newIconUrl = result.iconUrl || iconPreview;
+        } else if (res.data.icon_url) {
+          newIconUrl = res.data.icon_url;
+        }
+        setIsScanningIcon(false);
       }
 
       if (background) {
+        setIsScanningBackground(true);
         const formData = new FormData();
         formData.append('background', background);
-        await axios.put('/api/profile/background', formData, {
+        const res = await axios.put('/api/profile/background', formData, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'multipart/form-data' },
+          signal: controller.signal,
         });
+        if (res.data.status === 'scanning') {
+          const result = await pollProfile(controller.signal);
+          newBackgroundUrl = result.backgroundImageUrl || backgroundPreview;
+        } else if (res.data.background_image_url) {
+          newBackgroundUrl = res.data.background_image_url;
+        }
+        setIsScanningBackground(false);
       }
 
-      updateUser({ username, iconUrl: newIconUrl });
+      updateUser({ username, iconUrl: newIconUrl, backgroundImageUrl: newBackgroundUrl });
 
       setSuccess('プロフィールを更新しました。');
       setTimeout(() => navigate('/mypage'), 1500);
     } catch (err) {
-      setError('プロフィールの更新に失敗しました。');
+      if (!axios.isCancel(err)) {
+        setError('プロフィールの更新に失敗しました。');
+        setIsScanningIcon(false);
+        setIsScanningBackground(false);
+      }
     }
   };
 
@@ -122,17 +178,24 @@ const EditProfilePage = () => {
       <form onSubmit={handleSubmit}>
         <Box sx={{ display: 'flex', alignItems: 'center', mb: 3 }}>
           <Avatar src={iconPreview} sx={{ width: 100, height: 100, mr: 2 }} />
-          <Button variant="contained" component="label">
-            アイコンを変更
-            <input type="file" hidden accept="image/*" onChange={(e) => handleFileSelect(e, 'icon')} />
-          </Button>
+          <Box>
+            <Button variant="contained" component="label">
+              アイコンを変更
+              <input type="file" hidden accept="image/*" onChange={(e) => handleFileSelect(e, 'icon')} />
+            </Button>
+            {isScanningIcon && (
+              <Typography variant="caption" sx={{ display: 'block', mt: 1, color: 'warning.main' }}>
+                セキュリティスキャン中...
+              </Typography>
+            )}
+          </Box>
         </Box>
         <Box sx={{ mb: 3 }}>
           <Typography gutterBottom>背景画像</Typography>
           <Box
             sx={{
               width: '100%',
-              aspectRatio: '679 / 160', // Set aspect ratio to 679:160
+              aspectRatio: '679 / 160',
               border: '1px dashed grey',
               backgroundImage: `url(${backgroundPreview})`,
               backgroundSize: 'cover',
@@ -143,10 +206,17 @@ const EditProfilePage = () => {
               cursor: 'pointer',
               borderRadius: 1,
               color: 'text.secondary',
+              position: 'relative',
             }}
             component="label"
           >
             {!backgroundPreview && "クリックして画像を選択"}
+            {isScanningBackground && (
+              <Box sx={{ position: 'absolute', bgcolor: 'rgba(0,0,0,0.6)', color: 'white', p: 1, borderRadius: 1 }}>
+                <CircularProgress size={16} sx={{ color: 'white', mr: 1 }} />
+                スキャン中...
+              </Box>
+            )}
             <input type="file" hidden accept="image/*" onChange={(e) => handleFileSelect(e, 'background')} />
           </Box>
         </Box>

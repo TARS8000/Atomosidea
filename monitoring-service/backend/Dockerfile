@@ -1,5 +1,5 @@
 # ビルドステージ
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Git や証明書など依存ライブラリの取得に必要なツールをインストール
 RUN apk add --no-cache git ca-certificates

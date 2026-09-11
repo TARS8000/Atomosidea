@@ -22,7 +22,7 @@ services:
       - "custom.mypage_service_db_password=${MYPAGE_SERVICE_DB_PASSWORD}"
     volumes:
       - auth_db_data:/var/lib/postgresql/data
-      - ./auth-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./backend/auth/auth-datebase/auth-db/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - backend-db-network
 
@@ -38,7 +38,7 @@ services:
       POSTGRES_DB: app_db
     volumes:
       - app_db_data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./backend/datebase/app-db/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - backend-db-network
 
@@ -54,7 +54,7 @@ services:
       POSTGRES_DB: profile_db
     volumes:
       - profile_db_data:/var/lib/postgresql/data
-      - ./profile-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./backend/auth/auth-datebase/profile-db/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - backend-db-network
 
@@ -70,7 +70,7 @@ services:
       POSTGRES_DB: sfsp_db
     volumes:
       - sfsp_db_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d
+      - ./backend/security/sfsp-db:/docker-entrypoint-initdb.d
     networks:
       - backend-db-network
       - sfsp-isolated-net
@@ -100,7 +100,7 @@ services:
       MINIO_ROOT_USER: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
     volumes:
-      - ./static_site_storage_data:/data
+      - ./backend/static-site-service/static_site_storage_data:/data
     networks:
       - atmosidea-network
 
@@ -115,7 +115,7 @@ services:
       MINIO_ROOT_USER: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
       MINIO_ROOT_PASSWORD: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
     volumes:
-      - ./video_storage_data:/data
+      - ./backend/video-service/video_storage_data:/data
     networks:
       - atmosidea-network
 
@@ -130,7 +130,7 @@ services:
       MINIO_ROOT_USER: ${PROFILE_MINIO_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
     volumes:
-      - ./profile_storage_data:/data
+      - ./backend/auth/auth-storage/profile_storage_data:/data
     networks:
       - atmosidea-network
 
@@ -145,7 +145,7 @@ services:
       MINIO_ROOT_USER: ${GAME_MINIO_ACCESS_KEY_ID}
       MINIO_ROOT_PASSWORD: ${GAME_MINIO_SECRET_ACCESS_KEY}
     volumes:
-      - ./game_storage_data:/data
+      - ./backend/game-service/game_storage_data:/data
     networks:
       - atmosidea-network
 
@@ -160,7 +160,7 @@ services:
       MINIO_ROOT_USER: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
     volumes:
-      - ./sfsp_raw_minio_data:/data
+      - ./backend/security/sfsp-storage/sfsp_raw_minio_data:/data
     networks:
       - sfsp-isolated-net
 
@@ -175,7 +175,7 @@ services:
       MINIO_ROOT_USER: ${SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${SFSP_CLEAN_MINIO_ROOT_SECRET_KEY}
     volumes:
-      - ./sfsp_clean_minio_data:/data
+      - ./backend/security/sfsp-storage/sfsp_clean_minio_data:/data
     networks:
       - sfsp-isolated-net
 
@@ -209,6 +209,8 @@ services:
       SFSP_GAME_WORKER_SECRET_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
       SFSP_STATIC_SITE_WORKER_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
       SFSP_STATIC_SITE_WORKER_SECRET_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
+      SFSP_PROFILE_WORKER_ACCESS_KEY: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
+      SFSP_PROFILE_WORKER_SECRET_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
       SFSP_WORKER_RAW_ACCESS_KEY: ${SFSP_WORKER_RAW_ACCESS_KEY}
       SFSP_WORKER_RAW_SECRET_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
       SFSP_WORKER_CLEAN_ACCESS_KEY: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
@@ -259,6 +261,7 @@ services:
       mc admin policy create sfsp-clean sfsp-api-policy /tmp/sfsp-api-policy.json;
       mc admin policy create sfsp-clean sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
       mc admin policy create sfsp-clean sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
+      mc admin policy create sfsp-clean sfsp-profile-worker-policy /tmp/sfsp-profile-worker-policy.json;
       mc admin policy create sfsp-raw sfsp-worker-raw-policy /tmp/sfsp-worker-raw-policy.json;
       mc admin policy create sfsp-clean sfsp-worker-clean-policy /tmp/sfsp-worker-clean-policy.json;
 
@@ -272,10 +275,13 @@ services:
       mc admin user add sfsp-clean \"$SFSP_GAME_WORKER_ACCESS_KEY\" \"$SFSP_GAME_WORKER_SECRET_KEY\" || true;
       mc admin policy attach sfsp-clean sfsp-game-worker-policy --user=\"$SFSP_GAME_WORKER_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean \"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" \"$SFSP_STATIC_SITE_WORKER_SECRET_KEY\" || true;
-      mc admin policy attach sfsp-clean sfsp-static-site-worker-policy --user=\"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" || true;
+      mc admin user add sfsp-clean "$SFSP_STATIC_SITE_WORKER_ACCESS_KEY" "$SFSP_STATIC_SITE_WORKER_SECRET_KEY" || true;
+      mc admin policy attach sfsp-clean sfsp-static-site-worker-policy --user="$SFSP_STATIC_SITE_WORKER_ACCESS_KEY" || true;
 
-      mc admin user add sfsp-raw \"$SFSP_WORKER_RAW_ACCESS_KEY\" \"$SFSP_WORKER_RAW_SECRET_KEY\" || true;
+      mc admin user add sfsp-clean "$SFSP_PROFILE_WORKER_ACCESS_KEY" "$SFSP_PROFILE_WORKER_SECRET_KEY" || true;
+      mc admin policy attach sfsp-clean sfsp-profile-worker-policy --user="$SFSP_PROFILE_WORKER_ACCESS_KEY" || true;
+
+      mc admin user add sfsp-raw "$SFSP_WORKER_RAW_ACCESS_KEY" "$SFSP_WORKER_RAW_SECRET_KEY" || true;
       mc admin policy attach sfsp-raw sfsp-worker-raw-policy --user=\"$SFSP_WORKER_RAW_ACCESS_KEY\" || true;
 
       mc admin user add sfsp-clean \"$SFSP_WORKER_CLEAN_ACCESS_KEY\" \"$SFSP_WORKER_CLEAN_SECRET_KEY\" || true;
@@ -284,12 +290,13 @@ services:
       echo 'All MinIO buckets and SFSP policies/users initialized successfully!';
       "
     volumes:
-      - ./minio-init/sfsp-upload-policy.json:/tmp/sfsp-upload-policy.json:ro
-      - ./minio-init/sfsp-api-policy.json:/tmp/sfsp-api-policy.json:ro
-      - ./minio-init/sfsp-game-worker-policy.json:/tmp/sfsp-game-worker-policy.json:ro
-      - ./minio-init/sfsp-static-site-worker-policy.json:/tmp/sfsp-static-site-worker-policy.json:ro
-      - ./minio-init/sfsp-worker-raw-policy.json:/tmp/sfsp-worker-raw-policy.json:ro
-      - ./minio-init/sfsp-worker-clean-policy.json:/tmp/sfsp-worker-clean-policy.json:ro
+      - ./backend/minio-init/sfsp-upload-policy.json:/tmp/sfsp-upload-policy.json:ro
+      - ./backend/minio-init/sfsp-api-policy.json:/tmp/sfsp-api-policy.json:ro
+      - ./backend/minio-init/sfsp-game-worker-policy.json:/tmp/sfsp-game-worker-policy.json:ro
+      - ./backend/minio-init/sfsp-static-site-worker-policy.json:/tmp/sfsp-static-site-worker-policy.json:ro
+      - ./backend/minio-init/sfsp-profile-worker-policy.json:/tmp/sfsp-profile-worker-policy.json:ro
+      - ./backend/minio-init/sfsp-worker-raw-policy.json:/tmp/sfsp-worker-raw-policy.json:ro
+      - ./backend/minio-init/sfsp-worker-clean-policy.json:/tmp/sfsp-worker-clean-policy.json:ro
     networks:
       - atmosidea-network
       - sfsp-isolated-net
@@ -308,8 +315,8 @@ services:
     ports:
       - "3001:80"
     volumes:
-      - ./video_storage_data/videos:/storage/videos:ro
-      - ./video_storage_data/thumbnails:/storage/thumbnails:ro
+      - ./backend/video-service/video_storage_data/videos:/storage/videos:ro
+      - ./backend/video-service/video_storage_data/thumbnails:/storage/thumbnails:ro
       - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       auth-service:
@@ -332,7 +339,7 @@ services:
   auth-service:
     build:
       context: .
-      dockerfile: auth-service/Dockerfile
+      dockerfile: backend/auth/auth-worker/auth-service/Dockerfile
     container_name: atmosidea-auth-service
     restart: always
     env_file:
@@ -384,7 +391,7 @@ services:
   profile-service:
     build:
       context: .
-      dockerfile: profile-service/Dockerfile
+      dockerfile: backend/auth/auth-worker/profile-service/Dockerfile
     container_name: atmosidea-profile-service
     restart: always
     env_file:
@@ -396,6 +403,14 @@ services:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
+      redis:
+        condition: service_started
+      sfsp-api:
+        condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@profile-db:5432/profile_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
@@ -404,14 +419,30 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: user-profiles
       MINIO_USE_SSL: ${MINIO_USE_SSL}
+      SFSP_API_URL: http://sfsp-api:8080
+      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
+      SFSP_MINIO_USE_SSL: "false"
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
     networks:
       - atmosidea-network
       - backend-db-network
+      - sfsp-isolated-net
 
   upload-service:
     build:
       context: .
-      dockerfile: upload-service/Dockerfile
+      dockerfile: backend/video-service/video-upload-api/Dockerfile
     container_name: atmosidea-upload-service
     restart: always
     env_file:
@@ -455,8 +486,8 @@ services:
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379
     volumes:
-      - ./video_storage_data/videos:/storage/videos
-      - ./video_storage_data/thumbnails:/storage/thumbnails
+      - ./backend/video-service/video_storage_data/videos:/storage/videos
+      - ./backend/video-service/video_storage_data/thumbnails:/storage/thumbnails
     networks:
       - atmosidea-network
       - backend-db-network
@@ -465,7 +496,7 @@ services:
   stream-service:
     build:
       context: .
-      dockerfile: stream-service/Dockerfile
+      dockerfile: backend/video-service/video-worker/Dockerfile
     container_name: atmosidea-stream-service
     restart: always
     env_file:
@@ -482,7 +513,7 @@ services:
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
     volumes:
-      - ./video_storage_data/videos:/storage/videos:ro
+      - ./backend/video-service/video_storage_data/videos:/storage/videos:ro
     networks:
       - atmosidea-network
       - backend-db-network
@@ -490,7 +521,7 @@ services:
   game-upload-api:
     build:
       context: .
-      dockerfile: game-upload-api/Dockerfile
+      dockerfile: backend/game-service/game-upload-api/Dockerfile
     container_name: atmosidea-game-upload-api
     restart: always
     env_file:
@@ -541,7 +572,7 @@ services:
   game-worker:
     build:
       context: .
-      dockerfile: game-worker/Dockerfile
+      dockerfile: backend/game-service/game-worker/Dockerfile
     container_name: atmosidea-game-worker
     restart: always
     env_file:
@@ -589,7 +620,7 @@ services:
   static-site-upload-api:
     build:
       context: .
-      dockerfile: static-site-upload-api/Dockerfile
+      dockerfile: backend/static-site-service/static-site-upload-api/Dockerfile
     container_name: atmosidea-static-site-upload-api
     restart: always
     env_file:
@@ -640,7 +671,7 @@ services:
   static-site-worker:
     build:
       context: .
-      dockerfile: static-site-worker/Dockerfile
+      dockerfile: backend/static-site-service/static-site-worker/Dockerfile
     container_name: atmosidea-static-site-worker
     restart: always
     env_file:
@@ -688,7 +719,7 @@ services:
   mypage-service:
     build:
       context: .
-      dockerfile: mypage-service/Dockerfile
+      dockerfile: backend/auth/mypage-worker/Dockerfile
     container_name: atmosidea-mypage-service
     restart: always
     env_file:
@@ -712,7 +743,7 @@ services:
   sfsp-api:
     build:
       context: .
-      dockerfile: security/docker/api/Dockerfile
+      dockerfile: backend/security/sfsp/docker/api/Dockerfile
     container_name: sfsp-api
     restart: always
     env_file:
@@ -759,7 +790,7 @@ services:
   sfsp-worker:
     build:
       context: .
-      dockerfile: security/docker/worker/Dockerfile
+      dockerfile: backend/security/sfsp/docker/worker/Dockerfile
     container_name: sfsp-worker
     restart: always
     env_file:
@@ -818,7 +849,7 @@ services:
     volumes:
       - ./.env:/app/.env:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./security/yara-rules:/etc/yara-rules:ro
+      - ./backend/security/sfsp/yara-rules:/etc/yara-rules:ro
       - sfsp_temp_scan:/tmp/sfsp-scan
     networks:
       - sfsp-isolated-net
@@ -827,7 +858,7 @@ services:
   sfsp-clamav-client:
     build:
       context: .
-      dockerfile: security/docker/clamav-client/Dockerfile
+      dockerfile: backend/security/sfsp/docker/clamav-client/Dockerfile
     image: sfsp-clamav-client:latest
     container_name: sfsp-clamav-client-builder
     restart: "no"
@@ -836,7 +867,7 @@ services:
   sfsp-yara-client:
     build:
       context: .
-      dockerfile: security/docker/yara-client/Dockerfile
+      dockerfile: backend/security/sfsp/docker/yara-client/Dockerfile
     image: sfsp-yara-client:latest
     container_name: sfsp-yara-client-builder
     restart: "no"

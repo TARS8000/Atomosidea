@@ -22,16 +22,15 @@ node_modules/
 /game_storage_data/
 /profile_storage_data/
 /static_site_storage_data/
+/backend/auth/auth-storage/profile_storage_data/
+/backend/security/sfsp-storage/
 /sfsp_minio_data/
 /sfsp_raw_minio_data/
 /sfsp_clean_minio_data/
+/test_field/
 
 # Deprecated local storage folders (if any)
-/app_storage_db/
-/auth_storage_db/
-/profile_storage_db/
-/static_site_storage_db/
-/video_storage_db/
+/backend/datebase/app_storage_db/
 
 # Environment files
 # Contains sensitive credentials and local settings.

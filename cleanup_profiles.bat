@@ -23,13 +23,13 @@ if /i not "%are_you_sure%"=="y" (
 )
 
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'Step 1: Cleaning up the ''profile_storage_data'' directory...'"
-if exist "profile_storage_data" (
-    rmdir /S /Q "profile_storage_data"
-    mkdir "profile_storage_data"
+powershell -command "Write-Host 'Step 1: Cleaning up the ''backend\auth\auth-storage\profile_storage_data'' directory...'"
+if exist "backend\auth\auth-storage\profile_storage_data" (
+    rmdir /S /Q "backend\auth\auth-storage\profile_storage_data"
+    mkdir "backend\auth\auth-storage\profile_storage_data"
     powershell -command "Write-Host '  -> All profile assets have been deleted.'"
 ) else (
-    powershell -command "Write-Host '  -> ''profile_storage_data'' does not exist.'"
+    powershell -command "Write-Host '  -> ''backend\auth\auth-storage\profile_storage_data'' does not exist.'"
 )
 
 powershell -command "Write-Host ''"

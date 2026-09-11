@@ -23,23 +23,23 @@ if /i not "%are_you_sure%"=="y" (
 )
 
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'Step 1: Cleaning up the ''video_storage_data\\videos'' directory...'"
-if exist "video_storage_data\videos" (
-    rmdir /S /Q "video_storage_data\videos"
-    mkdir "video_storage_data\videos"
+powershell -command "Write-Host 'Step 1: Cleaning up the ''backend\video-service\video_storage_data\\videos'' directory...'"
+if exist "backend\video-service\video_storage_data\videos" (
+    rmdir /S /Q "backend\video-service\video_storage_data\videos"
+    mkdir "backend\video-service\video_storage_data\videos"
     powershell -command "Write-Host '  -> All video files have been deleted.'"
 ) else (
-    powershell -command "Write-Host '  -> ''video_storage_data\\videos'' does not exist.'"
+    powershell -command "Write-Host '  -> ''backend\video-service\video_storage_data\\videos'' does not exist.'"
 )
 
 powershell -command "Write-Host ''"
-powershell -command "Write-Host 'Step 2: Cleaning up the ''video_storage_data\\thumbnails'' directory...'"
-if exist "video_storage_data\thumbnails" (
-    rmdir /S /Q "video_storage_data\thumbnails"
-    mkdir "video_storage_data\thumbnails"
+powershell -command "Write-Host 'Step 2: Cleaning up the ''backend\video-service\video_storage_data\\thumbnails'' directory...'"
+if exist "backend\video-service\video_storage_data\thumbnails" (
+    rmdir /S /Q "backend\video-service\video_storage_data\thumbnails"
+    mkdir "backend\video-service\video_storage_data\thumbnails"
     powershell -command "Write-Host '  -> All thumbnail files have been deleted.'"
 ) else (
-    powershell -command "Write-Host '  -> ''video_storage_data\\thumbnails'' does not exist.'"
+    powershell -command "Write-Host '  -> ''backend\video-service\video_storage_data\\thumbnails'' does not exist.'"
 )
 
 powershell -command "Write-Host ''"
