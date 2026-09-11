@@ -1,0 +1,94 @@
+@echo off
+setlocal enabledelayedexpansion
+
+:: ============================================================================
+::  Aider / Local LLM 専用 統合・安全ガード付き実行バッチ (run.bat)
+:: ============================================================================
+
+:: 1. 作業ディレクトリ（プロジェクトルート）の取得と境界チェック
+set "PROJECT_ROOT=%CD%"
+
+:: プロジェクトルートが C:\ 直下や C:\Windows などの危険領域でないか安全チェック
+if /i "%PROJECT_ROOT%"=="C:\" (
+    echo [ERROR] SAFETY GUARD: Running directly on C:\ is prohibited!
+    exit /b 1
+)
+if /i "%PROJECT_ROOT%"=="C:\Windows" (
+    echo [ERROR] SAFETY GUARD: Running in system directory is prohibited!
+    exit /b 1
+)
+
+:: 第1引数が空の場合は使い方を表示
+if "%1"=="" goto USAGE
+
+:: 第1引数で処理を分岐
+if /i "%1"=="find-docs" goto FIND_DOCS
+if /i "%1"=="add-all"    goto ADD_ALL
+if /i "%1"=="tree"       goto TREE
+if /i "%1"=="clean"      goto SAFE_CLEAN
+
+goto USAGE
+
+:: ----------------------------------------------------------------------------
+:: [find-docs] プロジェクト内の構成ファイル・ドキュメント一覧を安全に抽出
+:: ----------------------------------------------------------------------------
+:FIND_DOCS
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$root = '$PROJECT_ROOT';" ^
+    "Get-ChildItem -Path $root -Recurse -File -Include '*.md','Dockerfile*','docker-compose*','*.yml','*.json' -ErrorAction SilentlyContinue | " ^
+    "Where-Object { $_.FullName.StartsWith($root) -and $_.FullName -notmatch '\\(\.git|node_modules|__pycache__|\.venv)\\' } | " ^
+    "ForEach-Object { $_.FullName }"
+goto END
+
+:: ----------------------------------------------------------------------------
+:: [add-all] プロジェクト内の全ソースコード・設定ファイルのパスを抽出
+:: ----------------------------------------------------------------------------
+:ADD_ALL
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$root = '$PROJECT_ROOT';" ^
+    "Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue | " ^
+    "Where-Object { $_.FullName.StartsWith($root) -and $_.FullName -notmatch '\\(\.git|node_modules|__pycache__|\.venv|dist|build)\\' } | " ^
+    "ForEach-Object { $_.FullName }"
+goto END
+
+:: ----------------------------------------------------------------------------
+:: [tree] プロジェクトのディレクトリ構造を出力
+:: ----------------------------------------------------------------------------
+:TREE
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$root = '$PROJECT_ROOT';" ^
+    "Get-ChildItem -Path $root -Recurse -Directory -ErrorAction SilentlyContinue | " ^
+    "Where-Object { $_.FullName.StartsWith($root) -and $_.FullName -notmatch '\\(\.git|node_modules|__pycache__|\.venv)\\' } | " ^
+    "ForEach-Object { Resolve-Path -Path $_.FullName -Relative }"
+goto END
+
+:: ----------------------------------------------------------------------------
+:: [clean] 一時ファイル等の安全な掃除（プロジェクト外削除の絶対防止）
+:: ----------------------------------------------------------------------------
+:SAFE_CLEAN
+echo [INFO] Running safe clean inside: %PROJECT_ROOT%
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$root = '$PROJECT_ROOT';" ^
+    "Get-ChildItem -Path $root -Recurse -Include '*.tmp','*.log','__pycache__' -ErrorAction SilentlyContinue | " ^
+    "Where-Object { $_.FullName.StartsWith($root) } | " ^
+    "Remove-Item -Recurse -Force -Verbose"
+goto END
+
+:: ----------------------------------------------------------------------------
+:: 使い方表示
+:: ----------------------------------------------------------------------------
+:USAGE
+echo.
+echo =======================================================
+echo   Aider Safe Execution Helper (Workspace Boundary Guard)
+echo =======================================================
+echo Usage:
+echo   run.bat find-docs  : Find markdown, docker, yaml, json files
+echo   run.bat add-all    : List all project source files
+echo   run.bat tree       : Display project folder tree
+echo   run.bat clean      : Safe clean temporary files in workspace
+echo.
+goto END
+
+:END
+exit /b 0
