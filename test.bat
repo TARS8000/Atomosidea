@@ -21,9 +21,24 @@ if /i "%PROJECT_ROOT%"=="C:\Windows" (
 echo [INFO] Running tests in: %PROJECT_ROOT%
 echo.
 
-:: Go がインストールされているか確認
+:: Go がインストールされているか確認（PATH と標準的なインストール場所を検出）
+set "GO_FOUND=0"
 where go >nul 2>&1
-if %errorlevel% neq 0 (
+if %errorlevel% equ 0 (
+    set "GO_FOUND=1"
+) else (
+    if exist "C:\Program Files\Go\bin\go.exe" (
+        set "GO_FOUND=1"
+        set "PATH=%PATH%;C:\Program Files\Go\bin"
+    ) else (
+        if exist "C:\Users\%USERNAME%\go\bin\go.exe" (
+            set "GO_FOUND=1"
+            set "PATH=%PATH%;C:\Users\%USERNAME%\go\bin"
+        )
+    )
+)
+
+if %GO_FOUND% equ 0 (
     echo [ERROR] Go is not installed or not in PATH.
     echo Please install Go from https://go.dev/dl/
     exit /b 1
