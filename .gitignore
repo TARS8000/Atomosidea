@@ -18,11 +18,14 @@ node_modules/
 /app_db_data/
 /profile_db_data/
 /sfsp_db_data/
-/video_storage_data/
-/game_storage_data/
-/profile_storage_data/
-/static_site_storage_data/
-/backend/auth/auth-storage/profile_storage_data/
+backend/video-service/video_storage_data/
+backend/game-service/game_storage_data/
+backend/static-site-service/static_site_storage_data/
+backend/auth/auth-storage/profile_storage_data/
+backend/auth/auth_storage_db/
+backend/profile-service/profile_storage_db/
+backend/video-service/video_storage_db/
+backend/static-site-service/static_site_storage_db/
 /backend/security/sfsp-storage/
 /sfsp_minio_data/
 /sfsp_raw_minio_data/
@@ -42,3 +45,20 @@ node_modules/
 # Log files
 *.log
 logs/
+.aider*
+
+# Frontend build outputs
+frontend/dist/
+
+# MinIO client binaries
+mc-linux
+
+# OS junk
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Editor swap files
+*.swp
+*.swo
+*~

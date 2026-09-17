@@ -14,12 +14,6 @@ services:
       POSTGRES_DB: auth_db
       AUTH_SERVICE_DB_PASSWORD: ${AUTH_SERVICE_DB_PASSWORD}
       MYPAGE_SERVICE_DB_PASSWORD: ${MYPAGE_SERVICE_DB_PASSWORD}
-    command:
-      - "postgres"
-      - "-c"
-      - "custom.auth_service_db_password=${AUTH_SERVICE_DB_PASSWORD}"
-      - "-c"
-      - "custom.mypage_service_db_password=${MYPAGE_SERVICE_DB_PASSWORD}"
     volumes:
       - auth_db_data:/var/lib/postgresql/data
       - ./backend/auth/auth-datebase/auth-db/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -54,7 +48,7 @@ services:
       POSTGRES_DB: profile_db
     volumes:
       - profile_db_data:/var/lib/postgresql/data
-      - ./backend/auth/auth-datebase/profile-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./backend/profile-service/profile-db/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - backend-db-network
 
@@ -211,6 +205,8 @@ services:
       SFSP_STATIC_SITE_WORKER_SECRET_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
       SFSP_PROFILE_WORKER_ACCESS_KEY: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
       SFSP_PROFILE_WORKER_SECRET_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
+      SFSP_VIDEO_WORKER_ACCESS_KEY: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
+      SFSP_VIDEO_WORKER_SECRET_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
       SFSP_WORKER_RAW_ACCESS_KEY: ${SFSP_WORKER_RAW_ACCESS_KEY}
       SFSP_WORKER_RAW_SECRET_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
       SFSP_WORKER_CLEAN_ACCESS_KEY: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
@@ -262,6 +258,7 @@ services:
       mc admin policy create sfsp-clean sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
       mc admin policy create sfsp-clean sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
       mc admin policy create sfsp-clean sfsp-profile-worker-policy /tmp/sfsp-profile-worker-policy.json;
+      mc admin policy create sfsp-clean sfsp-video-worker-policy /tmp/sfsp-video-worker-policy.json;
       mc admin policy create sfsp-raw sfsp-worker-raw-policy /tmp/sfsp-worker-raw-policy.json;
       mc admin policy create sfsp-clean sfsp-worker-clean-policy /tmp/sfsp-worker-clean-policy.json;
 
@@ -281,6 +278,9 @@ services:
       mc admin user add sfsp-clean "$SFSP_PROFILE_WORKER_ACCESS_KEY" "$SFSP_PROFILE_WORKER_SECRET_KEY" || true;
       mc admin policy attach sfsp-clean sfsp-profile-worker-policy --user="$SFSP_PROFILE_WORKER_ACCESS_KEY" || true;
 
+      mc admin user add sfsp-clean "$SFSP_VIDEO_WORKER_ACCESS_KEY" "$SFSP_VIDEO_WORKER_SECRET_KEY" || true;
+      mc admin policy attach sfsp-clean sfsp-video-worker-policy --user="$SFSP_VIDEO_WORKER_ACCESS_KEY" || true;
+
       mc admin user add sfsp-raw "$SFSP_WORKER_RAW_ACCESS_KEY" "$SFSP_WORKER_RAW_SECRET_KEY" || true;
       mc admin policy attach sfsp-raw sfsp-worker-raw-policy --user=\"$SFSP_WORKER_RAW_ACCESS_KEY\" || true;
 
@@ -295,6 +295,7 @@ services:
       - ./backend/minio-init/sfsp-game-worker-policy.json:/tmp/sfsp-game-worker-policy.json:ro
       - ./backend/minio-init/sfsp-static-site-worker-policy.json:/tmp/sfsp-static-site-worker-policy.json:ro
       - ./backend/minio-init/sfsp-profile-worker-policy.json:/tmp/sfsp-profile-worker-policy.json:ro
+      - ./backend/minio-init/sfsp-video-worker-policy.json:/tmp/sfsp-video-worker-policy.json:ro
       - ./backend/minio-init/sfsp-worker-raw-policy.json:/tmp/sfsp-worker-raw-policy.json:ro
       - ./backend/minio-init/sfsp-worker-clean-policy.json:/tmp/sfsp-worker-clean-policy.json:ro
     networks:
@@ -315,15 +316,13 @@ services:
     ports:
       - "3001:80"
     volumes:
-      - ./backend/video-service/video_storage_data/videos:/storage/videos:ro
-      - ./backend/video-service/video_storage_data/thumbnails:/storage/thumbnails:ro
       - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       auth-service:
         condition: service_started
-      upload-service:
+      video-upload-api:
         condition: service_started
-      stream-service:
+      video-worker:
         condition: service_started
       game-upload-api:
         condition: service_started
@@ -339,7 +338,7 @@ services:
   auth-service:
     build:
       context: .
-      dockerfile: backend/auth/auth-worker/auth-service/Dockerfile
+      dockerfile: backend/auth/auth-worker/Dockerfile
     container_name: atmosidea-auth-service
     restart: always
     env_file:
@@ -391,7 +390,7 @@ services:
   profile-service:
     build:
       context: .
-      dockerfile: backend/auth/auth-worker/profile-service/Dockerfile
+      dockerfile: backend/profile-service/profile-worker/Dockerfile
     container_name: atmosidea-profile-service
     restart: always
     env_file:
@@ -439,11 +438,11 @@ services:
       - backend-db-network
       - sfsp-isolated-net
 
-  upload-service:
+  video-upload-api:
     build:
       context: .
       dockerfile: backend/video-service/video-upload-api/Dockerfile
-    container_name: atmosidea-upload-service
+    container_name: atmosidea-video-upload-api
     restart: always
     env_file:
       - .env
@@ -486,18 +485,17 @@ services:
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379
     volumes:
-      - ./backend/video-service/video_storage_data/videos:/storage/videos
-      - ./backend/video-service/video_storage_data/thumbnails:/storage/thumbnails
+      - ./backend/video-service/upload_workdir:/storage
     networks:
       - atmosidea-network
       - backend-db-network
       - sfsp-isolated-net
 
-  stream-service:
+  video-worker:
     build:
       context: .
       dockerfile: backend/video-service/video-worker/Dockerfile
-    container_name: atmosidea-stream-service
+    container_name: atmosidea-video-worker
     restart: always
     env_file:
       - .env
@@ -506,17 +504,42 @@ services:
         condition: service_started
       video-storage:
         condition: service_started
+      sfsp-raw-minio:
+        condition: service_started
+      sfsp-clean-minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       UPLOAD_DIR: /storage/videos
+      THUMBNAIL_DIR: /storage/thumbnails
       VIDEO_MINIO_ENDPOINT: video-storage:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
+      REDIS_ADDR: redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379
+      SFSP_API_URL: http://sfsp-api:8080
+      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
+      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
+      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
+      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
+      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
+      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
+      SFSP_CLEAN_MINIO_USE_SSL: "false"
+      SFSP_MINIO_USE_SSL: "false"
+      APP_URL: ${APP_URL}
     volumes:
-      - ./backend/video-service/video_storage_data/videos:/storage/videos:ro
+      - ./backend/video-service/upload_workdir:/storage:ro
     networks:
       - atmosidea-network
       - backend-db-network
+      - sfsp-isolated-net
 
   game-upload-api:
     build:
@@ -719,7 +742,7 @@ services:
   mypage-service:
     build:
       context: .
-      dockerfile: backend/auth/mypage-worker/Dockerfile
+      dockerfile: backend/profile-service/mypage-worker/Dockerfile
     container_name: atmosidea-mypage-service
     restart: always
     env_file:

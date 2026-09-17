@@ -13,7 +13,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,9 +47,10 @@ type StaticSite struct {
 	MinioPath      string    `json:"minio_path"`
 	EntryPointPath string    `json:"entry_point_path"`
 	ThumbnailURL   string    `json:"thumbnail_url"`
-	Status         string    `json:"status"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"` // Add UpdatedAt field
+Status         string      `json:"status"`
+	CreatedAt      time.Time   `json:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at"`
+	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 }
 
 type SfspUploadResponse struct {
@@ -457,7 +457,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		}
 
 		var thumbSfspResp SfspUploadResponse
-		if err := uploadToSFSP(reqCtx, tmpThumbFile, thumbnailHeader, "thumbnail", &thumbSfspResp); err != nil {
+		if err := uploadToSFSP(reqCtx, tmpThumbFile, thumbnailHeader, "site-thumbnail", &thumbSfspResp); err != nil {
 			logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
 			return
@@ -481,7 +481,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 					ScannedAt:     time.Now().UTC(),
 					SHA256:        thumbSfspResp.SHA256,
 					Filename:      thumbnailHeader.Filename,
-					TargetService: "thumbnail",
+					TargetService: "site-thumbnail",
 				}
 				if err := queue.EnqueueScanCompletionEvent(reqCtx, event); err != nil {
 					logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for duplicate clean file: %v", err)
@@ -571,8 +571,8 @@ func getStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	siteID := c.Param("id")
 	var s StaticSite
-	err := db.QueryRowContext(reqCtx, "SELECT id, user_id, title, description, minio_path, status, entry_point_path, thumbnail_url, created_at, updated_at FROM static_sites WHERE id = $1", siteID).Scan(
-		&s.ID, &s.UserID, &s.Title, &s.Description, &s.MinioPath, &s.Status, &s.EntryPointPath, &s.ThumbnailURL, &s.CreatedAt, &s.UpdatedAt)
+	err := db.QueryRowContext(reqCtx, "SELECT id, user_id, title, description, minio_path, status, entry_point_path, thumbnail_url, created_at, updated_at, thumbnail_sfsp_job_id FROM static_sites WHERE id = $1", siteID).Scan(
+		&s.ID, &s.UserID, &s.Title, &s.Description, &s.MinioPath, &s.Status, &s.EntryPointPath, &s.ThumbnailURL, &s.CreatedAt, &s.UpdatedAt, &s.ThumbnailSfspJobID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Static site not found"})
@@ -591,16 +591,8 @@ func updateStaticSiteHandler(c *gin.Context) {
 	userIDStr := c.GetString("userID")
 	isAdmin := c.GetBool("isAdmin")
 
-	var req struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Errorf("ERROR: updateStaticSiteHandler JSON bind error: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid request format: %v", err)})
-		return
-	}
+title := c.PostForm("title")
+	description := c.PostForm("description")
 
 	// Fetch current site details to check ownership
 	var ownerUUID uuid.UUID
@@ -621,17 +613,102 @@ func updateStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
-	// Perform the update
-	_, err = db.ExecContext(reqCtx,
-		"UPDATE static_sites SET title = $1, description = $2, updated_at = NOW() WHERE id = $3",
-		req.Title, req.Description, siteID)
+	// Fetch the thumbnail file. When a thumbnail is uploaded, the title/description
+	// update is deferred until the security scan completes (the frontend sends a
+	// follow-up request after polling). When no thumbnail is uploaded, update
+	// title/description immediately.
+	thumbnailHeader, err := c.FormFile("thumbnail")
+	if err == http.ErrMissingFile {
+		_, err = db.ExecContext(reqCtx,
+			"UPDATE static_sites SET title = $1, description = $2, updated_at = NOW() WHERE id = $3",
+			title, description, siteID)
+		if err != nil {
+			logger.Errorf("ERROR: Failed to update static site %s in DB: %v", siteID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update static site"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Static site updated successfully"})
+		return
+	}
 	if err != nil {
-		logger.Errorf("ERROR: Failed to update static site %s in DB: %v", siteID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update static site"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to get thumbnail file: %v", err)})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Static site updated successfully"})
+	thumbnailSrc, err := thumbnailHeader.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open thumbnail file"})
+		return
+	}
+	defer thumbnailSrc.Close()
+
+	tmpThumbFile, err := os.CreateTemp("", "sfsp-thumbnail-*.tmp")
+	if err != nil {
+		logger.Errorf("Failed to create temp file for thumbnail SFSP upload: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+		return
+	}
+	defer os.Remove(tmpThumbFile.Name())
+	defer tmpThumbFile.Close()
+
+	if _, err := io.Copy(tmpThumbFile, thumbnailSrc); err != nil {
+		logger.Errorf("Failed to copy thumbnail to temp file: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+		return
+	}
+	if _, err := tmpThumbFile.Seek(0, io.SeekStart); err != nil {
+		logger.Errorf("Failed to reset temp thumbnail file: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+		return
+	}
+
+	var thumbSfspResp SfspUploadResponse
+	if err := uploadToSFSP(reqCtx, tmpThumbFile, thumbnailHeader, "site-thumbnail", &thumbSfspResp); err != nil {
+		logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
+		return
+	}
+
+	parsedThumbJobID, err := uuid.Parse(thumbSfspResp.JobID)
+	if err != nil {
+		logger.Errorf("Invalid Thumbnail Job ID from SFSP: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid thumbnail job ID from SFSP"})
+		return
+	}
+
+	_, err = db.ExecContext(reqCtx,
+		"UPDATE static_sites SET thumbnail_sfsp_job_id = $1 WHERE id = $2",
+		parsedThumbJobID, siteID)
+	if err != nil {
+		logger.Errorf("ERROR: Failed to update static site thumbnail SFSP job ID: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update static site thumbnail"})
+		return
+	}
+
+	if strings.ToLower(thumbSfspResp.Status) == "clean" {
+		if thumbFileID, err := uuid.Parse(thumbSfspResp.FileID); err == nil {
+			event := event.ScanCompletionEvent{
+				JobID:         parsedThumbJobID,
+				FileID:        thumbFileID,
+				FinalStatus:   "clean",
+				ScannedAt:     time.Now().UTC(),
+				SHA256:        thumbSfspResp.SHA256,
+				Filename:      thumbnailHeader.Filename,
+				TargetService: "site-thumbnail",
+			}
+			if err := queue.EnqueueScanCompletionEvent(reqCtx, event); err != nil {
+				logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for existing clean file: %v", err)
+			} else {
+				logger.Infof("Re-published thumbnail completion event for existing clean file, job %s", parsedThumbJobID)
+			}
+		}
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message": "Thumbnail upload accepted for scanning",
+		"job_id":  parsedThumbJobID.String(),
+		"status":  "scanning",
+	})
 }
 
 func deleteStaticSiteHandler(c *gin.Context) {

@@ -3,7 +3,9 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,6 +35,17 @@ var (
 	sfspBucketName  = "clean-files"
 	logger          *zap.SugaredLogger
 )
+
+// generateRandomThumbnailName はサムネイルのオブジェクト名に使うランダムな英数字文字列を返す。
+// 元のファイル名やサイトIDを名前に使わず、推測不可能な文字列にする。
+func generateRandomThumbnailName() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		logger.Errorf("Failed to generate random thumbnail name: %v", err)
+		return ""
+	}
+	return hex.EncodeToString(bytes)
+}
 
 func main() {
 	zapLogger, err := zap.NewProduction()
@@ -123,10 +136,10 @@ func main() {
 	logger.Info("Static Site Worker started. Waiting for jobs...")
 
 	staticSiteCompletionQueue := queue.StaticSiteCompletionQueue
-	thumbnailCompletionQueue := queue.ThumbnailCompletionQueue
+	siteThumbnailCompletionQueue := queue.SiteThumbnailCompletionQueue
 
 	for {
-		result, err := queue.RedisClient.BRPop(context.Background(), 0, staticSiteCompletionQueue, thumbnailCompletionQueue).Result()
+		result, err := queue.RedisClient.BRPop(context.Background(), 0, staticSiteCompletionQueue, siteThumbnailCompletionQueue).Result()
 		if err != nil {
 			logger.Errorf("Error popping job from Redis: %v", err)
 			time.Sleep(5 * time.Second)
@@ -169,7 +182,7 @@ func main() {
 			}
 
 			go processStaticSiteJob(siteID, event)
-		case thumbnailCompletionQueue:
+		case siteThumbnailCompletionQueue:
 			processStaticSiteThumbnail(context.Background(), &event)
 		default:
 			logger.Infof("INFO: Skipping event from unknown queue: %s", queueName)
@@ -347,7 +360,7 @@ func processStaticSiteThumbnail(ctx context.Context, event *event.ScanCompletion
 
 	if event.FinalStatus != "clean" {
 		logger.Infof("[SiteID: %s] Thumbnail scan result is '%s'. Aborting thumbnail processing.", siteID, event.FinalStatus)
-		_, err = db.Exec(ctx, "UPDATE static_sites SET thumbnail_sfsp_job_id = NULL WHERE id = $1", siteID)
+		_, err = db.Exec("UPDATE static_sites SET thumbnail_sfsp_job_id = NULL WHERE id = $1", siteID)
 		if err != nil {
 			logger.Errorf("[SiteID: %s] Failed to clear thumbnail scan job: %v", siteID, err)
 		}
@@ -412,7 +425,8 @@ func processStaticSiteThumbnail(ctx context.Context, event *event.ScanCompletion
 		return
 	}
 
-	thumbnailObjectName := fmt.Sprintf("thumbnails/%s%s", siteID, filepath.Ext(event.Filename))
+	thumbnailRandomName := generateRandomThumbnailName()
+	thumbnailObjectName := fmt.Sprintf("thumbnails/%s%s", thumbnailRandomName, filepath.Ext(event.Filename))
 	_, err = minioClient.PutObject(ctx, minioBucket, thumbnailObjectName, f, stat.Size(), minio.PutObjectOptions{
 		ContentType: contentType,
 	})
@@ -421,8 +435,8 @@ func processStaticSiteThumbnail(ctx context.Context, event *event.ScanCompletion
 		return
 	}
 
-	thumbnailURL := fmt.Sprintf("/static-sites/thumbnails/%s%s", siteID, filepath.Ext(event.Filename))
-	_, err = db.Exec(ctx, "UPDATE static_sites SET thumbnail_url = $1, thumbnail_sfsp_job_id = NULL WHERE id = $2", thumbnailURL, siteID)
+	thumbnailURL := fmt.Sprintf("/static-sites/thumbnails/%s%s", thumbnailRandomName, filepath.Ext(event.Filename))
+	_, err = db.Exec("UPDATE static_sites SET thumbnail_url = $1, thumbnail_sfsp_job_id = NULL WHERE id = $2", thumbnailURL, siteID)
 	if err != nil {
 		logger.Errorf("[SiteID: %s] ERROR: Failed to update thumbnail URL in DB: %v", siteID, err)
 		return

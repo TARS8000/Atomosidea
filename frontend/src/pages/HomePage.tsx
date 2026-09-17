@@ -45,9 +45,9 @@ const HomePage = () => {
         const query = debouncedSearchTerm ? `?q=${encodeURIComponent(debouncedSearchTerm)}` : '';
 
         const [videosRes, gamesRes, staticSitesRes] = await Promise.all([
-          axios.get(`/api/videos${query}`),
-          axios.get(`/api/games${query}`),
-          axios.get(`/api/static-sites${query}`),
+          axios.get(`/api/videos${query}`, { headers: { 'Cache-Control': 'no-store' } }),
+          axios.get(`/api/games${query}`, { headers: { 'Cache-Control': 'no-store' } }),
+          axios.get(`/api/static-sites${query}`, { headers: { 'Cache-Control': 'no-store' } }),
         ]);
 
         const videoData: Content[] = (videosRes.data || []).map((v: any) => ({ ...v, type: 'video', thumbnail_url: v.thumbnail_path }));
@@ -94,6 +94,15 @@ const HomePage = () => {
   const handleTabChange = useCallback((_event: React.SyntheticEvent, newValue: number) => setTabIndex(newValue), []);
   const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => setSearchTerm(e.target.value), []);
 
+  // サムネ画像を毎回強制的に取得するためのキャッシュバスタを付与する。
+  // 同一URLをブラウザがキャッシュして、アップロード後の新しいサムネが旧画像のまま
+  // 表示される問題を防ぐ（バックエンドは毎回ランダム名でサムネを差し替える）。
+  const withCacheBuster = useCallback((url: string | undefined) => {
+    if (!url) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}v=${encodeURIComponent(url)}`;
+  }, []);
+
   if (loading) return <CircularProgress />;
 
   const renderContentGrid = (contentArray: Content[]) => (
@@ -113,7 +122,7 @@ const HomePage = () => {
               to={linkUrl}
               sx={{ height: '100%', display: 'flex', flexDirection: 'column', textDecoration: 'none', boxShadow: 1, position: 'relative', '&:hover': { transform: 'translateY(-4px)', boxShadow: 6 }, transition: 'transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out' }}
             >
-              <CardMedia image={content.thumbnail_url} sx={{ height: 140, backgroundSize: content.type === 'game' ? 'contain' : 'cover', bgcolor: 'black' }} />
+              <CardMedia image={withCacheBuster(content.thumbnail_url)} sx={{ height: 140, backgroundSize: content.type === 'game' ? 'contain' : 'cover', bgcolor: 'black' }} />
               <CardContent sx={{ flexGrow: 1 }}>
                 <Typography gutterBottom variant="h6" component="div" noWrap>{content.title}</Typography>
                 <Box sx={{ display: 'flex', alignItems: 'center', mt: 1 }}>

@@ -70,8 +70,8 @@
            /api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO (profile-storage:9000)] (for icons)
            /api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
                                 |
-           /api/videos/**       +-> [upload-service:8080] --> [app-db:5432]
-                                |   [stream-service:8081] --> [app-db:5432]
+           /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
+                                |   [video-worker:8081] --> [app-db:5432]
                                 |
            /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
            /games/**            +-> [MinIO (game-storage:9000)]
@@ -93,8 +93,8 @@
 | `auth-service`          | `8080`     | Go, Gin       | **認証**: ユーザー登録、Google OAuth、JWT発行を担当。**`auth-db`**に接続。                                                                                        |
 | `profile-service`       | `8084`     | Go, Gin       | **プロフィール管理**: ユーザー名、自己紹介、アイコン、背景画像の取得・更新を担当。**`auth-db`**と**`profile-storage`**に接続。                                        |
 | `mypage-service`        | `8083`     | Go, Gin       | **マイページ**: ログインユーザーの投稿コンテンツ一覧（動画・ゲーム・静的サイト）を取得。**`app-db`**に接続。                                                       |
-| `upload-service`        | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
-| `stream-service`        | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
+| `video-upload-api`        | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
+| `video-worker`        | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
 | `game-upload-api`       | `8082`     | Go, Gin       | **ゲームメタデータAPI**: ゲームのメタデータ管理と、`game-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                                                 |
 | `game-worker`           | -          | Go            | **ゲーム非同期処理**: RedisからJobを受け取り、ZIP解凍、解像度抽出、MinIOへのファイルアップロード、DB更新といった時間のかかる処理を実行。**`app-db`**に接続。          |
 | `static-site-upload-api`| `8085`     | Go, Gin       | **静的サイトAPI**: 静的サイトのZIPアップロード受付、メタデータ管理、`static-site-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                         |
@@ -245,16 +245,16 @@ Nginxは最も具体的にマッチする`location`を優先します。この�
 ```nginx
 location ~ ^/api/videos/([0-9]+)$ {
     if ($request_method = DELETE) {
-        proxy_pass http://upload_service;
+        proxy_pass http://video_upload_service;
         break;
     }
-    proxy_pass http://stream_service;
+    proxy_pass http://video_worker_service;
 }
 ```
 
 -   **背景**: Nginxの世界では**「if is evil」**として知られており、`if`の使用は予期せぬ挙動の原因となるため、原則として避けるべきです。
--   **現状の理由**: `GET /api/videos/:id`（動画詳細）は`stream-service`、`DELETE /api/videos/:id`（動画削除）は`upload-service`と、同じURLで担当サービスが異なるため、暫定的に`if`でメソッドを判定しています。
--   **将来の展望**: これは技術的負債として認識しており、将来的には`upload-service`に削除専用のエンドポイント（例: `/api/videos/delete/:id`）を設けるなど、`if`を使わないルーティングへのリファクタリングが望ましいです。
+-   **現状の理由**: `GET /api/videos/:id`（動画詳細）は`video-worker`、`DELETE /api/videos/:id`（動画削除）は`video-upload-api`と、同じURLで担当サービスが異なるため、暫定的に`if`でメソッドを判定しています。
+-   **将来の展望**: これは技術的負債として認識しており、将来的には`video-upload-api`に削除専用のエンドポイント（例: `/api/videos/delete/:id`）を設けるなど、`if`を使わないルーティングへのリファクタリングが望ましいです。
 
 ## 8. APIエンドポイント一覧
 
@@ -271,12 +271,12 @@ location ~ ^/api/videos/([0-9]+)$ {
 | `GET`    | `/api/my/videos`         | `mypage-service`          | 自分の動画一覧を取得               | 要   |
 | `GET`    | `/api/my/games`          | `mypage-service`          | 自分のゲーム一覧を取得             | 要   |
 | `GET`    | `/api/my/static-sites`   | `mypage-service`          | 自分の静的サイト一覧を取得         | 要   |
-| `POST`   | `/api/videos/upload`     | `upload-service`          | 動画アップロード                   | 要   |
-| `PUT`    | `/api/videos/:id`        | `upload-service`          | 動画メタデータの更新               | 要   |
-| `DELETE` | `/api/videos/:id`        | `upload-service`          | 動画の削除                         | 要   |
-| `GET`    | `/api/videos`            | `stream-service`          | 動画一覧を取得                     | 不要 |
-| `GET`    | `/api/videos/:id`        | `stream-service`          | 動画詳細を取得                     | 不要 |
-| `GET`    | `/api/videos/:id/stream` | `stream-service`          | 動画ストリーミング                 | 不要 |
+| `POST`   | `/api/videos/upload`     | `video-upload-api`          | 動画アップロード                   | 要   |
+| `PUT`    | `/api/videos/:id`        | `video-upload-api`          | 動画メタデータの更新               | 要   |
+| `DELETE` | `/api/videos/:id`        | `video-upload-api`          | 動画の削除                         | 要   |
+| `GET`    | `/api/videos`            | `video-worker`          | 動画一覧を取得                     | 不要 |
+| `GET`    | `/api/videos/:id`        | `video-worker`          | 動画詳細を取得                     | 不要 |
+| `GET`    | `/api/videos/:id/stream` | `video-worker`          | 動画ストリーミング                 | 不要 |
 | `POST`   | `/api/games/upload`      | `game-upload-api`         | ゲームアップロードと処理Jobの発行  | 要   |
 | `GET`    | `/api/games`             | `game-upload-api`         | ゲーム一覧を取得                   | 不要 |
 | `GET`    | `/api/games/:id`         | `game-upload-api`         | ゲーム詳細を取得                   | 不要 |
@@ -322,10 +322,10 @@ location ~ ^/api/videos/([0-9]+)$ {
 ├── postgres/
 │   └── init.sql          # DB初期化スキーマ
 │
-├── stream-service/       # 動画配信サービス
+├── video-worker/       # 動画配信サービス
 │   └── main.go
 │
-├── upload-service/       # 動画アップロードサービス
+├── video-upload-api/       # 動画アップロードサービス
 │   └── main.go
 │
 ├── game_storage_db/      # MinIO (game-storage) の永続化ディレクトリ
@@ -423,8 +423,8 @@ location ~ ^/api/videos/([0-9]+)$ {
            /api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO:9000] (for icons)
            /api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
                                 |
-           /api/videos/**       +-> [upload-service:8080] --> [app-db:5432]
-                                |   [stream-service:8081] --> [app-db:5432]
+           /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
+                                |   [video-worker:8081] --> [app-db:5432]
                                 |
            /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
            /games/**            +-> [MinIO (game-storage:9000)]
@@ -441,8 +441,8 @@ location ~ ^/api/videos/([0-9]+)$ {
 | `auth-service`      | `8080`     | Go, Gin       | **認証**: ユーザー登録、Google OAuth、JWT発行を担当。**`auth-db`**に接続。                                                                                        |
 | `profile-service`   | `8084`     | Go, Gin       | **プロフィール管理**: ユーザー名、自己紹介、アイコン、背景画像の取得・更新を担当。**`auth-db`**と**`minio`**に接続。                                                 |
 | `mypage-service`    | `8083`     | Go, Gin       | **マイページ**: ログインユーザーの投稿コンテンツ一覧（動画・ゲーム）を取得。**`app-db`**に接続。                                                                   |
-| `upload-service`    | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
-| `stream-service`    | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
+| `video-upload-api`    | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
+| `video-worker`    | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
 | `game-upload-api`   | `8082`     | Go, Gin       | **ゲームメタデータAPI**: ゲームのメタデータ管理と、`game-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                                                 |
 | `game-worker`       | -          | Go            | **ゲーム非同期処理**: RedisからJobを受け取り、ZIP解凍、解像度抽出、MinIOへのファイルアップロード、DB更新といった時間のかかる処理を実行。**`app-db`**に接続。          |
 | `auth-db`           | `5432`     | PostgreSQL    | **認証・ユーザーDB**: ユーザー情報、プロフィール、アカウント状態を永続化。                                                                                       |
@@ -483,12 +483,12 @@ location ~ ^/api/videos/([0-9]+)$ {
 | `PUT`    | `/api/profile/background`| `profile-service`   | 背景画像を更新                     | 要   |
 | `GET`    | `/api/my/videos`         | `mypage-service`    | 自分の動画一覧を取得               | 要   |
 | `GET`    | `/api/my/games`          | `mypage-service`    | 自分のゲーム一覧を取得             | 要   |
-| `POST`   | `/api/videos/upload`     | `upload-service`    | 動画アップロード                   | 要   |
-| `PUT`    | `/api/videos/:id`        | `upload-service`    | 動画メタデータの更新               | 要   |
-| `DELETE` | `/api/videos/:id`        | `upload-service`    | 動画の削除                         | 要   |
-| `GET`    | `/api/videos`            | `stream-service`    | 動画一覧を取得                     | 不要 |
-| `GET`    | `/api/videos/:id`        | `stream-service`    | 動画詳細を取得                     | 不要 |
-| `GET`    | `/api/videos/:id/stream` | `stream-service`    | 動画ストリーミング                 | 不要 |
+| `POST`   | `/api/videos/upload`     | `video-upload-api`    | 動画アップロード                   | 要   |
+| `PUT`    | `/api/videos/:id`        | `video-upload-api`    | 動画メタデータの更新               | 要   |
+| `DELETE` | `/api/videos/:id`        | `video-upload-api`    | 動画の削除                         | 要   |
+| `GET`    | `/api/videos`            | `video-worker`    | 動画一覧を取得                     | 不要 |
+| `GET`    | `/api/videos/:id`        | `video-worker`    | 動画詳細を取得                     | 不要 |
+| `GET`    | `/api/videos/:id/stream` | `video-worker`    | 動画ストリーミング                 | 不要 |
 | `POST`   | `/api/games/upload`      | `game-upload-api`   | ゲームアップロードと処理Jobの発行  | 要   |
 | `GET`    | `/api/games`             | `game-upload-api`   | ゲーム一覧を取得                   | 不要 |
 | `GET`    | `/api/games/:id`         | `game-upload-api`   | ゲーム詳細を取得                   | 不要 |
@@ -533,8 +533,8 @@ HLS動画再生機能の実装において発生した問題と、その解決�
     *   **修正**: `VideoDetailPage.tsx`の`streamUrl`を`/api/videos/${video.id}/stream`に変更し、APIゲートウェイ経由でリクエストするように修正しました。
 
 2.  **Nginxルーティングの不備**
-    *   **問題**: `/api/videos/:id/stream`へのリクエストを処理する`location`ブロックが`nginx.conf`に存在せず、Nginxがリクエストを`stream-service`に転送できていませんでした。
-    *   **修正**: `nginx.conf`に`location ~ ^/api/videos/([0-9]+)/stream { proxy_pass http://stream_service; ... }`を追加し、HLSストリームリクエストを`stream-service`に転送するようにしました。
+    *   **問題**: `/api/videos/:id/stream`へのリクエストを処理する`location`ブロックが`nginx.conf`に存在せず、Nginxがリクエストを`video-worker`に転送できていませんでした。
+    *   **修正**: `nginx.conf`に`location ~ ^/api/videos/([0-9]+)/stream { proxy_pass http://video_worker_service; ... }`を追加し、HLSストリームリクエストを`video-worker`に転送するようにしました。
 
 3.  **TypeScriptコンパイルエラー**
     *   **問題**: `VideoDetailPage.tsx`のHLSイベントリスナーで、`event`引数が宣言されているものの使用されていなかったため、`TS6133: 'event' is declared but its value is never read.`というコンパイルエラーが発生し、ビルドが失敗しました。
@@ -571,7 +571,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 
 2.  **Reactコンポーネント (`VideoDetailPage.tsx`) の初期化**
     *   `VideoDetailPage.tsx` がマウントされ、`useEffect` フックが実行されます。
-    *   `axios.get('/api/videos/:id')` を通じて、バックエンドの `stream-service` から動画のメタデータ（タイトル、説明、IDなど）を取得します。この際、動画のファイルパスは `filename` フィールドに含まれますが、これはHLSのルートディレクトリを示すもので、直接再生には使用しません。
+    *   `axios.get('/api/videos/:id')` を通じて、バックエンドの `video-worker` から動画のメタデータ（タイトル、説明、IDなど）を取得します。この際、動画のファイルパスは `filename` フィールドに含まれますが、これはHLSのルートディレクトリを示すもので、直接再生には使用しません。
 
 3.  **HLS.js のセットアップとストリームURLの構築**
     *   動画メタデータの取得が完了し、`loading` ステートが `false` になると、HLSセットアップ用の `useEffect` が再実行されます。
@@ -649,9 +649,9 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 
 -   **データベース**: `app-db`内の`videos`および`games`テーブルの`id`カラムの型を`SERIAL`から`VARCHAR(10)`に変更。
 -   **バックエンド**:
-    -   `upload-service`と`game-upload-api`に、`crypto/rand`を利用した安全なランダムID生成関数を追加。
+    -   `video-upload-api`と`game-upload-api`に、`crypto/rand`を利用した安全なランダムID生成関数を追加。
     -   コンテンツ作成時に、連番ではなくこの関数で生成したIDを付与するように変更。
-    -   関連する全てのサービス（`stream-service`, `mypage-service`, `game-worker`など）で、IDを`string`として扱うように修正。
+    -   関連する全てのサービス（`video-worker`, `mypage-service`, `game-worker`など）で、IDを`string`として扱うように修正。
 -   **フロントエンド**:
     -   関連する全てのページコンポーネント（`HomePage`, `MyPage`, `VideoDetailPage`など）で、IDの型を`number`から`string`に修正。
     -   Nginxの設定ファイル(`nginx.conf`)のルーティングも、新しい英数字ID形式に対応するように正規表現を修正。
@@ -688,7 +688,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 
 **解決策**: コンテンツ一覧ページに検索バーを導入し、タイトルによる検索機能を追加しました。
 
--   **バックエンド (`stream-service`, `game-upload-api`)**:
+-   **バックエンド (`video-worker`, `game-upload-api`)**:
     -   `listVideosHandler` および `listGamesHandler` に検索クエリパラメータ (`q`) を受け取るロジックを追加。
     -   データベースクエリに `WHERE title ILIKE $1` を追加し、検索キーワードをプリペアドステートメントで安全にバインドすることで、SQLインジェクション攻撃を防止。
 -   **フロントエンド (`HomePage.tsx`)**:
@@ -907,8 +907,8 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 /api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO (profile-storage:9000)] (for icons)
 /api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
 
-       /api/videos/**       +-> [upload-service:8080] --> [app-db:5432]
-                            |   [stream-service:8081] --> [app-db:5432]
+       /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
+                            |   [video-worker:8081] --> [app-db:5432]
 
        /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
        /games/**            +-> [MinIO (game-storage:9000)]
@@ -992,15 +992,15 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 ### 18.7. Goマイクロサービス（モノリポ）における依存関係・Dockerビルドエラーと解決策
 
 *   **`go.mod` 初期状態における依存関係欠落と依存構造（直接/間接依存）の理解**:
-    *   **課題**: 一部のサービス（`upload-service` など）の `go.mod` が `module` 名と `go` バージョン宣言のみの初期状態（たった3行）であり、プログラムの動作に必要な外部ライブラリの記録（`require`）や、改ざん防止・バージョン固定用のチェックサムファイル（`go.sum`）が存在しませんでした。
+    *   **課題**: 一部のサービス（`video-upload-api` など）の `go.mod` が `module` 名と `go` バージョン宣言のみの初期状態（たった3行）であり、プログラムの動作に必要な外部ライブラリの記録（`require`）や、改ざん防止・バージョン固定用のチェックサムファイル（`go.sum`）が存在しませんでした。
     *   **背景と構造**: Go言語では、コード内で直に呼び出している「直接依存（`import` しているライブラリ）」と、そのライブラリが内部で勝手に使っている「間接依存（`// indirect` コメントが付く孫ライブラリ）」の2種類が存在します。正常なサービス（`profile-service` など）の構成と比較・分析し、`go mod tidy` コマンドを実行してプロジェクト全体でこの依存関係を正確に記録・整理する必要性を明らかにしました。
 
 *   **モノリポ共通パッケージ（`shared`）の参照不可による GitHub 認証エラー (`exit status 128`)**:
-    *   **課題**: 各マイクロサービス（`upload-service`, `static-site-worker`, `game-worker` 等）から、チーム共有の共通モジュール（`github.com/atmosidea/shared`）を呼び出そうとした際、Go言語が「このプログラムはインターネット（GitHub）上にある非公開リポジトリ（プライベートリポジトリ）に取りに行かなければならない」と勘違いしてアクセスを試みました。その結果、Dockerビルドなどの画面が出ない自動処理（非対話型環境）の中でユーザー名やパスワード（SSHキー）を入力できず、`fatal: could not read Username for 'https://github.com': terminal prompts disabled` という認証エラー（exit status 128）で処理が停止していました。
+    *   **課題**: 各マイクロサービス（`video-upload-api`, `static-site-worker`, `game-worker` 等）から、チーム共有の共通モジュール（`github.com/atmosidea/shared`）を呼び出そうとした際、Go言語が「このプログラムはインターネット（GitHub）上にある非公開リポジトリ（プライベートリポジトリ）に取りに行かなければならない」と勘違いしてアクセスを試みました。その結果、Dockerビルドなどの画面が出ない自動処理（非対話型環境）の中でユーザー名やパスワード（SSHキー）を入力できず、`fatal: could not read Username for 'https://github.com': terminal prompts disabled` という認証エラー（exit status 128）で処理が停止していました。
     *   **解決策**: 該当するすべてのサービスの `go.mod` ファイルの最末尾に `replace github.com/atmosidea/shared => ../shared` という「置換（replace）指示」を明示的に追記しました。これにより、インターネットへの通信を一切発生させず、同じパソコン内にある隣の `../shared` フォルダを直接読み込ませるように設定を修正しました。
 
 *   **Docker ビルドコンテキストの誤りと相対パス参照失敗 (`replacement directory ../shared does not exist`)**:
-    *   **課題**: 従来は `cd upload-service` のように各サービスフォルダの中に移動してから `docker build .` を実行したり、`Dockerfile` 内で該当サービス単体のフォルダだけをコンテナ内部にコピー（`COPY . .`）していました。この状態だと、コンテナの中から見ると「自分自身のフォルダ」しか見えず、親階層にある `../shared` フォルダが存在しないため、`go.mod` で設定した `replace` 指示が「指定された `../shared` ディレクトリが存在しない（does not exist）」というパス切れエラーを起こしていました。
+    *   **課題**: 従来は `cd video-upload-api` のように各サービスフォルダの中に移動してから `docker build .` を実行したり、`Dockerfile` 内で該当サービス単体のフォルダだけをコンテナ内部にコピー（`COPY . .`）していました。この状態だと、コンテナの中から見ると「自分自身のフォルダ」しか見えず、親階層にある `../shared` フォルダが存在しないため、`go.mod` で設定した `replace` 指示が「指定された `../shared` ディレクトリが存在しない（does not exist）」というパス切れエラーを起こしていました。
     *   **解決策**: Dockerのビルド対象範囲（ビルドコンテキスト）を、常にプロジェクト全体の最ルート階層（`Atomosidea` フォルダ直下）に指定（`docker build -f <サービス>/Dockerfile .`）するように変更しました。さらに `Dockerfile` の中で `COPY . .` を行なってプロジェクト全体（`shared` 含む）をコンテナ内に一度まるごとコピーした上で、`WORKDIR /app/<サービス名>` へ移動してビルドを行う安全な設計に一括改修しました。
 
 *   **Dockerfile 内での不適切な `RUN go mod tidy` 実行とビルド安定化の阻害**:
@@ -1048,7 +1048,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 
 #### 19.1.2. 統合されたアップロードフロー
 
-1.  **各アップロードAPI (`game-upload-api`, `static-site-upload-api`, `upload-service`)**:
+1.  **各アップロードAPI (`game-upload-api`, `static-site-upload-api`, `video-upload-api`)**:
     *   各アップロードAPIは、ファイルを受け取ると、まずSFSP (`sfsp-api`) にファイルを転送します。
     *   SFSPからジョブIDと初期ステータスを受け取り、各コンテンツのDBテーブル（`games`, `static_sites`, `videos`）に `sfsp_job_id` を保存し、ステータスを `scanning` に設定します。
     *   SFSPが重複ファイルを検知し、`clean` ステータスを返した場合、各アップロードAPIは `sfsp:completed_jobs` キューに完了イベントを再発行し、ワーカーを直接トリガーします。
@@ -1058,7 +1058,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
     *   スキャン完了後、結果（`clean`, `malicious`など）を `sfsp:completed_jobs` キューに発行します。
     *   **Unity WebGLビルドの検証ロジックを改善**: ZIP展開後、Unity WebGLルートと静的サイトルートの両方が見つかる場合に `invalid` と判定される問題を修正。Unity WebGLルートを優先的に探索するように変更しました。
 
-3.  **各ワーカーサービス (`game-worker`, `static-site-worker`, `upload-service`)**:
+3.  **各ワーカーサービス (`game-worker`, `static-site-worker`, `video-upload-api`)**:
     *   `sfsp:completed_jobs` キューをリッスンします。
     *   対応するジョブの完了イベントを受け取ると、`final_status` が `clean` であることを確認し、それぞれのコンテンツ処理（HLS変換、ZIP展開など）を開始します。
     *   処理の各段階でDBの `processing_details` フィールドを更新し、フロントエンドに詳細な進捗を伝えます。
@@ -1097,7 +1097,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 ### 19.4. 主なバグ修正とデバッグの過程
 
 *   **ビルドエラー**:
-    *   Goの`imported and not used`エラーを修正 (`upload-service/main.go`から`archive/zip`のimportを削除)。
+    *   Goの`imported and not used`エラーを修正 (`video-upload-api/main.go`から`archive/zip`のimportを削除)。
     *   TypeScriptの`Cannot find namespace 'NodeJS'`エラーを修正（`GameDetailPage.tsx`で`NodeJS.Timeout`を`number`に変更）。
 *   **実行時エラー**:
     *   **DB/Redis接続エラー**: サービス起動時に接続をリトライするロジックを導入。
@@ -1125,7 +1125,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 #### 20.1. 発生していた主な障害・エラー
 - **`game-upload-api` ビルドエラー:**  
   `sfspResponse.Close` 呼び出し時の型不整合 (`bool is not a function`)。
-- **`stream-service` 404 (Not Found) エラー:**  
+- **`video-worker` 404 (Not Found) エラー:**  
   動画詳細取得 API (`/api/videos/:id`) 実行時、DB の `uploader_id` (VARCHAR) を Go 構造体の `int` 型フィールドへスキャンしようとして `can't scan into dest...` エラーが発生し、フォールバックで 404 を返却。
 
 #### 20.2. 各サービスの修正内容
@@ -1136,7 +1136,7 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 - **型変更対応:**  
   `Game` 構造体の `UploaderID` を `string` に統一。JWT ミドルウェアおよび各ハンドラー (`upload`, `update`, `adjust`, `delete`) 内の `userID` / `uploaderID` 変数を `string` 型へ変更。
 
-##### ② `stream-service` (`main.go`)
+##### ② `video-worker` (`main.go`)
 - **型変更対応:**  
   `Video` 構造体の `UploaderID` フィールドを `int` から **`string`** へ変更。
 - **スキャン処理の修正:**  
@@ -1144,6 +1144,6 @@ HLS動画再生機能の実装において発生した問題と、その解決�
 
 #### 20.3. 動作確認結果
 1. **コンテナ再ビルド＆起動:**  
-   `game-upload-api` および `stream-service` のビルドが正常完了。
+   `game-upload-api` および `video-worker` のビルドが正常完了。
 2. **API 正常性確認:**  
    フロントエンドからの `/api/videos/:id` 呼び出しに対して DB スキャンエラーが解消され、`200 OK` で動画メタデータが正常返却されることを確認。

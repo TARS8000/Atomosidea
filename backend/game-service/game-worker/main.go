@@ -111,7 +111,7 @@ func main() {
 	logger.Info("Game Worker started. Waiting for scan completion events...")
 
 	gameCompletionQueue := queue.GameCompletionQueue
-	thumbnailCompletionQueue := queue.ThumbnailCompletionQueue
+	thumbnailCompletionQueue := queue.GameThumbnailCompletionQueue
 
 	for {
 		result, err := queue.RedisClient.BRPop(ctx, 0, gameCompletionQueue, thumbnailCompletionQueue).Result()
@@ -143,6 +143,10 @@ func main() {
 			}
 			processGame(ctx, &event)
 		case thumbnailCompletionQueue:
+			if event.TargetService != "game-thumbnail" {
+				logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a game thumbnail event.", event.TargetService, event.JobID)
+				continue
+			}
 			processGameThumbnail(ctx, &event)
 		default:
 			logger.Infof("INFO: Skipping event from unknown queue: %s", queueName)
@@ -269,7 +273,8 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) {
 
 func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent) {
 	var gameID string
-	err := db.QueryRow(ctx, "SELECT id FROM games WHERE thumbnail_sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&gameID)
+	var currentThumbnailURL string
+	err := db.QueryRow(ctx, "SELECT id, COALESCE(thumbnail_url, '') FROM games WHERE thumbnail_sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&gameID, &currentThumbnailURL)
 	if err != nil {
 		logger.Errorf("[Thumbnail JobID: %s] ERROR: Could not find a matching game record: %v", event.JobID, err)
 		return
@@ -339,7 +344,20 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 		return
 	}
 
-	thumbnailObjectName := fmt.Sprintf("thumbnails/%s-%s", gameID, event.Filename)
+	// Name the thumbnail object after the game ID so the thumbnail is directly
+	// identifiable with its game (e.g. thumbnails/<game_id> mirrors games/<game_id>/).
+	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", gameID)
+
+	// Reclaim storage: delete the previous thumbnail before uploading the new one.
+	if currentThumbnailURL != "" {
+		oldObjectName := strings.TrimPrefix(currentThumbnailURL, "/games/")
+		if err := gameMinioClient.RemoveObject(ctx, gameBucketName, oldObjectName, minio.RemoveObjectOptions{}); err != nil {
+			logger.Warnf("[GameID: %s] WARNING: Failed to delete previous thumbnail %s: %v", gameID, oldObjectName, err)
+		} else {
+			logger.Infof("[GameID: %s] Deleted previous thumbnail %s", gameID, oldObjectName)
+		}
+	}
+
 	_, err = gameMinioClient.PutObject(ctx, gameBucketName, thumbnailObjectName, f, stat.Size(), minio.PutObjectOptions{
 		ContentType: contentType,
 	})

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS public.videos (
     thumbnail_path VARCHAR(255),
     status VARCHAR(50) NOT NULL DEFAULT 'processing',
     sfsp_job_id UUID,
+    thumbnail_sfsp_job_id UUID,
     processing_details TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS public.static_sites (
 
 -- ジョブ検索・参照用インデックス
 CREATE INDEX IF NOT EXISTS idx_videos_sfsp_job_id ON public.videos(sfsp_job_id);
+CREATE INDEX IF NOT EXISTS idx_videos_thumbnail_sfsp_job_id ON public.videos(thumbnail_sfsp_job_id);
 CREATE INDEX IF NOT EXISTS idx_games_sfsp_job_id ON public.games(sfsp_job_id);
 CREATE INDEX IF NOT EXISTS idx_games_thumbnail_sfsp_job_id ON public.games(thumbnail_sfsp_job_id);
 CREATE INDEX IF NOT EXISTS idx_static_sites_sfsp_job_id ON public.static_sites(sfsp_job_id);

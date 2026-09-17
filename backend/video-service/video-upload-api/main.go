@@ -39,6 +39,8 @@ var (
 	sfspApiUrl            string
 	sfspCleanMinioClient  *minio.Client
 	sfspCleanBucketName   string
+	videoMinioClient      *minio.Client
+	videoBucketName       = "videos"
 	maxUploadSize         = int64(2 * 1024 * 1024 * 1024) // 2GB
 	logger                *zap.SugaredLogger
 	allowedVideoMimeTypes = map[string]bool{
@@ -238,6 +240,24 @@ func main() {
 		logger.Fatalf("Unable to connect to SFSP Clean Minio: %v", err)
 	}
 	logger.Info("Successfully connected to SFSP Clean Minio!")
+
+	videoMinioEndpoint := os.Getenv("VIDEO_MINIO_ENDPOINT")
+	videoMinioAccessKey := os.Getenv("VIDEO_MINIO_ACCESS_KEY_ID")
+	videoMinioSecretKey := os.Getenv("VIDEO_MINIO_SECRET_ACCESS_KEY")
+	videoMinioUseSSL := os.Getenv("VIDEO_MINIO_USE_SSL") == "true"
+
+	if videoMinioEndpoint == "" || videoMinioAccessKey == "" || videoMinioSecretKey == "" {
+		logger.Fatalf("FATAL: Configuration for Video MinIO is incomplete. VIDEO_MINIO_ENDPOINT, VIDEO_MINIO_ACCESS_KEY_ID, and VIDEO_MINIO_SECRET_ACCESS_KEY must all be set.")
+	}
+
+	videoMinioClient, err = minio.New(videoMinioEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(videoMinioAccessKey, videoMinioSecretKey, ""),
+		Secure: videoMinioUseSSL,
+	})
+	if err != nil {
+		logger.Fatalf("Unable to connect to Video MinIO: %v", err)
+	}
+	logger.Info("Successfully connected to Video MinIO!")
 
 	go videoWorker(ctx)
 
@@ -612,11 +632,19 @@ func processVideoAsync(ctx context.Context, videoID, fileIDStr, filename, title,
 	if err != nil {
 		logger.Errorf("ERROR: Failed to generate thumbnail for video %s: %v", videoID, err)
 	} else {
-		thumbnailPath = "/storage/thumbnails/" + generatedThumbnailFilename
+		thumbnailPath = uploadThumbnailToMinIO(ctx, videoID, generatedThumbnailPath)
+		os.Remove(generatedThumbnailPath)
 	}
 
+	// 変換したHLSをMinIOへ展開し、ローカル一時ファイルを削除する。
+	if err := uploadHLSMinIO(ctx, videoID, hlsOutputPath); err != nil {
+		updateVideoStatus(ctx, videoID, StatusError, fmt.Sprintf("HLSのMinIOアップロードに失敗しました: %v", err))
+		return
+	}
+	os.RemoveAll(hlsOutputPath)
+
 	updateVideoStatus(ctx, videoID, StatusProcessing, "データベースを更新中...")
-	m3u8RelativePath := fmt.Sprintf("/storage/videos/%s/playlist.m3u8", videoID)
+	m3u8RelativePath := fmt.Sprintf("/videos/%s/playlist.m3u8", videoID)
 	_, err = db.Exec(ctx,
 		"UPDATE videos SET filename = $1, thumbnail_path = $2, status = $3, processing_details = NULL WHERE id = $4",
 		m3u8RelativePath, thumbnailPath, StatusPublic, videoID)
@@ -735,18 +763,20 @@ func deleteHandler(c *gin.Context) {
 		return
 	}
 
-	hlsPath := filepath.Join(uploadDir, videoID)
-	if err := os.RemoveAll(hlsPath); err != nil {
-		logger.Errorf("Failed to delete HLS directory %s: %v", hlsPath, err)
+	// HLSはMinIOへ保存しているのでMinIOから削除し、念のためローカル一時ファイルも削除する。
+	if err := removeHLSMinIO(context.Background(), videoID); err != nil {
+		logger.Errorf("Failed to delete HLS from MinIO for video %s: %v", videoID, err)
+	}
+	if err := os.RemoveAll(filepath.Join(uploadDir, videoID)); err != nil {
+		logger.Warnf("Failed to remove leftover local HLS directory %s for video %s: %v", filepath.Join(uploadDir, videoID), videoID, err)
 	}
 
 	var thumbnailPath string
 	_ = db.QueryRow(context.Background(), "SELECT thumbnail_path FROM videos WHERE id = $1", videoID).Scan(&thumbnailPath)
 	if thumbnailPath != "" {
-		thumbFilename := filepath.Base(thumbnailPath)
-		thumbPath := filepath.Join(thumbnailDir, thumbFilename)
-		if err := os.Remove(thumbPath); err != nil {
-			logger.Errorf("Failed to delete thumbnail file %s: %v", thumbPath, err)
+		objectName := strings.TrimPrefix(thumbnailPath, "/videos/")
+		if err := videoMinioClient.RemoveObject(context.Background(), videoBucketName, objectName, minio.RemoveObjectOptions{}); err != nil {
+			logger.Errorf("Failed to delete thumbnail from MinIO %s: %v", objectName, err)
 		}
 	}
 
@@ -784,10 +814,9 @@ func deleteThumbnailHandler(c *gin.Context) {
 	}
 
 	if thumbnailPath.Valid && thumbnailPath.String != "" {
-		thumbFilename := filepath.Base(thumbnailPath.String)
-		thumbPath := filepath.Join(thumbnailDir, thumbFilename)
-		if err := os.Remove(thumbPath); err != nil {
-			logger.Errorf("Failed to delete thumbnail file %s: %v", thumbPath, err)
+		objectName := strings.TrimPrefix(thumbnailPath.String, "/videos/")
+		if err := videoMinioClient.RemoveObject(context.Background(), videoBucketName, objectName, minio.RemoveObjectOptions{}); err != nil {
+			logger.Errorf("Failed to delete thumbnail from MinIO %s: %v", objectName, err)
 		}
 	}
 
@@ -845,4 +874,139 @@ func authMiddleware() gin.HandlerFunc {
 func generateThumbnail(ctx context.Context, videoPath, thumbnailPath string) error {
 	cmd := exec.CommandContext(ctx, "ffmpeg", "-i", videoPath, "-ss", "00:00:01.000", "-vframes", "1", "-q:v", "2", "-vf", "scale=320:-1", thumbnailPath)
 	return cmd.Run()
+}
+
+// uploadThumbnailToMinIO uploads a locally generated thumbnail to the video
+// MinIO bucket at thumbnails/<videoID> and returns the served URL
+// (/videos/thumbnails/<videoID>). It returns an empty string on failure.
+func uploadThumbnailToMinIO(ctx context.Context, videoID, localPath string) string {
+	f, err := os.Open(localPath)
+	if err != nil {
+		logger.Errorf("[VideoID: %s] ERROR: Failed to open thumbnail for upload: %v", videoID, err)
+		return ""
+	}
+	defer f.Close()
+
+	buffer := make([]byte, 512)
+	n, _ := f.Read(buffer)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		logger.Errorf("[VideoID: %s] ERROR: Failed to reset thumbnail reader: %v", videoID, err)
+		return ""
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		logger.Errorf("[VideoID: %s] ERROR: Failed to stat thumbnail: %v", videoID, err)
+		return ""
+	}
+
+	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", videoID)
+	err = putObjectWithRetry(ctx, thumbnailObjectName, func() (minio.UploadInfo, error) {
+		if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+			return minio.UploadInfo{}, seekErr
+		}
+		return videoMinioClient.PutObject(ctx, videoBucketName, thumbnailObjectName, f, stat.Size(), minio.PutObjectOptions{ContentType: http.DetectContentType(buffer[:n])})
+	})
+	if err != nil {
+		logger.Errorf("[VideoID: %s] ERROR: Failed to upload thumbnail to MinIO: %v", videoID, err)
+		return ""
+	}
+	return "/videos/" + thumbnailObjectName
+}
+
+// contentTypeForHLS returns the MIME type for HLS assets so MinIO serves them
+// with the correct Content-Type for browser playback.
+func contentTypeForHLS(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m3u8":
+		return "application/vnd.apple.mpegurl"
+	case ".ts":
+		return "video/mp2t"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// putObjectWithRetry uploads an object to MinIO, retrying on transient failures
+// such as a startup race where video-storage's MinIO is not yet ready to
+// authenticate requests when video-upload-api first starts. The S3 API and
+// credentials are correct, so a few attempts with backoff resolves the race
+// without masking a genuine misconfiguration.
+func putObjectWithRetry(ctx context.Context, objectName string, upload func() (minio.UploadInfo, error)) error {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		_, err := upload()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			logger.Warnf("MinIO upload attempt %d/%d failed for %s: %v", attempt, maxAttempts, objectName, err)
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
+	}
+	return fmt.Errorf("failed to upload %s to MinIO after %d attempts: %w", objectName, maxAttempts, lastErr)
+}
+
+// uploadHLSMinIO uploads every file under localHlsDir to the video MinIO bucket.
+// Object keys are "<videoID>/<rel>" (no bucket prefix), matching the nginx
+// stream route which consumes "/videos/<videoID>/<path>" as bucket=videos.
+func uploadHLSMinIO(ctx context.Context, videoID, localHlsDir string) error {
+	return filepath.Walk(localHlsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(localHlsDir, path)
+		if err != nil {
+			return err
+		}
+		objectName := fmt.Sprintf("%s/%s", videoID, rel)
+		logger.Infof("[VideoID: %s] Uploading HLS object %s to MinIO", videoID, objectName)
+		f, openErr := os.Open(path)
+		if openErr != nil {
+			return fmt.Errorf("failed to open %s: %w", objectName, openErr)
+		}
+		defer f.Close()
+		stat, statErr := f.Stat()
+		if statErr != nil {
+			return fmt.Errorf("failed to stat %s: %w", objectName, statErr)
+		}
+		if putErr := putObjectWithRetry(ctx, objectName, func() (minio.UploadInfo, error) {
+			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+				return minio.UploadInfo{}, seekErr
+			}
+			return videoMinioClient.PutObject(ctx, videoBucketName, objectName, f, stat.Size(), minio.PutObjectOptions{ContentType: contentTypeForHLS(path)})
+		}); putErr != nil {
+			return fmt.Errorf("failed to upload %s to MinIO: %w", objectName, putErr)
+		}
+		return nil
+	})
+}
+
+// removeHLSMinIO deletes all objects under "<videoID>/" from the video MinIO bucket.
+func removeHLSMinIO(ctx context.Context, videoID string) error {
+	objectCh := videoMinioClient.ListObjects(ctx, videoBucketName, minio.ListObjectsOptions{
+		Prefix:    fmt.Sprintf("%s/", videoID),
+		Recursive: true,
+	})
+	var firstErr error
+	for obj := range objectCh {
+		if obj.Err != nil {
+			logger.Warnf("[VideoID: %s] Error listing object %s: %v", videoID, obj.Key, obj.Err)
+			if firstErr == nil {
+				firstErr = obj.Err
+			}
+			continue
+		}
+		if err := videoMinioClient.RemoveObject(ctx, videoBucketName, obj.Key, minio.RemoveObjectOptions{}); err != nil {
+			logger.Errorf("[VideoID: %s] Failed to remove object %s: %v", videoID, obj.Key, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }

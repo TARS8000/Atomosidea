@@ -151,23 +151,25 @@ func runCleanupBatch(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool
 
 func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, logger *zap.SugaredLogger, job cleanupJobInfo) error {
 	var query string
-	var tableName string
 
 	// ターゲットサービスに応じた app-db テーブル名の決定
 	switch strings.ToLower(job.targetService) {
 	case "video", "videos", "stream", "streams":
-		tableName = "public.videos"
+		query = fmt.Sprintf("SELECT status FROM public.videos WHERE sfsp_job_id = $1")
 	case "game", "games":
-		tableName = "public.games"
+		query = fmt.Sprintf("SELECT status FROM public.games WHERE sfsp_job_id = $1")
 	case "static_site", "static_sites", "static-site", "staticsite":
-		tableName = "public.static_sites"
-	case "thumbnail":
-		tableName = ""
-	}
-
-	if tableName != "" {
-		query = fmt.Sprintf("SELECT status FROM %s WHERE sfsp_job_id = $1", tableName)
-	} else {
+		query = fmt.Sprintf("SELECT status FROM public.static_sites WHERE sfsp_job_id = $1")
+	case "thumbnail", "video-thumbnail":
+		// サムネイルはvideosテーブルのthumbnail_sfsp_job_idで参照される
+		query = "SELECT status FROM public.videos WHERE thumbnail_sfsp_job_id = $1"
+	case "game-thumbnail":
+		// サムネイルはgamesテーブルのthumbnail_sfsp_job_idで参照される
+		query = "SELECT status FROM public.games WHERE thumbnail_sfsp_job_id = $1"
+	case "site-thumbnail":
+		// サムネイルはstatic_sitesテーブルのthumbnail_sfsp_job_idで参照される
+		query = "SELECT status FROM public.static_sites WHERE thumbnail_sfsp_job_id = $1"
+	default:
 		// ターゲットサービスが不明な場合は 3 テーブルを横断検索
 		query = `
           SELECT status FROM (
