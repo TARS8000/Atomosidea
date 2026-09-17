@@ -128,8 +128,7 @@ const EditProfilePage = () => {
           signal: controller.signal,
         });
         if (res.data.status === 'scanning') {
-          const result = await pollProfile(controller.signal);
-          newIconUrl = result.iconUrl || iconPreview;
+          await pollProfile(controller.signal);
         } else if (res.data.icon_url) {
           newIconUrl = res.data.icon_url;
         }
@@ -145,8 +144,7 @@ const EditProfilePage = () => {
           signal: controller.signal,
         });
         if (res.data.status === 'scanning') {
-          const result = await pollProfile(controller.signal);
-          newBackgroundUrl = result.backgroundImageUrl || backgroundPreview;
+          await pollProfile(controller.signal);
         } else if (res.data.background_image_url) {
           newBackgroundUrl = res.data.background_image_url;
         }

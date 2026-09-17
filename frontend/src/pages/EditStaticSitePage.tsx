@@ -4,14 +4,18 @@ import axios from 'axios';
 import { Container, TextField, Button, Typography, Box, CircularProgress, Alert } from '@mui/material';
 import { useAuth } from '../context/AuthContext';
 
+const MAX_POLL_MS = 120000;
+
 const EditStaticSitePage = () => {
   const { id } = useParams();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [thumbnail, setThumbnail] = useState<File | null>(null);
   const [existingThumbnailUrl, setExistingThumbnailUrl] = useState('');
+  const [thumbnailUrl, setThumbnailUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
+  const [isScanningThumbnail, setIsScanningThumbnail] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const navigate = useNavigate();
@@ -26,6 +30,7 @@ const EditStaticSitePage = () => {
         setTitle(response.data.title);
         setDescription(response.data.description);
         setExistingThumbnailUrl(response.data.thumbnail_url);
+        setThumbnailUrl(response.data.thumbnail_url);
       } catch (err) {
         setError('サイト情報の取得に失敗しました。');
       } finally {
@@ -36,9 +41,46 @@ const EditStaticSitePage = () => {
   }, [id, token]);
 
   const handleThumbnailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setThumbnail(e.target.files[0]);
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setThumbnail(file);
+      setThumbnailUrl(URL.createObjectURL(file));
     }
+  };
+
+  const pollStaticSite = async (signal: AbortSignal): Promise<{ thumbnailUrl?: string; accepted: boolean }> => {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      const pollInterval = setInterval(async () => {
+        try {
+          const siteRes = await axios.get(`/api/static-sites/${id}`, { signal });
+          const site = siteRes.data;
+          if (!site.thumbnail_sfsp_job_id) {
+            clearInterval(pollInterval);
+            // A thumbnail_url set here means the SFSP worker wrote the clean
+            // thumbnail to storage. When the scan rejected the file, the job_id
+            // is cleared but thumbnail_url stays empty.
+            resolve({
+              thumbnailUrl: site.thumbnail_url || existingThumbnailUrl,
+              accepted: !!site.thumbnail_url,
+            });
+          }
+        } catch (err) {
+          if (!axios.isCancel(err)) {
+            console.error('Polling static site failed:', err);
+          }
+        }
+        if (Date.now() - startTime > MAX_POLL_MS) {
+          clearInterval(pollInterval);
+          reject(new Error('サムネイルアップロードの待機がタイムアウトしました。'));
+        }
+      }, 2000);
+
+      signal.addEventListener('abort', () => {
+        clearInterval(pollInterval);
+        reject(new Error('Polling aborted'));
+      });
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -47,24 +89,86 @@ const EditStaticSitePage = () => {
     setError('');
     setSuccess('');
 
-    const formData = new FormData();
-    formData.append('title', title);
-    formData.append('description', description);
-    if (thumbnail) {
-      formData.append('thumbnail', thumbnail);
-    }
+    const controller = new AbortController();
 
     try {
-      await axios.put(`/api/static-sites/${id}`, formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-          Authorization: `Bearer ${token}`,
-        },
-      });
-      setSuccess('サイト情報が更新されました。');
-      setTimeout(() => navigate(`/static-sites/${id}`), 2000);
+      let newThumbnailUrl = thumbnailUrl;
+
+      if (thumbnail) {
+        // Step 1: upload thumbnail only (triggers SFSP scan). Title/description
+        // are deferred until the scan completes so the site is not half-updated
+        // if the thumbnail is rejected.
+        setIsScanningThumbnail(true);
+        const thumbFormData = new FormData();
+        thumbFormData.append('thumbnail', thumbnail);
+        const res = await axios.put(`/api/static-sites/${id}`, thumbFormData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+            Authorization: `Bearer ${token}`,
+          },
+          signal: controller.signal,
+        });
+        if (res.data.status === 'scanning') {
+          const result = await pollStaticSite(controller.signal);
+          if (!result.accepted) {
+            setIsScanningThumbnail(false);
+            setError('サムネイルがセキュリティスキャンで拒否されました。');
+            return;
+          }
+          // Step 2: scan finished and the thumbnail was written to storage.
+          // Commit title/description now.
+          const infoFormData = new FormData();
+          infoFormData.append('title', title);
+          infoFormData.append('description', description);
+          await axios.put(`/api/static-sites/${id}`, infoFormData, {
+            headers: {
+              'Content-Type': 'multipart/form-data',
+              Authorization: `Bearer ${token}`,
+            },
+            signal: controller.signal,
+          });
+          setSuccess('更新が完了しました。');
+        } else if (res.data.thumbnail_url) {
+          newThumbnailUrl = res.data.thumbnail_url;
+          setSuccess('サイト情報が更新されました。');
+        } else {
+          setSuccess('サイト情報が更新されました。');
+        }
+      } else {
+        const formData = new FormData();
+        formData.append('title', title);
+        formData.append('description', description);
+        await axios.put(`/api/static-sites/${id}`, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+            Authorization: `Bearer ${token}`,
+          },
+          signal: controller.signal,
+        });
+        setSuccess('サイト情報が更新されました。');
+      }
+
+      // Preload the freshly-written thumbnail (cache-buster to bypass any stale
+      // browser cache of the old image) and keep the overlay up until it has
+      // loaded, then swap the displayed image only once it is fully ready, so
+      // the old thumbnail never flashes during the transition.
+      const bust = newThumbnailUrl.includes('?') ? '&' : '?';
+      const freshUrl = newThumbnailUrl + bust + 't=' + Date.now();
+      const preload = new Image();
+      const reveal = () => {
+        setIsScanningThumbnail(false);
+        setThumbnailUrl(freshUrl);
+        setError('');
+        setTimeout(() => navigate(`/static-sites/${id}`), 2000);
+      };
+      preload.onload = reveal;
+      preload.onerror = reveal;
+      preload.src = freshUrl;
     } catch (err) {
-      setError('更新に失敗しました。');
+      if (!axios.isCancel(err)) {
+        setError('更新に失敗しました。');
+      }
+      setIsScanningThumbnail(false);
     } finally {
       setUpdating(false);
     }
@@ -80,6 +184,7 @@ const EditStaticSitePage = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       setExistingThumbnailUrl('');
+      setThumbnailUrl('');
       setSuccess('サムネイルが削除されました。');
     } catch (err) {
       setError('サムネイルの削除に失敗しました。');
@@ -120,16 +225,34 @@ const EditStaticSitePage = () => {
           />
         </Box>
         <Box mb={2}>
-          <Button variant="contained" component="label">
-            新しいサムネイルを選択
-            <input type="file" hidden accept="image/*" onChange={handleThumbnailChange} />
-          </Button>
+          <Box sx={{ position: 'relative', display: 'inline-block' }}>
+            <Button variant="contained" component="label">
+              新しいサムネイルを選択
+              <input type="file" hidden accept="image/*" onChange={handleThumbnailChange} />
+            </Button>
+            {isScanningThumbnail && (
+              <Box
+                sx={{
+                  position: 'absolute',
+                  inset: 0,
+                  bgcolor: 'rgba(0,0,0,0.6)',
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  borderRadius: 2,
+                }}
+              >
+                <CircularProgress size={20} sx={{ color: 'white', mr: 1 }} />
+                <Typography variant="body2" sx={{ color: 'white' }}>スキャン中...</Typography>
+              </Box>
+            )}
+          </Box>
           {thumbnail && <Typography sx={{ ml: 2, display: 'inline' }}>{thumbnail.name}</Typography>}
         </Box>
-        {existingThumbnailUrl && (
+        {thumbnailUrl && (
           <Box mb={2}>
             <Typography variant="subtitle1">現在のサムネイル</Typography>
-            <img src={existingThumbnailUrl} alt="Thumbnail" style={{ maxWidth: '100%', height: 'auto' }} />
+            <img src={thumbnailUrl} alt="Thumbnail" style={{ maxWidth: '100%', height: 'auto' }} />
             <Button variant="outlined" color="secondary" onClick={handleDeleteThumbnail} sx={{ mt: 1 }}>
               サムネイルを削除
             </Button>

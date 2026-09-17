@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -110,9 +111,10 @@ func main() {
 	logger.Info("Game Worker started. Waiting for scan completion events...")
 
 	gameCompletionQueue := queue.GameCompletionQueue
+	thumbnailCompletionQueue := queue.GameThumbnailCompletionQueue
 
 	for {
-		result, err := queue.RedisClient.BRPop(ctx, 0, gameCompletionQueue).Result()
+		result, err := queue.RedisClient.BRPop(ctx, 0, gameCompletionQueue, thumbnailCompletionQueue).Result()
 		if err != nil {
 			logger.Errorf("Error fetching event from Redis: %v. Retrying in 5 seconds...", err)
 			time.Sleep(5 * time.Second)
@@ -123,8 +125,9 @@ func main() {
 			continue
 		}
 
+		queueName := result[0]
 		eventPayload := result[1]
-		logger.Infof("Received event: %s", eventPayload)
+		logger.Infof("Received event from queue [%s]: %s", queueName, eventPayload)
 
 		var event event.ScanCompletionEvent
 		if err := json.Unmarshal([]byte(eventPayload), &event); err != nil {
@@ -132,12 +135,22 @@ func main() {
 			continue
 		}
 
-		if event.TargetService != "game" {
-			logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a game event.", event.TargetService, event.JobID)
-			continue
+		switch queueName {
+		case gameCompletionQueue:
+			if event.TargetService != "game" {
+				logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a game event.", event.TargetService, event.JobID)
+				continue
+			}
+			processGame(ctx, &event)
+		case thumbnailCompletionQueue:
+			if event.TargetService != "game-thumbnail" {
+				logger.Infof("INFO: Skipping event for TargetService '%s' (Job ID: %s), not a game thumbnail event.", event.TargetService, event.JobID)
+				continue
+			}
+			processGameThumbnail(ctx, &event)
+		default:
+			logger.Infof("INFO: Skipping event from unknown queue: %s", queueName)
 		}
-
-		processGame(ctx, &event)
 	}
 }
 
@@ -256,6 +269,111 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) {
 	}
 
 	logger.Infof("[GameID: %s] Processing complete. Game is now public.", gameID)
+}
+
+func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent) {
+	var gameID string
+	var currentThumbnailURL string
+	err := db.QueryRow(ctx, "SELECT id, COALESCE(thumbnail_url, '') FROM games WHERE thumbnail_sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", event.JobID).Scan(&gameID, &currentThumbnailURL)
+	if err != nil {
+		logger.Errorf("[Thumbnail JobID: %s] ERROR: Could not find a matching game record: %v", event.JobID, err)
+		return
+	}
+	logger.Infof("[GameID: %s] Found matching game record for thumbnail SFSP JobID %s", gameID, event.JobID)
+
+	if event.FinalStatus != "clean" {
+		logger.Infof("[GameID: %s] Thumbnail scan result is '%s'. Aborting thumbnail processing.", gameID, event.FinalStatus)
+		_, err = db.Exec(ctx, "UPDATE games SET thumbnail_sfsp_job_id = NULL WHERE id = $1", gameID)
+		if err != nil {
+			logger.Errorf("[GameID: %s] Failed to clear thumbnail scan job: %v", gameID, err)
+		}
+		return
+	}
+
+	logger.Infof("[GameID: %s] Thumbnail is clean. Processing thumbnail...", gameID)
+
+	fileIDStr := event.FileID.String()
+	candidateKeys := []string{
+		fileIDStr,
+		fmt.Sprintf("%s/%s", fileIDStr, event.Filename),
+	}
+	if event.SHA256 != "" {
+		candidateKeys = append(candidateKeys, fmt.Sprintf("%s/%s", event.SHA256, event.Filename))
+	}
+	candidateKeys = append(candidateKeys, event.Filename)
+
+	tempThumbPath := filepath.Join(tempDir, fmt.Sprintf("thumb-%s-%s", gameID, event.Filename))
+	var downloadErr error
+	downloadSuccess := false
+
+	for _, objectKey := range candidateKeys {
+		logger.Infof("[GameID: %s] Trying thumbnail download key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
+		downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, objectKey, tempThumbPath, minio.GetObjectOptions{})
+		if downloadErr == nil {
+			downloadSuccess = true
+			logger.Infof("[GameID: %s] Successfully downloaded thumbnail with key '%s'", gameID, objectKey)
+			break
+		}
+		logger.Warnf("[GameID: %s] Failed to download thumbnail key '%s': %v", gameID, objectKey, downloadErr)
+	}
+
+	if !downloadSuccess {
+		logger.Errorf("[GameID: %s] ERROR: Download thumbnail from SFSP failed after retries: %v", gameID, downloadErr)
+		return
+	}
+	defer os.Remove(tempThumbPath)
+
+	f, err := os.Open(tempThumbPath)
+	if err != nil {
+		logger.Errorf("[GameID: %s] ERROR: Failed to open downloaded thumbnail: %v", gameID, err)
+		return
+	}
+	defer f.Close()
+
+	buffer := make([]byte, 512)
+	n, _ := f.Read(buffer)
+	contentType := http.DetectContentType(buffer[:n])
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		logger.Errorf("[GameID: %s] ERROR: Failed to reset thumbnail file: %v", gameID, err)
+		return
+	}
+
+	stat, err := f.Stat()
+	if err != nil {
+		logger.Errorf("[GameID: %s] ERROR: Failed to stat thumbnail file: %v", gameID, err)
+		return
+	}
+
+	// Name the thumbnail object after the game ID so the thumbnail is directly
+	// identifiable with its game (e.g. thumbnails/<game_id> mirrors games/<game_id>/).
+	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", gameID)
+
+	// Reclaim storage: delete the previous thumbnail before uploading the new one.
+	if currentThumbnailURL != "" {
+		oldObjectName := strings.TrimPrefix(currentThumbnailURL, "/games/")
+		if err := gameMinioClient.RemoveObject(ctx, gameBucketName, oldObjectName, minio.RemoveObjectOptions{}); err != nil {
+			logger.Warnf("[GameID: %s] WARNING: Failed to delete previous thumbnail %s: %v", gameID, oldObjectName, err)
+		} else {
+			logger.Infof("[GameID: %s] Deleted previous thumbnail %s", gameID, oldObjectName)
+		}
+	}
+
+	_, err = gameMinioClient.PutObject(ctx, gameBucketName, thumbnailObjectName, f, stat.Size(), minio.PutObjectOptions{
+		ContentType: contentType,
+	})
+	if err != nil {
+		logger.Errorf("[GameID: %s] ERROR: Failed to upload thumbnail to game MinIO: %v", gameID, err)
+		return
+	}
+
+	thumbnailURL := fmt.Sprintf("/games/%s", thumbnailObjectName)
+	_, err = db.Exec(ctx, "UPDATE games SET thumbnail_url = $1, thumbnail_sfsp_job_id = NULL WHERE id = $2", thumbnailURL, gameID)
+	if err != nil {
+		logger.Errorf("[GameID: %s] ERROR: Failed to update thumbnail URL in DB: %v", gameID, err)
+		return
+	}
+
+	logger.Infof("[GameID: %s] Thumbnail processing complete.", gameID)
 }
 
 func findGameRoot(basePath string) (string, error) {

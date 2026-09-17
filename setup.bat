@@ -75,7 +75,7 @@ echo Creating .env file...
 >> .env echo SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY=your-sfsp-clean-minio-root-access-key
 >> .env echo SFSP_CLEAN_MINIO_ROOT_SECRET_KEY=your-sfsp-clean-minio-root-secret-key
 >> .env echo.
->> .env echo # SFSP MinIO Credentials for upload-service (raw-minio)
+>> .env echo # SFSP MinIO Credentials for video-upload-api (raw-minio)
 >> .env echo SFSP_UPLOAD_ACCESS_KEY=sfsp-upload-access-key
 >> .env echo SFSP_UPLOAD_SECRET_KEY=sfsp-upload-secret-key
 >> .env echo.

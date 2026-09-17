@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS public.videos (
     thumbnail_path VARCHAR(255),
     status VARCHAR(50) NOT NULL DEFAULT 'processing',
     sfsp_job_id UUID,
+    thumbnail_sfsp_job_id UUID,
     processing_details TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS public.games (
     description TEXT,
     status VARCHAR(50) NOT NULL DEFAULT 'processing',
     sfsp_job_id UUID,
+    thumbnail_sfsp_job_id UUID,
     processing_details TEXT,
     game_url VARCHAR(255),
     thumbnail_url VARCHAR(255),
@@ -39,12 +41,13 @@ CREATE TABLE IF NOT EXISTS public.games (
 
 -- 静的サイトテーブル
 CREATE TABLE IF NOT EXISTS public.static_sites (
-                                                   id VARCHAR(10) PRIMARY KEY,
+                                                    id VARCHAR(10) PRIMARY KEY,
     user_id UUID NOT NULL,
     title VARCHAR(255) NOT NULL,
     description TEXT,
     status VARCHAR(50) NOT NULL DEFAULT 'processing',
     sfsp_job_id UUID,
+    thumbnail_sfsp_job_id UUID,
     processing_details TEXT,
     minio_path VARCHAR(255) NOT NULL,
     entry_point_path VARCHAR(255) DEFAULT 'index.html' NOT NULL,
@@ -59,8 +62,11 @@ CREATE TABLE IF NOT EXISTS public.static_sites (
 
 -- ジョブ検索・参照用インデックス
 CREATE INDEX IF NOT EXISTS idx_videos_sfsp_job_id ON public.videos(sfsp_job_id);
+CREATE INDEX IF NOT EXISTS idx_videos_thumbnail_sfsp_job_id ON public.videos(thumbnail_sfsp_job_id);
 CREATE INDEX IF NOT EXISTS idx_games_sfsp_job_id ON public.games(sfsp_job_id);
+CREATE INDEX IF NOT EXISTS idx_games_thumbnail_sfsp_job_id ON public.games(thumbnail_sfsp_job_id);
 CREATE INDEX IF NOT EXISTS idx_static_sites_sfsp_job_id ON public.static_sites(sfsp_job_id);
+CREATE INDEX IF NOT EXISTS idx_static_sites_thumbnail_sfsp_job_id ON public.static_sites(thumbnail_sfsp_job_id);
 
 -- ユーザー（投稿者）別一覧表示用インデックス
 CREATE INDEX IF NOT EXISTS idx_videos_uploader_id ON public.videos(uploader_id);

@@ -10,8 +10,10 @@ const EditGamePage = () => {
   const [description, setDescription] = useState('');
   const [thumbnail, setThumbnail] = useState<File | null>(null);
   const [existingThumbnailUrl, setExistingThumbnailUrl] = useState('');
+  const [thumbnailUrl, setThumbnailUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
+  const [isScanningThumbnail, setIsScanningThumbnail] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const navigate = useNavigate();
@@ -26,6 +28,7 @@ const EditGamePage = () => {
         setTitle(response.data.title);
         setDescription(response.data.description);
         setExistingThumbnailUrl(response.data.thumbnail_url);
+        setThumbnailUrl(response.data.thumbnail_url);
       } catch (err) {
         setError('ゲーム情報の取得に失敗しました。');
       } finally {
@@ -36,9 +39,49 @@ const EditGamePage = () => {
   }, [id, token]);
 
   const handleThumbnailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setThumbnail(e.target.files[0]);
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setThumbnail(file);
+      setThumbnailUrl(URL.createObjectURL(file));
     }
+  };
+
+  // thumbnail_sfsp_job_id が NULL になるまでポーリングする。
+  // このフラグがクリアされるのはゲームワーカーがクリーンなサムネイルを
+  // game-storage に書き込んだ後だけなので、これでストレ書き込み完了を
+  // 保証でき、フライングによる旧画像の表示を防止できる。
+  const MAX_POLL_MS = 120000;
+  const pollGame = async (signal: AbortSignal): Promise<{ thumbnailUrl?: string }> => {
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const pollInterval = setInterval(async () => {
+        try {
+          const gameRes = await axios.get(`/api/games/${id}`, { signal });
+          const game = gameRes.data;
+          // ゲームワーカーがサムネイル処理を完了（job_id クリア）すれば解決。
+          // この時点で thumbnail_url は新サムネイルに更新されている。
+          if (!game.thumbnail_sfsp_job_id) {
+            clearInterval(pollInterval);
+            resolve({ thumbnailUrl: game.thumbnail_url || existingThumbnailUrl });
+            return;
+          }
+          // 安全網: ゲームワーカーが応答しない無限スピンを防止する。
+          if (Date.now() - startedAt > MAX_POLL_MS) {
+            clearInterval(pollInterval);
+            resolve({ thumbnailUrl: game.thumbnail_url || existingThumbnailUrl });
+          }
+        } catch (err) {
+          if (!axios.isCancel(err)) {
+            console.error('Polling game failed:', err);
+          }
+        }
+      }, 2000);
+
+      signal.addEventListener('abort', () => {
+        clearInterval(pollInterval);
+        reject(new Error('Polling aborted'));
+      });
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -46,6 +89,8 @@ const EditGamePage = () => {
     setUpdating(true);
     setError('');
     setSuccess('');
+
+    const controller = new AbortController();
 
     const formData = new FormData();
     formData.append('title', title);
@@ -55,16 +100,45 @@ const EditGamePage = () => {
     }
 
     try {
-      await axios.put(`/api/games/${id}`, formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-          Authorization: `Bearer ${token}`,
-        },
-      });
-      setSuccess('ゲーム情報が更新されました。');
-      setTimeout(() => navigate(`/games/${id}`), 2000);
+      let newThumbnailUrl = thumbnailUrl;
+
+      if (thumbnail) {
+        setIsScanningThumbnail(true);
+        const res = await axios.put(`/api/games/${id}`, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+            Authorization: `Bearer ${token}`,
+          },
+          signal: controller.signal,
+        });
+        if (res.data.status === 'scanning') {
+          await pollGame(controller.signal);
+        } else if (res.data.thumbnail_url) {
+          newThumbnailUrl = res.data.thumbnail_url;
+        }
+      }
+
+      // Preload the freshly-written thumbnail (cache-buster to bypass any stale
+      // browser cache of the old image) and keep the overlay up until it has
+      // loaded, then swap the displayed image only once it is fully ready, so
+      // the old thumbnail never flashes during the transition.
+      const bust = newThumbnailUrl.includes('?') ? '&' : '?';
+      const freshUrl = newThumbnailUrl + bust + 't=' + Date.now();
+      const preload = new Image();
+      const reveal = () => {
+        setIsScanningThumbnail(false);
+        setThumbnailUrl(freshUrl);
+        setSuccess('ゲーム情報が更新されました。');
+        setTimeout(() => navigate(`/games/${id}`), 2000);
+      };
+      preload.onload = reveal;
+      preload.onerror = reveal;
+      preload.src = freshUrl;
     } catch (err) {
-      setError('更新に失敗しました。');
+      if (!axios.isCancel(err)) {
+        setError('更新に失敗しました。');
+      }
+      setIsScanningThumbnail(false);
     } finally {
       setUpdating(false);
     }
@@ -80,6 +154,7 @@ const EditGamePage = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       setExistingThumbnailUrl('');
+      setThumbnailUrl('');
       setSuccess('サムネイルが削除されました。');
     } catch (err) {
       setError('サムネイルの削除に失敗しました。');
@@ -120,16 +195,34 @@ const EditGamePage = () => {
           />
         </Box>
         <Box mb={2}>
-          <Button variant="contained" component="label">
-            新しいサムネイルを選択
-            <input type="file" hidden accept="image/*" onChange={handleThumbnailChange} />
-          </Button>
+          <Box sx={{ position: 'relative', display: 'inline-block' }}>
+            <Button variant="contained" component="label">
+              新しいサムネイルを選択
+              <input type="file" hidden accept="image/*" onChange={handleThumbnailChange} />
+            </Button>
+            {isScanningThumbnail && (
+              <Box
+                sx={{
+                  position: 'absolute',
+                  inset: 0,
+                  bgcolor: 'rgba(0,0,0,0.6)',
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  borderRadius: 2,
+                }}
+              >
+                <CircularProgress size={20} sx={{ color: 'white', mr: 1 }} />
+                <Typography variant="body2" sx={{ color: 'white' }}>スキャン中...</Typography>
+              </Box>
+            )}
+          </Box>
           {thumbnail && <Typography sx={{ ml: 2, display: 'inline' }}>{thumbnail.name}</Typography>}
         </Box>
-        {existingThumbnailUrl && (
+        {thumbnailUrl && (
           <Box mb={2}>
             <Typography variant="subtitle1">現在のサムネイル</Typography>
-            <img src={existingThumbnailUrl} alt="Thumbnail" style={{ maxWidth: '100%', height: 'auto' }} />
+            <img src={thumbnailUrl} alt="Thumbnail" style={{ maxWidth: '100%', height: 'auto' }} />
             <Button variant="outlined" color="secondary" onClick={handleDeleteThumbnail} sx={{ mt: 1 }}>
               サムネイルを削除
             </Button>
