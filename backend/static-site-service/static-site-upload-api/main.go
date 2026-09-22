@@ -46,7 +46,7 @@ type StaticSite struct {
 	Description    string    `json:"description"`
 	MinioPath      string    `json:"minio_path"`
 	EntryPointPath string    `json:"entry_point_path"`
-	ThumbnailURL   string    `json:"thumbnail_url"`
+	ThumbnailURL   *string   `json:"thumbnail_url"`
 Status         string      `json:"status"`
 	CreatedAt      time.Time   `json:"created_at"`
 	UpdatedAt      time.Time   `json:"updated_at"`

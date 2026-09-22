@@ -390,7 +390,7 @@ func registerHandler(c *gin.Context) {
 	go func(userIDStr, uname string) {
 		profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
 		if profileServiceURL == "" {
-			profileServiceURL = "http://profile-service:8083"
+			profileServiceURL = "http://profile-service:8084"
 		}
 
 		payload, _ := json.Marshal(map[string]string{
@@ -510,7 +510,7 @@ func googleCallbackHandler(c *gin.Context) {
 		go func(userIDStr, username string) {
 			profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
 			if profileServiceURL == "" {
-				profileServiceURL = "http://profile-service:8083" // Docker Compose内のデフォルト
+				profileServiceURL = "http://profile-service:8084" // Docker Compose内のデフォルト
 			}
 
 			payload, _ := json.Marshal(map[string]string{

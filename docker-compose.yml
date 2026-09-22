@@ -81,97 +81,28 @@ services:
       - sfsp-isolated-net
 
   # ==========================================
-  # Storage Services (内部接続のみ)
+  # Storage Service (Unified MinIO, bucket-level separation)
   # ==========================================
-  static-site-storage:
+  minio:
     image: minio/minio:latest
-    container_name: atmosidea-static-site-storage
+    container_name: atmosidea-minio
     restart: always
     command: server /data --console-address ":9001"
     env_file:
       - .env
     environment:
-      MINIO_ROOT_USER: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
-      MINIO_ROOT_PASSWORD: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - ./backend/static-site-service/static_site_storage_data:/data
+      - ./backend/storage_data:/data
     networks:
       - atmosidea-network
-
-  video-storage:
-    image: minio/minio:latest
-    container_name: atmosidea-video-storage
-    restart: always
-    command: server /data --console-address ":9003"
-    env_file:
-      - .env
-    environment:
-      MINIO_ROOT_USER: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
-    volumes:
-      - ./backend/video-service/video_storage_data:/data
-    networks:
-      - atmosidea-network
-
-  profile-storage:
-    image: minio/minio:latest
-    container_name: atmosidea-profile-storage
-    restart: always
-    command: server /data --console-address ":9005"
-    env_file:
-      - .env
-    environment:
-      MINIO_ROOT_USER: ${PROFILE_MINIO_ACCESS_KEY_ID}
-      MINIO_ROOT_PASSWORD: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
-    volumes:
-      - ./backend/auth/auth-storage/profile_storage_data:/data
-    networks:
-      - atmosidea-network
-
-  game-storage:
-    image: minio/minio:latest
-    container_name: atmosidea-game-storage
-    restart: always
-    command: server /data --console-address ":9007"
-    env_file:
-      - .env
-    environment:
-      MINIO_ROOT_USER: ${GAME_MINIO_ACCESS_KEY_ID}
-      MINIO_ROOT_PASSWORD: ${GAME_MINIO_SECRET_ACCESS_KEY}
-    volumes:
-      - ./backend/game-service/game_storage_data:/data
-    networks:
-      - atmosidea-network
-
-  sfsp-raw-minio:
-    image: minio/minio:latest
-    container_name: sfsp-raw-minio
-    restart: always
-    command: server /data --console-address ":9009"
-    env_file:
-      - .env
-    environment:
-      MINIO_ROOT_USER: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
-      MINIO_ROOT_PASSWORD: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
-    volumes:
-      - ./backend/security/sfsp-storage/sfsp_raw_minio_data:/data
-    networks:
       - sfsp-isolated-net
-
-  sfsp-clean-minio:
-    image: minio/minio:latest
-    container_name: sfsp-clean-minio
-    restart: always
-    command: server /data --console-address ":9011"
-    env_file:
-      - .env
-    environment:
-      MINIO_ROOT_USER: ${SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY}
-      MINIO_ROOT_PASSWORD: ${SFSP_CLEAN_MINIO_ROOT_SECRET_KEY}
-    volumes:
-      - ./backend/security/sfsp-storage/sfsp_clean_minio_data:/data
-    networks:
-      - sfsp-isolated-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   # ==========================================
   # MinIO バケット自動初期化サービス
@@ -183,18 +114,8 @@ services:
     env_file:
       - .env
     environment:
-      PROFILE_MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
-      PROFILE_MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
-      GAME_MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
-      GAME_MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
-      STATIC_SITE_MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
-      STATIC_SITE_MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
-      VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
-      VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
-      SFSP_RAW_MINIO_ROOT_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
-      SFSP_RAW_MINIO_ROOT_SECRET_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY: ${SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY}
-      SFSP_CLEAN_MINIO_ROOT_SECRET_KEY: ${SFSP_CLEAN_MINIO_ROOT_SECRET_KEY}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       SFSP_UPLOAD_ACCESS_KEY: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_UPLOAD_SECRET_KEY: ${SFSP_UPLOAD_SECRET_KEY}
       SFSP_API_ACCESS_KEY: ${SFSP_API_ACCESS_KEY}
@@ -212,80 +133,63 @@ services:
       SFSP_WORKER_CLEAN_ACCESS_KEY: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
       SFSP_WORKER_CLEAN_SECRET_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
     depends_on:
-      profile-storage:
-        condition: service_started
-      game-storage:
-        condition: service_started
-      static-site-storage:
-        condition: service_started
-      video-storage:
-        condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
-        condition: service_started
+      minio:
+        condition: service_healthy
     entrypoint: |
       /bin/sh -c "
-      echo 'Waiting for MinIO services...';
-      until mc alias set profile http://profile-storage:9000 \"$PROFILE_MINIO_ACCESS_KEY_ID\" \"$PROFILE_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
-      until mc alias set game http://game-storage:9000 \"$GAME_MINIO_ACCESS_KEY_ID\" \"$GAME_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
-      until mc alias set staticsite http://static-site-storage:9000 \"$STATIC_SITE_MINIO_ACCESS_KEY_ID\" \"$STATIC_SITE_MINIO_SECRET_ACCESS_KEY\"; do sleep 1; done;
-      until mc alias set videostorage http://video-storage:9000 \"${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}\" \"${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}\"; do sleep 1; done;
-      until mc alias set sfsp-raw http://sfsp-raw-minio:9000 \"$SFSP_RAW_MINIO_ROOT_ACCESS_KEY\" \"$SFSP_RAW_MINIO_ROOT_SECRET_KEY\"; do sleep 1; done;
-      until mc alias set sfsp-clean http://sfsp-clean-minio:9000 \"$SFSP_CLEAN_MINIO_ROOT_ACCESS_KEY\" \"$SFSP_CLEAN_MINIO_ROOT_SECRET_KEY\"; do sleep 1; done;
+      echo 'Waiting for MinIO...';
+      until mc alias set myminio http://minio:9000 \"$MINIO_ROOT_USER\" \"$MINIO_ROOT_PASSWORD\"; do sleep 1; done;
+      mc admin info myminio;
 
       set -e;
 
       echo 'Creating buckets...';
-      mc mb --ignore-existing profile/user-profiles;
-      mc anonymous set download profile/user-profiles;
-      mc mb --ignore-existing game/games;
-      mc anonymous set download game/games;
-      mc mb --ignore-existing staticsite/static-sites;
-      mc anonymous set download staticsite/static-sites;
-      mc mb --ignore-existing videostorage/videos;
-      mc mb --ignore-existing videostorage/thumbnails;
-      mc anonymous set download videostorage/videos;
-      mc anonymous set download videostorage/thumbnails;
-
-      mc mb --ignore-existing sfsp-raw/raw-files;
-      mc mb --ignore-existing sfsp-clean/clean-files;
-      mc mb --ignore-existing sfsp-clean/quarantine;
+      mc mb --ignore-existing myminio/user-profiles;
+      mc anonymous set download myminio/user-profiles;
+      mc mb --ignore-existing myminio/static-sites;
+      mc anonymous set download myminio/static-sites;
+      mc mb --ignore-existing myminio/videos;
+      mc anonymous set download myminio/videos;
+      mc mb --ignore-existing myminio/games;
+      mc anonymous set download myminio/games;
+      mc mb --ignore-existing myminio/raw-files;
+      mc mb --ignore-existing myminio/clean-files;
+      mc mb --ignore-existing myminio/quarantine;
 
       echo 'Creating and updating policies...';
-      mc admin policy create sfsp-raw sfsp-upload-policy /tmp/sfsp-upload-policy.json;
-      mc admin policy create sfsp-clean sfsp-api-policy /tmp/sfsp-api-policy.json;
-      mc admin policy create sfsp-clean sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
-      mc admin policy create sfsp-clean sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
-      mc admin policy create sfsp-clean sfsp-profile-worker-policy /tmp/sfsp-profile-worker-policy.json;
-      mc admin policy create sfsp-clean sfsp-video-worker-policy /tmp/sfsp-video-worker-policy.json;
-      mc admin policy create sfsp-raw sfsp-worker-raw-policy /tmp/sfsp-worker-raw-policy.json;
-      mc admin policy create sfsp-clean sfsp-worker-clean-policy /tmp/sfsp-worker-clean-policy.json;
+      mc admin policy create myminio sfsp-upload-policy /tmp/sfsp-upload-policy.json;
+      mc admin policy create myminio sfsp-api-policy /tmp/sfsp-api-policy.json;
+      mc admin policy create myminio sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
+      mc admin policy create myminio sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
+      mc admin policy create myminio sfsp-profile-worker-policy /tmp/sfsp-profile-worker-policy.json;
+      mc admin policy create myminio sfsp-video-worker-policy /tmp/sfsp-video-worker-policy.json;
+      mc admin policy create myminio sfsp-worker-raw-policy /tmp/sfsp-worker-raw-policy.json;
+      mc admin policy create myminio sfsp-worker-clean-policy /tmp/sfsp-worker-clean-policy.json;
 
       echo 'Creating users and attaching policies...';
-      mc admin user add sfsp-raw \"$SFSP_UPLOAD_ACCESS_KEY\" \"$SFSP_UPLOAD_SECRET_KEY\" || true;
-      mc admin policy attach sfsp-raw sfsp-upload-policy --user=\"$SFSP_UPLOAD_ACCESS_KEY\" || true;
+      mc admin user add myminio \"$SFSP_UPLOAD_ACCESS_KEY\" \"$SFSP_UPLOAD_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-upload-policy --user=\"$SFSP_UPLOAD_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean \"$SFSP_API_ACCESS_KEY\" \"$SFSP_API_SECRET_KEY\" || true;
-      mc admin policy attach sfsp-clean sfsp-api-policy --user=\"$SFSP_API_ACCESS_KEY\" || true;
+      mc admin user add myminio \"$SFSP_API_ACCESS_KEY\" \"$SFSP_API_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-api-policy --user=\"$SFSP_API_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean \"$SFSP_GAME_WORKER_ACCESS_KEY\" \"$SFSP_GAME_WORKER_SECRET_KEY\" || true;
-      mc admin policy attach sfsp-clean sfsp-game-worker-policy --user=\"$SFSP_GAME_WORKER_ACCESS_KEY\" || true;
+      mc admin user add myminio \"$SFSP_GAME_WORKER_ACCESS_KEY\" \"$SFSP_GAME_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-game-worker-policy --user=\"$SFSP_GAME_WORKER_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean "$SFSP_STATIC_SITE_WORKER_ACCESS_KEY" "$SFSP_STATIC_SITE_WORKER_SECRET_KEY" || true;
-      mc admin policy attach sfsp-clean sfsp-static-site-worker-policy --user="$SFSP_STATIC_SITE_WORKER_ACCESS_KEY" || true;
+      mc admin user add myminio \"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" \"$SFSP_STATIC_SITE_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-static-site-worker-policy --user=\"$SFSP_STATIC_SITE_WORKER_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean "$SFSP_PROFILE_WORKER_ACCESS_KEY" "$SFSP_PROFILE_WORKER_SECRET_KEY" || true;
-      mc admin policy attach sfsp-clean sfsp-profile-worker-policy --user="$SFSP_PROFILE_WORKER_ACCESS_KEY" || true;
+      mc admin user add myminio \"$SFSP_PROFILE_WORKER_ACCESS_KEY\" \"$SFSP_PROFILE_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-profile-worker-policy --user=\"$SFSP_PROFILE_WORKER_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean "$SFSP_VIDEO_WORKER_ACCESS_KEY" "$SFSP_VIDEO_WORKER_SECRET_KEY" || true;
-      mc admin policy attach sfsp-clean sfsp-video-worker-policy --user="$SFSP_VIDEO_WORKER_ACCESS_KEY" || true;
+      mc admin user add myminio \"$SFSP_VIDEO_WORKER_ACCESS_KEY\" \"$SFSP_VIDEO_WORKER_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-video-worker-policy --user=\"$SFSP_VIDEO_WORKER_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-raw "$SFSP_WORKER_RAW_ACCESS_KEY" "$SFSP_WORKER_RAW_SECRET_KEY" || true;
-      mc admin policy attach sfsp-raw sfsp-worker-raw-policy --user=\"$SFSP_WORKER_RAW_ACCESS_KEY\" || true;
+      mc admin user add myminio \"$SFSP_WORKER_RAW_ACCESS_KEY\" \"$SFSP_WORKER_RAW_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-worker-raw-policy --user=\"$SFSP_WORKER_RAW_ACCESS_KEY\" || true;
 
-      mc admin user add sfsp-clean \"$SFSP_WORKER_CLEAN_ACCESS_KEY\" \"$SFSP_WORKER_CLEAN_SECRET_KEY\" || true;
-      mc admin policy attach sfsp-clean sfsp-worker-clean-policy --user=\"$SFSP_WORKER_CLEAN_ACCESS_KEY\" || true;
+      mc admin user add myminio \"$SFSP_WORKER_CLEAN_ACCESS_KEY\" \"$SFSP_WORKER_CLEAN_SECRET_KEY\" || true;
+      mc admin policy attach myminio sfsp-worker-clean-policy --user=\"$SFSP_WORKER_CLEAN_ACCESS_KEY\" || true;
 
       echo 'All MinIO buckets and SFSP policies/users initialized successfully!';
       "
@@ -350,13 +254,9 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      profile-storage:
-        condition: service_started
-      game-storage:
-        condition: service_started
-      static-site-storage:
-        condition: service_started
       profile-service:
+        condition: service_started
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -369,13 +269,13 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
       APP_URL: ${APP_URL}
       ADMIN_REGISTRATION_CODE: ${ADMIN_REGISTRATION_CODE}
-      MINIO_ENDPOINT: profile-storage:9000
+      MINIO_ENDPOINT: minio:9000
       PROFILE_MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
       PROFILE_MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
-      GAME_MINIO_ENDPOINT: game-storage:9000
+      GAME_MINIO_ENDPOINT: minio:9000
       GAME_MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
       GAME_MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
-      STATIC_SITE_MINIO_ENDPOINT: static-site-storage:9000
+      STATIC_SITE_MINIO_ENDPOINT: minio:9000
       STATIC_SITE_MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
       STATIC_SITE_MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
       MINIO_USE_SSL: ${MINIO_USE_SSL}
@@ -398,7 +298,7 @@ services:
     depends_on:
       profile-db:
         condition: service_started
-      profile-storage:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -406,26 +306,22 @@ services:
         condition: service_started
       sfsp-api:
         condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
-        condition: service_started
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@profile-db:5432/profile_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
-      MINIO_ENDPOINT: profile-storage:9000
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY_ID: ${PROFILE_MINIO_ACCESS_KEY_ID}
       MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: user-profiles
       MINIO_USE_SSL: ${MINIO_USE_SSL}
       SFSP_API_URL: http://sfsp-api:8080
-      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -451,11 +347,7 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
-        condition: service_started
-      video-storage:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -466,16 +358,16 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       UPLOAD_DIR: /storage/videos
       THUMBNAIL_DIR: /storage/thumbnails
-      VIDEO_MINIO_ENDPOINT: video-storage:9000
+      VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
-      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -502,11 +394,9 @@ services:
     depends_on:
       app-db:
         condition: service_started
-      video-storage:
+      redis:
         condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -514,7 +404,7 @@ services:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       UPLOAD_DIR: /storage/videos
       THUMBNAIL_DIR: /storage/thumbnails
-      VIDEO_MINIO_ENDPOINT: video-storage:9000
+      VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID:-minioadmin}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY:-minioadminpassword}
       REDIS_ADDR: redis:6379
@@ -522,13 +412,13 @@ services:
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379
       SFSP_API_URL: http://sfsp-api:8080
-      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
       SFSP_CLEAN_MINIO_USE_SSL: "false"
@@ -554,11 +444,7 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      game-storage:
-        condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -567,18 +453,18 @@ services:
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
-      MINIO_ENDPOINT: game-storage:9000
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
       MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: games
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -605,17 +491,13 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      game-storage:
-        condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
-      MINIO_ENDPOINT: game-storage:9000
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY_ID: ${GAME_MINIO_ACCESS_KEY_ID}
       MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: games
@@ -624,13 +506,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379
-      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -653,11 +535,7 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      static-site-storage:
-        condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
@@ -666,18 +544,18 @@ services:
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
-      MINIO_ENDPOINT: static-site-storage:9000
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
       MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: static-sites
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      SFSP_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -704,17 +582,13 @@ services:
         condition: service_started
       redis:
         condition: service_started
-      static-site-storage:
-        condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
-      MINIO_ENDPOINT: static-site-storage:9000
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
       MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: static-sites
@@ -723,13 +597,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379
-      SFSP_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: sfsp-raw-minio:9000
+      SFSP_RAW_MINIO_ENDPOINT: minio:9000
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: sfsp-clean-minio:9000
+      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
@@ -774,9 +648,7 @@ services:
     depends_on:
       sfsp-db:
         condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       redis:
         condition: service_started
@@ -786,15 +658,15 @@ services:
       SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
 
       # RAW MinIO 設定 (ROOT 権限キーに変更)
-      SFSP_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_MINIO_ENDPOINT: "minio:9000"
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      SFSP_RAW_MINIO_ENDPOINT: "minio:9000"
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_RAW_MINIO_ROOT_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_RAW_MINIO_ROOT_SECRET_KEY}
 
       # Clean MinIO 設定
-      SFSP_CLEAN_MINIO_ENDPOINT: "sfsp-clean-minio:9000"
+      SFSP_CLEAN_MINIO_ENDPOINT: "minio:9000"
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_API_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_API_SECRET_KEY}
 
@@ -827,9 +699,7 @@ services:
         condition: service_started
       app-db:
         condition: service_started
-      sfsp-raw-minio:
-        condition: service_started
-      sfsp-clean-minio:
+      minio:
         condition: service_started
       redis:
         condition: service_started
@@ -843,14 +713,14 @@ services:
       SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
       APP_DATABASE_URL: "postgres://${SFSP_WORKER_DB_USER:-sfsp_worker}:${SFSP_WORKER_DB_PASSWORD:-sfsp_worker_password}@app-db:5432/app_db?sslmode=disable"
 
-      # デフォルトエンドポイントを sfsp-raw-minio:9000 に指定
-      SFSP_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
+      # デフォルトエンドポイントを minio:9000 に指定
+      SFSP_MINIO_ENDPOINT: "minio:9000"
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_RAW_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
 
       # Explicit source (raw) and destination (clean) endpoints
-      SFSP_RAW_MINIO_ENDPOINT: "sfsp-raw-minio:9000"
-      SFSP_CLEAN_MINIO_ENDPOINT: "sfsp-clean-minio:9000"
+      SFSP_RAW_MINIO_ENDPOINT: "minio:9000"
+      SFSP_CLEAN_MINIO_ENDPOINT: "minio:9000"
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_RAW_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}

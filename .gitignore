@@ -18,19 +18,17 @@ node_modules/
 /app_db_data/
 /profile_db_data/
 /sfsp_db_data/
-backend/video-service/video_storage_data/
-backend/game-service/game_storage_data/
-backend/static-site-service/static_site_storage_data/
-backend/auth/auth-storage/profile_storage_data/
 backend/auth/auth_storage_db/
 backend/profile-service/profile_storage_db/
 backend/video-service/video_storage_db/
 backend/static-site-service/static_site_storage_db/
-/backend/security/sfsp-storage/
 /sfsp_minio_data/
 /sfsp_raw_minio_data/
 /sfsp_clean_minio_data/
 /test_field/
+
+# Unified MinIO object storage (single host directory, bucket-separated internally)
+/backend/storage_data/
 
 # Deprecated local storage folders (if any)
 /backend/datebase/app_storage_db/
