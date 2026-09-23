@@ -15,6 +15,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ type Game struct {
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 	UploaderID         string      `json:"uploader_id"`
 	UploaderName       string      `json:"uploader_name"`
+	TeamID             string      `json:"team_id"`
 	Scale              float32     `json:"scale"`
 	OffsetX            int         `json:"offset_x"`
 	OffsetY            int         `json:"offset_y"`
@@ -147,6 +149,47 @@ func uploadToSFSP(ctx context.Context, tmpFile *os.File, header *multipart.FileH
 	return nil
 }
 
+// ensureGameSchema は既存DBへの後方互換性のため、gamesテーブルを作成し、
+// team_idカラムが存在しなければ追加する。
+// team_idがNULLのゲームが全体公開、チームトークンを保持するゲームがそのチーム限定公開になる。
+func ensureGameSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	createGamesTableSQL := `
+		CREATE TABLE IF NOT EXISTS public.games (
+			id VARCHAR(10) PRIMARY KEY,
+			user_id UUID NOT NULL,
+			title VARCHAR(255) NOT NULL,
+			description TEXT,
+			status VARCHAR(50) NOT NULL DEFAULT 'processing',
+			sfsp_job_id UUID,
+			thumbnail_sfsp_job_id UUID,
+			processing_details TEXT,
+			-- team_idがNULLのゲームが全体公開、チームトークンを保持するゲームがそのチーム限定公開になる
+			team_id VARCHAR(24),
+			game_url VARCHAR(255),
+			thumbnail_url VARCHAR(255),
+			scale REAL DEFAULT 1.0 NOT NULL,
+			offset_x INTEGER DEFAULT 0 NOT NULL,
+			offset_y INTEGER DEFAULT 0 NOT NULL,
+			native_width INTEGER DEFAULT 1280 NOT NULL,
+			native_height INTEGER DEFAULT 720 NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+		)`
+
+	_, err := pool.Exec(ctx, createGamesTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create games table: %w", err)
+	}
+
+	// 既存DBへの後方互換性のため、team_idカラムが存在しなければ追加する。
+	_, err = pool.Exec(ctx, `ALTER TABLE public.games ADD COLUMN IF NOT EXISTS team_id VARCHAR(24)`)
+	if err != nil {
+		return fmt.Errorf("failed to add team_id column to games table: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
@@ -179,6 +222,12 @@ func main() {
 		logger.Fatalf("Unable to connect to database: %v\n", err)
 	}
 	defer db.Close()
+
+	// 既存DBへの後方互換性のため、team_idカラムが存在しなければ追加する。
+	// team_idがNULLのゲームが全体公開、チームトークンを保持するゲームがそのチーム限定公開になる。
+	if err := ensureGameSchema(ctx, db); err != nil {
+		logger.Fatalf("Failed to ensure game schema: %v", err)
+	}
 
 	minioClient, err = minio.New(minioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
@@ -226,6 +275,7 @@ func uploadGameHandler(c *gin.Context) {
 
 	title := c.PostForm("title")
 	description := c.PostForm("description")
+	teamID := c.PostForm("team_id")
 	if title == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Title is required"})
 		return
@@ -439,11 +489,15 @@ if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "game
 		gameStatus = "processing"
 	}
 
+teamIDVal := interface{}(teamID)
+	if teamID == "" {
+		teamIDVal = nil
+	}
 	_, err = db.Exec(
 		context.Background(),
 		`INSERT INTO games
-       (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, thumbnail_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, thumbnail_url, team_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		gameID,
 		userUUID,
 		title,
@@ -452,6 +506,7 @@ if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "game
 		sfspJobID,
 		thumbnailSFSPJobID,
 		thumbnailURL,
+		teamIDVal,
 	)
 	if err != nil {
 		logger.Errorf("Error creating initial game record: %v", err)
@@ -544,22 +599,34 @@ func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, 
 
 func listGamesHandler(c *gin.Context) {
 	searchTerm := c.Query("q")
+	teamToken := c.Query("team")
+
+	// team パラメータ: ある場合はそのチーム限定(team_id = $)、なければ公開(team_id IS NULL)のみ。
+	// status='public' のみを表示。プレースホルダーは args の順序に合わせて番号を振る。
+	whereConds := []string{"status = 'public'"}
+	var args []interface{}
+	argIdx := 1
+	if teamToken != "" {
+		whereConds = append(whereConds, "team_id = $"+strconv.Itoa(argIdx))
+		args = append(args, teamToken)
+		argIdx++
+	} else {
+		whereConds = append(whereConds, "team_id IS NULL")
+	}
+	if searchTerm != "" {
+		whereConds = append(whereConds, "title ILIKE $"+strconv.Itoa(argIdx))
+		args = append(args, "%"+searchTerm+"%")
+		argIdx++
+	}
+	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
+
 	var rows pgx.Rows
 	var err error
-
-	if searchTerm != "" {
-		rows, err = db.Query(context.Background(),
-			`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), user_id, scale, offset_x, offset_y, native_width, native_height, created_at
-           FROM games
-           WHERE status = 'public' AND title ILIKE $1
-           ORDER BY created_at DESC LIMIT 50`, "%"+searchTerm+"%")
-	} else {
-		rows, err = db.Query(context.Background(),
-			`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), user_id, scale, offset_x, offset_y, native_width, native_height, created_at
-           FROM games
-           WHERE status = 'public'
-           ORDER BY created_at DESC LIMIT 50`)
-	}
+	rows, err = db.Query(context.Background(),
+		`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), user_id, scale, offset_x, offset_y, native_width, native_height, created_at
+         FROM games
+         `+whereClause+`
+         ORDER BY created_at DESC LIMIT 50`, args...)
 
 	if err != nil {
 		logger.Errorf("ERROR: Database query failed in listGamesHandler: %v", err)

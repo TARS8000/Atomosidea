@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +46,7 @@ type Video struct {
 	ThumbnailPath     string    `json:"thumbnail_path"`
 	UploaderID        string    `json:"uploader_id"`
 	UploaderName      string    `json:"uploader_name"`
+	TeamID            string    `json:"team_id"`
 	Status            string      `json:"status"`
 	ProcessingDetails string      `json:"processing_details"`
 	ThumbnailSfspJobID *uuid.UUID  `json:"thumbnail_sfsp_job_id,omitempty"`
@@ -163,22 +165,35 @@ func main() {
 // 動画一覧・検索
 func listVideosHandler(c *gin.Context) {
 	searchTerm := c.Query("q")
+	teamToken := c.Query("team")
+
+	// team パラメータ: ある場合はそのチーム限定(team_id = $)、なければ公開(team_id IS NULL)のみ。
+	// q パラメータでタイトル検索。プレースホルダーは args の順序に合わせて番号を振る。
+	whereConds := []string{"1=1"}
+	var args []interface{}
+	argIdx := 1
+	if teamToken != "" {
+		whereConds = append(whereConds, "team_id = $"+strconv.Itoa(argIdx))
+		args = append(args, teamToken)
+		argIdx++
+	} else {
+		whereConds = append(whereConds, "team_id IS NULL")
+	}
+	if searchTerm != "" {
+		whereConds = append(whereConds, "title ILIKE $"+strconv.Itoa(argIdx))
+		args = append(args, "%"+searchTerm+"%")
+		argIdx++
+	}
+	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
+
 	var rows pgx.Rows
 	var err error
-
-	if searchTerm != "" {
-		// 💡 COALESCE(description, '') で NULL 対策を追加
-		rows, err = db.Query(context.Background(),
-			`SELECT id, title, COALESCE(description, '') as description, filename, COALESCE(thumbnail_path, ''), uploader_id, 'Unknown User' as username, status, COALESCE(processing_details, '') as processing_details, created_at
-            FROM videos
-            WHERE title ILIKE $1
-            ORDER BY created_at DESC LIMIT 50`, "%"+searchTerm+"%")
-	} else {
-		rows, err = db.Query(context.Background(),
-			`SELECT id, title, COALESCE(description, '') as description, filename, COALESCE(thumbnail_path, ''), uploader_id, 'Unknown User' as username, status, COALESCE(processing_details, '') as processing_details, created_at
-            FROM videos
-            ORDER BY created_at DESC LIMIT 50`)
-	}
+	// 💡 COALESCE(description, '') で NULL 対策を追加
+	rows, err = db.Query(context.Background(),
+		`SELECT id, title, COALESCE(description, '') as description, filename, COALESCE(thumbnail_path, ''), uploader_id, 'Unknown User' as username, status, COALESCE(processing_details, '') as processing_details, created_at
+         FROM videos
+         `+whereClause+`
+         ORDER BY created_at DESC LIMIT 50`, args...)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database query failed"})

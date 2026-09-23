@@ -4,57 +4,63 @@
 
 -- 動画テーブル
 CREATE TABLE IF NOT EXISTS public.videos (
-                                             id VARCHAR(10) PRIMARY KEY,
-    uploader_id UUID NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description TEXT,
-    filename VARCHAR(255) NOT NULL,
-    thumbnail_path VARCHAR(255),
-    status VARCHAR(50) NOT NULL DEFAULT 'processing',
-    sfsp_job_id UUID,
-    thumbnail_sfsp_job_id UUID,
-    processing_details TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
-                             );
+                                              id VARCHAR(10) PRIMARY KEY,
+     uploader_id UUID NOT NULL,
+     title VARCHAR(255) NOT NULL,
+     description TEXT,
+     filename VARCHAR(255) NOT NULL,
+     thumbnail_path VARCHAR(255),
+     status VARCHAR(50) NOT NULL DEFAULT 'processing',
+     sfsp_job_id UUID,
+     thumbnail_sfsp_job_id UUID,
+     processing_details TEXT,
+     -- team_idがNULLの動画が全体公開、チームトークンを保持する動画がそのチーム限定公開になる
+     team_id VARCHAR(24),
+     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+                              );
 
 -- ゲームテーブル
 CREATE TABLE IF NOT EXISTS public.games (
-                                            id VARCHAR(10) PRIMARY KEY,
-    user_id UUID NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description TEXT,
-    status VARCHAR(50) NOT NULL DEFAULT 'processing',
-    sfsp_job_id UUID,
-    thumbnail_sfsp_job_id UUID,
-    processing_details TEXT,
-    game_url VARCHAR(255),
-    thumbnail_url VARCHAR(255),
-    scale REAL DEFAULT 1.0 NOT NULL,
-    offset_x INTEGER DEFAULT 0 NOT NULL,
-    offset_y INTEGER DEFAULT 0 NOT NULL,
-    native_width INTEGER DEFAULT 1280 NOT NULL,
-    native_height INTEGER DEFAULT 720 NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
-                             );
+                                             id VARCHAR(10) PRIMARY KEY,
+     user_id UUID NOT NULL,
+     title VARCHAR(255) NOT NULL,
+     description TEXT,
+     status VARCHAR(50) NOT NULL DEFAULT 'processing',
+     sfsp_job_id UUID,
+     thumbnail_sfsp_job_id UUID,
+     processing_details TEXT,
+     -- team_idがNULLのゲームが全体公開、チームトークンを保持するゲームがそのチーム限定公開になる
+     team_id VARCHAR(24),
+     game_url VARCHAR(255),
+     thumbnail_url VARCHAR(255),
+     scale REAL DEFAULT 1.0 NOT NULL,
+     offset_x INTEGER DEFAULT 0 NOT NULL,
+     offset_y INTEGER DEFAULT 0 NOT NULL,
+     native_width INTEGER DEFAULT 1280 NOT NULL,
+     native_height INTEGER DEFAULT 720 NOT NULL,
+     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+                              );
 
 -- 静的サイトテーブル
 CREATE TABLE IF NOT EXISTS public.static_sites (
-                                                    id VARCHAR(10) PRIMARY KEY,
-    user_id UUID NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description TEXT,
-    status VARCHAR(50) NOT NULL DEFAULT 'processing',
-    sfsp_job_id UUID,
-    thumbnail_sfsp_job_id UUID,
-    processing_details TEXT,
-    minio_path VARCHAR(255) NOT NULL,
-    entry_point_path VARCHAR(255) DEFAULT 'index.html' NOT NULL,
-    thumbnail_url VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
-                             );
+                                                     id VARCHAR(10) PRIMARY KEY,
+     user_id UUID NOT NULL,
+     title VARCHAR(255) NOT NULL,
+     description TEXT,
+     status VARCHAR(50) NOT NULL DEFAULT 'processing',
+     sfsp_job_id UUID,
+     thumbnail_sfsp_job_id UUID,
+     processing_details TEXT,
+     -- team_idがNULLの.static-siteが全体公開、チームトークンを保持する.static-siteがそのチーム限定公開になる
+     team_id VARCHAR(24),
+     minio_path VARCHAR(255) NOT NULL,
+     entry_point_path VARCHAR(255) DEFAULT 'index.html' NOT NULL,
+     thumbnail_url VARCHAR(255),
+     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+                              );
 
 -- =========================================================================
 -- 2. インデックス作成

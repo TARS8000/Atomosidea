@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ var (
 type StaticSite struct {
 	ID             string    `json:"id"`
 	UserID         string    `json:"user_id"`
+	TeamID         string    `json:"team_id"`
 	Title          string    `json:"title"`
 	Description    string    `json:"description"`
 	MinioPath      string    `json:"minio_path"`
@@ -320,6 +322,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 
 	title := c.PostForm("title")
 	description := c.PostForm("description")
+	teamID := c.PostForm("team_id")
 
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
@@ -499,9 +502,13 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
+	teamIDVal := interface{}(teamID)
+	if teamID == "" {
+		teamIDVal = nil
+	}
 	_, err = db.ExecContext(reqCtx,
-		"INSERT INTO static_sites (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, minio_path, thumbnail_url, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, $8, NOW(), NOW())",
-		siteID, userUUID, title, description, sfspJobID, thumbnailSFSPJobID, "", thumbnailURL)
+		"INSERT INTO static_sites (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, minio_path, thumbnail_url, team_id, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, $8, $9, NOW(), NOW())",
+		siteID, userUUID, title, description, sfspJobID, thumbnailSFSPJobID, "", thumbnailURL, teamIDVal)
 	if err != nil {
 		logger.Errorf("ERROR: Failed to insert static site into DB: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register static site"})
@@ -538,15 +545,31 @@ func uploadStaticSiteHandler(c *gin.Context) {
 func listStaticSitesHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	searchTerm := c.Query("q")
+	teamToken := c.Query("team")
+
+	// team パラメータ: ある場合はそのチーム限定(team_id = $)、なければ公開(team_id IS NULL)のみ。
+	// status='public' のみを表示。プレースホルダーは args の順序に合わせて番号を振る。
+	whereConds := []string{"status = 'public'"}
+	var args []interface{}
+	argIdx := 1
+	if teamToken != "" {
+		whereConds = append(whereConds, "team_id = $"+strconv.Itoa(argIdx))
+		args = append(args, teamToken)
+		argIdx++
+	} else {
+		whereConds = append(whereConds, "team_id IS NULL")
+	}
+	if searchTerm != "" {
+		whereConds = append(whereConds, "title ILIKE $"+strconv.Itoa(argIdx))
+		args = append(args, "%"+searchTerm+"%")
+		argIdx++
+	}
+	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
+
 	var rows *sql.Rows
 	var err error
-
-	baseQuery := "SELECT id, user_id, title, description, minio_path, status, entry_point_path, thumbnail_url, created_at, updated_at FROM static_sites WHERE status = 'public'"
-	if searchTerm != "" {
-		rows, err = db.QueryContext(reqCtx, baseQuery+" AND title ILIKE $1 ORDER BY created_at DESC", "%"+searchTerm+"%")
-	} else {
-		rows, err = db.QueryContext(reqCtx, baseQuery+" ORDER BY created_at DESC")
-	}
+	rows, err = db.QueryContext(reqCtx,
+		"SELECT id, user_id, title, description, minio_path, status, entry_point_path, thumbnail_url, created_at, updated_at FROM static_sites "+whereClause+" ORDER BY created_at DESC", args...)
 
 	if err != nil {
 		logger.Errorf("ERROR: Database query failed in listStaticSitesHandler: %v", err)

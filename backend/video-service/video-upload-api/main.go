@@ -67,6 +67,7 @@ type Video struct {
 	Filename          string `json:"filename"`
 	ThumbnailPath     string `json:"thumbnail_path"`
 	UploaderID        string `json:"uploader_id"`
+	TeamID            string `json:"team_id"`
 	Status            string `json:"status"`
 	ProcessingDetails string `json:"processing_details"`
 }
@@ -147,6 +148,13 @@ func initTables(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, createVideosTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create videos table: %w", err)
+	}
+
+	// 既存DBへの後方互換性のため、team_idカラムが存在しなければ追加する。
+	// team_idがNULLの動画が全体公開、チームトークンを保持する動画がそのチーム限定公開になる。
+	_, err = pool.Exec(ctx, `ALTER TABLE videos ADD COLUMN IF NOT EXISTS team_id VARCHAR(24)`)
+	if err != nil {
+		return fmt.Errorf("failed to add team_id column to videos table: %w", err)
 	}
 
 	logger.Info("Database tables initialized successfully.")
@@ -318,6 +326,7 @@ func uploadHandler(c *gin.Context) {
 
 	title := c.PostForm("title")
 	description := c.PostForm("description")
+	teamID := c.PostForm("team_id")
 
 	tmpFile, err := os.CreateTemp("", "sfsp-upload-*.tmp")
 	if err != nil {
@@ -435,9 +444,13 @@ func uploadHandler(c *gin.Context) {
 		processingDetails = "セキュリティスキャン完了 (既存クリーンファイル)。動画変換待機中..."
 	}
 
+	teamIDVal := interface{}(teamID)
+	if teamID == "" {
+		teamIDVal = nil
+	}
 	_, err = db.Exec(context.Background(),
-		"INSERT INTO videos (id, title, description, filename, uploader_id, status, sfsp_job_id, processing_details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-		videoID, title, description, header.Filename, uploaderUUID, videoStatus, sfspJobID, processingDetails)
+		"INSERT INTO videos (id, title, description, filename, uploader_id, team_id, status, sfsp_job_id, processing_details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+		videoID, title, description, header.Filename, uploaderUUID, teamIDVal, videoStatus, sfspJobID, processingDetails)
 	if err != nil {
 		logger.Errorf("Error creating initial video record: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create video record"})

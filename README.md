@@ -279,6 +279,7 @@ graph TD
         AuthDB[(Auth DB - PostgreSQL)]
         AppDB[(App DB - PostgreSQL)]
         ProfileDB[(Profile DB - PostgreSQL)]
+        TeamDB[(Team DB - PostgreSQL)]
         SFSP_DB[(SFSP DB - PostgreSQL)]
         Redis[(Redis - Cache & Queue)]
     end
@@ -417,6 +418,7 @@ graph TD
 | `static-site-upload-api` | `atmosidea-static-site-upload-api` | `backend/static-site-service/static-site-upload-api/Dockerfile` | `backend/static-site-service/static-site-upload-api/` |
 | `static-site-worker` | `atmosidea-static-site-worker` | `backend/static-site-service/static-site-worker/Dockerfile` | `backend/static-site-service/static-site-worker/` |
 | `mypage-service` | `atmosidea-mypage-service` | `backend/auth/mypage-worker/Dockerfile` | `backend/auth/mypage-worker/` |
+| `team-service` | `atmosidea-team-service` | `backend/team-service/team-worker/Dockerfile` | `backend/team-service/team-worker/` |
 | `sfsp-api` | `sfsp-api` | `backend/security/sfsp/docker/api/Dockerfile` | `backend/security/sfsp/` |
 | `sfsp-worker` | `sfsp-worker` | `backend/security/sfsp/docker/worker/Dockerfile` | `backend/security/sfsp/` |
 | `sfsp-clamav-client` | `sfsp-clamav-client-builder` | `backend/security/sfsp/docker/clamav-client/Dockerfile` | `backend/security/sfsp/` |
@@ -837,6 +839,37 @@ sequenceDiagram
 | `GET` | `/videos` | JWT | **自分の動画リスト取得**。認証ユーザーがアップロードした動画のリストを返します。 |
 | `GET` | `/games` | JWT | **自分のゲームリスト取得**。認証ユーザーがアップロードしたゲームのリストを返します。 |
 | `GET` | `/static-sites` | JWT | **自分のstatic-siteリスト取得**。認証ユーザーがアップロードしたstaticサイトのリストを返します。 |
+
+---
+
+#### **Team Service** (`team-service`)
+
+- **ベースパス:** `/api/teams`
+- **責務:** チームの作成・管理と、トークンベースのクローズドコンテンツ共有（Discord招待リンク風）。 viewing はトークン(URL)のみで認証不要。
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `GET` | `` (公開) | 不要 | **公開チーム一覧取得**。`is_public=true` のチームのみを返します。 |
+| `GET` | `/mine` | JWT | **自分が参加しているチーム一覧**を取得します。 |
+| `POST` | `` (公開) | JWT | **チーム作成**。24文字のトークンを自動生成して返します。`is_public` を指定可能。 |
+| `GET` | `/:token` | 不要 | **トークンでチーム詳細取得**。URLを持つ誰でも閲覧可能。 |
+| `GET` | `/:token/members` | JWT (member以上) | **メンバー一覧**を取得します。 |
+| `POST` | `/:token/members` | JWT (admin以上) | **メンバー追加**。`user_id` と `role` を指定。 |
+| `DELETE` | `/:token/members/:userId` | JWT (admin以上) | **メンバー削除**。 |
+| `PATCH` | `/:token` | JWT (owner) | **チーム情報更新**。`name`・`description`・`is_public`。 |
+| `DELETE` | `/:token` | JWT (owner) | **チーム削除**（メンバー・関連情報も削除）。 |
+
+##### チームコンテンツ（投稿）
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `POST` | `/:token/content` | JWT (member以上) | **投稿作成**。`title`・`body`を指定。作成者は自動的にメンバー追加は不要で投稿可能。 |
+| `GET` | `/:token/content` | チームが公開なら不要／非公開ならmember以上 | **そのチームの投稿一覧**を取得します。 |
+| `GET` | `/:token/content/:contentID` | 一覧と同じ | **単一投稿取得**。 |
+
+投稿は `team_posts` テーブルに格納され、`author_name` は必要に応じて `app-db` の `users` から付与されます。非公開チームのコンテンツは、メンバーがログインした場合のみ閲覧可能です。
+
+> **補足:** `:token` は24文字のbase36トークン（約143ビットの熵）で、未予測性によりアクセスを制限します。チームコンテンツ（動画・ゲーム・static-site）の連携は Phase 2 で追加予定。
 
 ---
 

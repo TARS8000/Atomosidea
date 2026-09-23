@@ -6,6 +6,7 @@ import UploadIcon from '@mui/icons-material/Upload';
 import VideocamIcon from '@mui/icons-material/Videocam';
 import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
 import PublicIcon from '@mui/icons-material/Public'; // Import PublicIcon
+import GroupIcon from '@mui/icons-material/Group';
 import AccountDeletionModal from './AccountDeletionModal';
 import axios from 'axios';
 
@@ -87,6 +88,9 @@ const Header = () => {
               sx={{ mr: 2 }}
             >
               アップロード
+            </Button>
+            <Button component={RouterLink} to="/teams" startIcon={<GroupIcon />} sx={{ mr: 2, color: 'text.primary' }}>
+              チーム
             </Button>
             <Menu
               anchorEl={uploadMenuAnchorEl}

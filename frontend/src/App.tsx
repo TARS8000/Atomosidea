@@ -16,7 +16,9 @@ import MyPage from './pages/MyPage';
 import EditProfilePage from './pages/EditProfilePage';
 import UploadStaticSitePage from './pages/UploadStaticSitePage';
 import StaticSiteDetailPage from './pages/StaticSiteDetailPage';
-import EditStaticSitePage from './pages/EditStaticSitePage'; // Import the new page
+import EditStaticSitePage from './pages/EditStaticSitePage';
+import TeamListPage from './pages/TeamListPage';
+import TeamDetailPage from './pages/TeamDetailPage'; // Import the new page
 import { Container, CssBaseline, ThemeProvider } from '@mui/material';
 import theme from './theme';
 
@@ -45,6 +47,8 @@ function App() {
               <Route path="/login/success" element={<LoginSuccessPage />} />
               <Route path="/mypage" element={<MyPage />} />
               <Route path="/edit-profile" element={<EditProfilePage />} />
+              <Route path="/teams" element={<TeamListPage />} />
+              <Route path="/teams/:token" element={<TeamDetailPage />} />
             </Routes>
           </Container>
         </AuthProvider>

@@ -52,6 +52,23 @@ services:
     networks:
       - backend-db-network
 
+  team-db:
+    image: postgres:16
+    container_name: atmosidea-team-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: team_db
+      TEAM_SERVICE_DB_PASSWORD: ${TEAM_SERVICE_DB_PASSWORD}
+    volumes:
+      - team_db_data:/var/lib/postgresql/data
+      - ./backend/team-service/team-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - backend-db-network
+
   sfsp-db:
     image: postgres:16
     container_name: sfsp-db
@@ -332,7 +349,25 @@ services:
     networks:
       - atmosidea-network
       - backend-db-network
-      - sfsp-isolated-net
+
+  team-service:
+    build:
+      context: .
+      dockerfile: backend/team-service/team-worker/Dockerfile
+    container_name: atmosidea-team-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      team-db:
+        condition: service_started
+    environment:
+      TEAM_DATABASE_URL: "postgres://team_service_user:${TEAM_SERVICE_DB_PASSWORD}@team-db:5432/team_db?sslmode=disable"
+      APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET}
+    networks:
+      - atmosidea-network
+      - backend-db-network
 
   video-upload-api:
     build:
@@ -786,4 +821,5 @@ volumes:
   auth_db_data:
   app_db_data:
   profile_db_data:
+  team_db_data:
   sfsp_db_data:

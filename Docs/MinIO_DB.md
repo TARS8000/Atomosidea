@@ -48,6 +48,7 @@ Atomosideaの永続層は、論理分離と物理分離の両方でリスクを�
 | `auth-db` | `atmosidea-auth-db` | `auth_db` | `auth_db_data` | `backend/auth/auth-datebase/auth-db/init.sql` | backend-db-network |
 | `app-db` | `atmosidea-app-db` | `app_db` | `app_db_data` | `backend/datebase/app-db/init.sql` | backend-db-network |
 | `profile-db` | `atmosidea-profile-db` | `profile_db` | `profile_db_data` | `backend/profile-service/profile-db/init.sql` | backend-db-network |
+| `team-db` | `atmosidea-team-db` | `team_db` | `team_db_data` | `backend/team-service/team-db/init.sql` | backend-db-network |
 | `sfsp-db` | `sfsp-db` | `sfsp_db` | `sfsp_db_data` | `backend/security/sfsp-db/`（ディレクトリ全体） | backend-db-network, sfsp-isolated-net |
 
 `sfsp-db`のみ`sfsp-isolated-net`にも参加し、SFSPサービス（`sfsp-api`・`sfsp-worker`）から直接アクセスできます。
@@ -94,6 +95,19 @@ Atomosideaの永続層は、論理分離と物理分離の両方でリスクを�
 - **テーブル: `users`**
   - `id` UUID（PK）, `username`, `bio` TEXT, `icon_url` TEXT, `background_image_url` TEXT, `icon_sfsp_job_id` UUID, `background_sfsp_job_id` UUID, `status`（デフォルト`offline`）, `created_at`, `updated_at`
 - **テストデータ** — 初回起動時に`user_atomos`（UUIDv7形式）が`ON CONFLICT (id) DO NOTHING`で挿入。実環境では不要なら削除可能。
+
+#### team-db（`team_db`）— チーム・コンテンツ共有
+
+初期化ファイル: `backend/team-service/team-db/init.sql`
+
+Discordの招待リンク風、トークン（URL）ベースのクローズドコンテンツ共有を管理します。`gen_random_uuid()`（`pgcrypto`）を使用。
+
+- **テーブル**
+  - `teams` — チーム。`id` UUID（PK）、`token` VARCHAR(24)（UNIQUE、base36・crypto/randで生成・約143ビットの熵）、`name` VARCHAR(255)（NOT NULL）、`description` TEXT、`is_public` BOOLEAN（デフォルト`false`）、`created_by` UUID、`created_at` タイスタンプ
+  - `team_members` — チーム所属。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`user_id` UUID、`role`（`owner`/`admin`/`member`、デフォルト`member`）、`joined_at` タイスタンプ。`UNIQUE(team_id, user_id)`
+  - `team_content` — 既存コンテンツ（動画・ゲーム・static-site）をチームに紐付けるためのリンク表（Phase 2用）。`id` UUID（PK）、`team_id`（`teams.id`へのFK）、`content_type`、`content_id`、`created_at`
+  - `team_posts` — チーム原生の投稿（Phase 1）。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`author_id` UUID、`title` VARCHAR(255)、`body` TEXT、`created_at` タイスタンプ
+- **ロール: `team_service_user`** — `teams`・`team_members`・`team_content`・`team_posts`へのSELECT/INSERT/UPDATE/DELETE。パスワードは`.env`の`TEAM_SERVICE_DB_PASSWORD`と一致。`team_posts`の`author_id`から著者名を取得する場合は`app-db`の`users`も読み取り。
 
 #### sfsp-db（`sfsp_db`）— スキャン平台
 

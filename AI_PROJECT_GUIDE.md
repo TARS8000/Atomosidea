@@ -117,6 +117,7 @@
 | `auth-service` | ログイン/登録/JWT/アカウント削除 | `/api/auth/*` |
 | `profile-service` | プロフィール管理＋アイコンスキャン | `/api/profile/*` |
 | `mypage-service` | マイページ（自分の投稿一覧） | `/api/my/*` |
+| `team-service` | チーム管理＋トークンベースのクローズドコンテンツ共有 | `/api/teams/*` |
 
 ### 5.2. コンテンツアップロード（受け付け＋裏処理）
 | サービス | 役割 | 入口パス |

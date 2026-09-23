@@ -62,6 +62,7 @@ Nginxは`upstream`で各サービスの内部ホスト名とポートを定義�
 | `auth_service` | `auth-service:8080` | 認証 |
 | `profile_service` | `profile-service:8084` | プロフィール管理 |
 | `mypage_service` | `mypage-service:8083` | マイページ |
+| `team_service` | `team-service:8080` | チーム管理＋トークンベースのコンテンツ共有 |
 | `game_upload_api` | `game-upload-api:8082` | ゲームアップロードAPI |
 | `static_site_upload_api` | `static-site-upload-api:8085` | static-siteアップロードAPI |
 | `video_upload_service` | `video-upload-api:8080` | 動画アップロード |
@@ -113,6 +114,7 @@ Atomosideaは**1つのMinIOインスタンス**（`minio:9000`）を持ち、Ngi
 | `/api/auth` | `auth_service` | 認証 |
 | `/api/profile` | `profile_service` | プロフィール |
 | `/api/my` | `mypage_service` | マイページ |
+| `/api/teams` | `team_service` | チーム管理＋トークンベースのコンテンツ共有（`/api/teams/:token/*` を含む） |
 | `/api/games` | `game_upload_api` | ゲームメタデータ |
 | `/api/static-sites` | `static_site_upload_api` | static-siteメタデータ |
 | `/api/videos/upload` | `video_upload_service` | アップロード（300秒のタイムアウト） |
