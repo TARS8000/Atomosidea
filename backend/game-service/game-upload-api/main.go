@@ -40,7 +40,46 @@ var (
 	bucketName  string
 	sfspApiUrl  string
 	logger      *zap.SugaredLogger
+	teamServiceURL string
 )
+
+// teamAccessCheck calls the team-service permission endpoint to verify that the
+// caller is allowed to post to the given team. Returns true if posting is allowed.
+// A missing/empty team_id is treated as a public post (always allowed).
+func teamAccessCheck(c *gin.Context, teamToken string) bool {
+	if teamToken == "" {
+		return true
+	}
+	if teamServiceURL == "" {
+		teamServiceURL = "http://team-service:8080"
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", teamServiceURL+"/api/teams/"+teamToken+"/permission", nil)
+	if err != nil {
+		logger.Errorf("teamAccessCheck: failed to create request: %v", err)
+		return false
+	}
+	if authHeader := c.GetHeader("Authorization"); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Errorf("teamAccessCheck: request failed for team %s: %v", teamToken, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Errorf("teamAccessCheck: team service returned %d for team %s", resp.StatusCode, teamToken)
+		return false
+	}
+	var body struct {
+		CanPost bool `json:"can_post"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		logger.Errorf("teamAccessCheck: failed to decode response: %v", err)
+		return false
+	}
+	return body.CanPost
+}
 
 type Game struct {
 	ID                 string     `json:"id"`
@@ -278,6 +317,11 @@ func uploadGameHandler(c *gin.Context) {
 	teamID := c.PostForm("team_id")
 	if title == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Title is required"})
+		return
+	}
+
+	if !teamAccessCheck(c, teamID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You are not allowed to post to this team"})
 		return
 	}
 

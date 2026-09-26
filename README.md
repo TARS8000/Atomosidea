@@ -1,4 +1,4 @@
-# Atomosidea 完全ガイド & 技術仕様書
+﻿# Atomosidea 完全ガイド & 技術仕様書
 
 Atomosidea（アトモシデア）は、動画共有・ゲーム配信・静的サイトホスティング・プロフィール機能を統合した多機能なデジタルコンテンツプラットフォームです。マイクロサービスアーキテクチャを採用しており、各機能が独立したサービスとして開発・運用されます。これにより高いスケーラビリティ、可用性、メンテナンス性を実現しています。
 
@@ -191,8 +191,30 @@ Atomosidea は、動画共有・ゲーム配信・静的サイトホスティン
   - `/api/my/games`: 自身のゲーム一覧を取得。
   - `/api/my/static-sites`: 自身の静的サイト一覧を取得。
 - **内部処理ロジック:** `app-db`から`uploader_id`または`user_id`が認証ユーザーと一致するコンテンツを検索して返す。
-- **関連ファイル:** `backend/auth/mypage-worker/main.go`
-- **Dockerfile:** `backend/auth/mypage-worker/Dockerfile`
+- **関連ファイル:** `backend/profile-service/mypage-worker/main.go`
+- **Dockerfile:** `backend/profile-service/mypage-worker/Dockerfile`
+
+### チーム管理 (team-service)
+
+- **機能概要:** チーム（グループ）の作成・メンバー管理と、トクエン（URL）ベースのクローズドコンテンツ共有。Discordの招待リンク風に、URLを持つ誰でも閲覧できる公開チームと、メンバー承認が必要な非公開チームをサポート。
+- **トリガー:**
+  - `/api/teams`: 公開チーム一覧の取得、チームの作成
+  - `/api/teams/mine`: 自分が参加しているチーム一覧の取得
+  - `/api/teams/:token`: トクエンによるチーム詳細の取得
+  - `/api/teams/:token/members`: メンバーの一覧・追加・削除
+  - `/api/teams/:token`: チーム情報の更新・削除
+  - `/api/teams/:token/content`: チーム内への投稿の作成・一覧・取得
+  - `/api/teams/:token/join`: チームへの加入リクエスト
+  - `/api/teams/:token/join-requests`: 加入リクエストの一覧・承認
+- **内部処理ロジック:**
+  - チームは`team-db`の`teams`テーブルに格納。トクエンは24文字のbase36（crypto/rand由来、約143ビットの熵）を自動生成する。
+  - メンバーロールは`owner`(3)・`admin`(2)・`member`(1)の3段階で、役割ランクに基づきアクセス制御する。
+  - 公開チームはトクエン(URL)のみで閲覧可能。非公開チームはメンバー認証が必要。
+  - 投稿の著者名(`author_name`)は`app-db`の`users`テーブルから取得する（取得不可時は空文字列）。
+  - チームへの投稿・コンテンツ共有時、各アップロードサービス（動画・ゲーム・static-site）は`team-service`の`/api/teams/:token/permission`_endpointを呼び出し、アクセス権限を検証する。
+  - コンテンツ（動画・ゲーム・static-site）は`app-db`の各テーブルの`team_id`カラムにトクエンを保持することでそのチーム限定公開にする（`NULL`の全体公開）。
+- **関連ファイル:** `backend/team-service/team-worker/main.go`
+- **Dockerfile:** `backend/team-service/team-worker/Dockerfile`
 
 ### セキュリティスキャン受付 (sfsp-api)
 
@@ -262,6 +284,7 @@ graph TD
         GameUploadAPI(Game Upload API)
         StaticSiteUploadAPI(Static Site API)
         MyPageService(MyPage Service)
+        TeamService(Team Service)
     end
 
     subgraph "Backend Workers"
@@ -334,6 +357,13 @@ graph TD
     MyPageService --> AuthDB
     MyPageService --> AppDB
 
+    Frontend -->|REST API| TeamService
+    TeamService --> TeamDB
+    TeamService --> AppDB
+    UploadService -->|HTTP Call| TeamService
+    GameUploadAPI -->|HTTP Call| TeamService
+    StaticSiteUploadAPI -->|HTTP Call| TeamService
+
     SFSP_API --> SFSP_DB
     SFSP_API --> SFSP_MinIO
     SFSP_API -->|Enqueue Job| Redis
@@ -365,6 +395,7 @@ graph TD
     MonitoringService -->|Docker Socket| GameUploadAPI
     MonitoringService -->|Docker Socket| StaticSiteUploadAPI
     MonitoringService -->|Docker Socket| MyPageService
+    MonitoringService -->|Docker Socket| TeamService
     MonitoringService -->|Docker Socket| VideoWorker
     MonitoringService -->|Docker Socket| GameWorker
     MonitoringService -->|Docker Socket| StaticSiteWorker
@@ -409,22 +440,22 @@ graph TD
 | サービス名 | コンテナ名 | ビルド元（Dockerfile） | 実装ディレクトリ |
 |---|---|---|---|
 | `frontend` | `atmosidea-frontend` | `./frontend`（Nginxで配信） | `frontend/` |
-| `auth-service` | `atmosidea-auth-service` | `backend/auth/auth-worker/auth-service/Dockerfile` | `backend/auth/auth-worker/auth-service/` |
-| `profile-service` | `atmosidea-profile-service` | `backend/auth/auth-worker/profile-service/Dockerfile` | `backend/auth/auth-worker/profile-service/` |
+| `auth-service` | `atmosidea-auth-service` | `backend/auth/auth-worker/Dockerfile` | `backend/auth/auth-worker/` |
+| `profile-service` | `atmosidea-profile-service` | `backend/profile-service/profile-worker/Dockerfile` | `backend/profile-service/profile-worker/` |
 | `video-upload-api` | `atmosidea-video-upload-api` | `backend/video-service/video-upload-api/Dockerfile` | `backend/video-service/video-upload-api/` |
 | `video-worker` | `atmosidea-video-worker` | `backend/video-service/video-worker/Dockerfile` | `backend/video-service/video-worker/` |
 | `game-upload-api` | `atmosidea-game-upload-api` | `backend/game-service/game-upload-api/Dockerfile` | `backend/game-service/game-upload-api/` |
 | `game-worker` | `atmosidea-game-worker` | `backend/game-service/game-worker/Dockerfile` | `backend/game-service/game-worker/` |
 | `static-site-upload-api` | `atmosidea-static-site-upload-api` | `backend/static-site-service/static-site-upload-api/Dockerfile` | `backend/static-site-service/static-site-upload-api/` |
 | `static-site-worker` | `atmosidea-static-site-worker` | `backend/static-site-service/static-site-worker/Dockerfile` | `backend/static-site-service/static-site-worker/` |
-| `mypage-service` | `atmosidea-mypage-service` | `backend/auth/mypage-worker/Dockerfile` | `backend/auth/mypage-worker/` |
+| `mypage-service` | `atmosidea-mypage-service` | `backend/profile-service/mypage-worker/Dockerfile` | `backend/profile-service/mypage-worker/` |
 | `team-service` | `atmosidea-team-service` | `backend/team-service/team-worker/Dockerfile` | `backend/team-service/team-worker/` |
 | `sfsp-api` | `sfsp-api` | `backend/security/sfsp/docker/api/Dockerfile` | `backend/security/sfsp/` |
 | `sfsp-worker` | `sfsp-worker` | `backend/security/sfsp/docker/worker/Dockerfile` | `backend/security/sfsp/` |
 | `sfsp-clamav-client` | `sfsp-clamav-client-builder` | `backend/security/sfsp/docker/clamav-client/Dockerfile` | `backend/security/sfsp/` |
 | `sfsp-yara-client` | `sfsp-yara-client-builder` | `backend/security/sfsp/docker/yara-client/Dockerfile` | `backend/security/sfsp/` |
 
-> **補足:** `video-worker` と `video-worker` は同じDockerfileからビルドされますが、別々のコンテナとして動作します。
+> **補足:** `video-upload-api` と `video-worker` はそれぞれ別々のDockerfileからビルドされますが、別々のコンテナとして動作します。
 
 ### データフロー・処理シーケンス（ゲームアップロードの例）
 
@@ -479,28 +510,36 @@ sequenceDiagram
 .
 ├── backend/                     # Goバックエンドサービス群
 │   ├── auth/
-│   │   ├── auth-datebase/       # DB関連（auth-db初期スクリプト）。下位にauth-db/とprofile-db/が共存
+│   │   ├── auth-datebase/       # auth-db初期スクリプト（旧・profile-dbも同梱されているが、本番で使われるのはprofile-service/profile-db）
 │   │   │   └── auth-db/init.sql
-│   │   ├── profile-db/          # profile-dbスクリプト
-│   │   │   └── init.sql
 │   │   ├── auth-storage/        # MinIO永続化
 │   │   │   └── profile_storage_data/
-│   │   ├── auth-worker/         # ワーカー・サービス
-│   │   │   ├── auth-service/    #   認証サービス
-│   │   │   │   ├── Dockerfile
-│   │   │   │   ├── go.mod
-│   │   │   │   ├── go.sum
-│   │   │   │   └── main.go
-│   │   │   └── profile-service/ #   プロフィールサービス
-│   │   │       ├── Dockerfile
-│   │   │       ├── go.mod
-│   │   │       ├── go.sum
-│   │   │       └── main.go
-│   │   └── mypage-worker/       # マイページサービス
+│   │   └── auth-worker/         # 認証サービス (auth-service)
 │   │       ├── Dockerfile
 │   │       ├── go.mod
 │   │       ├── go.sum
 │   │       └── main.go
+│   ├── profile-service/
+│   │   ├── profile-worker/      # プロフィールサービス
+│   │   │   ├── Dockerfile
+│   │   │   ├── go.mod
+│   │   │   ├── go.sum
+│   │   │   └── main.go
+│   │   ├── mypage-worker/       # マイページサービス
+│   │   │   ├── Dockerfile
+│   │   │   ├── go.mod
+│   │   │   ├── go.sum
+│   │   │   └── main.go
+│   │   └── profile-db/          # profile-db初期スクリプト（本番で使用）
+│   │       └── init.sql
+│   ├── team-service/
+│   │   ├── team-worker/         # チーム管理サービス
+│   │   │   ├── Dockerfile
+│   │   │   ├── go.mod
+│   │   │   ├── go.sum
+│   │   │   └── main.go
+│   │   └── team-db/             # team-db初期スクリプト
+│   │       └── init.sql
 │   ├── game-service/
 │   │   ├── game-upload-api/     # ゲームアップロードAPI
 │   │   │   ├── Dockerfile
@@ -696,6 +735,7 @@ sequenceDiagram
   - `uploader_id` (UUID): アップロード者ID
   - `status` (VARCHAR): 'scanning'、'processing'、'public'、'error'、'quarantined'
   - `sfsp_job_id` (UUID): SFSPジョブID
+  - `team_id` (VARCHAR): チームトークン（NULLなら全体公開、値があればそのチーム限定公開）
 - **gamesテーブル**
   - `id` (VARCHAR, PK): ゲームID
   - `user_id` (UUID): アップロード者ID
@@ -705,6 +745,7 @@ sequenceDiagram
   - `thumbnail_url` (VARCHAR): サムネイルURL
   - `native_width`, `native_height` (INT): ゲームのネイティブ解像度
   - `sfsp_job_id` (UUID): SFSPジョブID
+  - `team_id` (VARCHAR): チームトークン（NULLなら全体公開、値があればそのチーム限定公開）
 - **static_sitesテーブル**
   - `id` (VARCHAR, PK): サイトID
   - `user_id` (UUID): アップロード者ID
@@ -712,6 +753,47 @@ sequenceDiagram
   - `status` (VARCHAR): 'scanning'、'processing'、'public'、'error'、'quarantined'
   - `entry_point_path` (VARCHAR): エントリーポイント（index.html）
   - `sfsp_job_id` (UUID): SFSPジョブID
+  - `team_id` (VARCHAR): チームトークン（NULLなら全体公開、値があればそのチーム限定公開）
+
+#### team-db (teams、team_members、team_content、team_postsテーブル)
+
+- **teamsテーブル**
+  - `id` (VARCHAR, PK): チームID（UUID）
+  - `token` (VARCHAR, UNIQUE): 24文字のbase36トークン（約143ビットの熵、crypto/rand由来）
+  - `name` (VARCHAR): チーム名
+  - `description` (TEXT): 説明
+  - `is_public` (BOOLEAN): 公開チームかどうか
+  - `auto_approve` (BOOLEAN): 公開チームの加入を自動承認するか
+  - `allow_member_invite` (BOOLEAN): owner以外でもmemberが招待URLを共有できるか
+  - `created_by` (UUID): 作成者
+  - `created_at` (TIMESTAMP): 作成日時
+- **team_membersテーブル**
+  - `team_id` (VARCHAR, FK): `teams.id`への参照
+  - `user_id` (UUID): メンバーのユーザーID
+  - `role` (VARCHAR): `owner`(3)・`admin`(2)・`member`(1)のいずれか
+  - `joined_at` (TIMESTAMP): 参加日時
+  - `team_id, user_id`にUNIQUE制約
+- **team_join_requestsテーブル**
+  - `id` (VARCHAR, PK): 加入リクエストID
+  - `team_id` (VARCHAR, FK): `teams.id`への参照
+  - `user_id` (UUID): 加入希望者のユーザーID
+  - `status` (VARCHAR): 'pending'、'approved'、'rejected'
+  - `requested_at` (TIMESTAMP): リクエスト日時
+  - `reviewed_at` (TIMESTAMP): 審査日時
+  - `reviewed_by` (UUID): 審査したユーザーID
+- **team_contentテーブル**
+  - `id` (VARCHAR, PK): コンテンツID
+  - `team_id` (VARCHAR, FK): `teams.id`への参照
+  - `content_type` (VARCHAR): 'video'、'game'、'static-site'
+  - `content_id` (VARCHAR): 対象コンテンツのID（videos/games/static_sitesのid）
+  - `created_at` (TIMESTAMP): 作成日時
+- **team_postsテーブル**
+  - `id` (VARCHAR, PK): 投稿ID
+  - `team_id` (VARCHAR, FK): `teams.id`への参照
+  - `author_id` (UUID): 著者ID
+  - `title` (VARCHAR): 投稿タイトル
+  - `body` (TEXT): 投稿本文
+  - `created_at` (TIMESTAMP): 作成日時
 
 #### sfsp-db (files、scan_jobs、scan_resultsテーブル)
 
@@ -845,19 +927,30 @@ sequenceDiagram
 #### **Team Service** (`team-service`)
 
 - **ベースパス:** `/api/teams`
-- **責務:** チームの作成・管理と、トークンベースのクローズドコンテンツ共有（Discord招待リンク風）。 viewing はトークン(URL)のみで認証不要。
+- **責務:** チームの作成・メンバー管理と、トークンベースのクローズドコンテンツ共有（Discord招待リンク風）。閲覧（viewing）はトークン(URL)のみで認証不要。チームに所属するコンテンツ（動画・ゲーム・static-site）は、各アップロードサービスのapp-dbテーブルにある`team_id`カラムで所属チームを特定し、チーム限定公開にする。
+- **ロール:** メンバーは`owner`(3)・`admin`(2)・`member`(1)の3段階。各エンドポイントは役割ランクでアクセス制御する。
 
 | メソッド | エンドポイント | 認証 | 説明 |
 |---|---|---|---|
-| `GET` | `` (公開) | 不要 | **公開チーム一覧取得**。`is_public=true` のチームのみを返します。 |
+| `GET` | `` | 不要 | **公開チーム一覧取得**。`is_public=true` のチームのみを返します。 |
 | `GET` | `/mine` | JWT | **自分が参加しているチーム一覧**を取得します。 |
-| `POST` | `` (公開) | JWT | **チーム作成**。24文字のトークンを自動生成して返します。`is_public` を指定可能。 |
+| `POST` | `` | JWT | **チーム作成**。24文字のbase36トークンを自動生成して返します。`is_public`・`auto_approve`を指定可能。 |
 | `GET` | `/:token` | 不要 | **トークンでチーム詳細取得**。URLを持つ誰でも閲覧可能。 |
+| `GET` | `/:token/permission` | 不要 | **権限確認**。呼び出し人がそのチームで閲覧・投稿可能かを`{is_public, can_view, can_post, role}`で返す。各アップロードサービスがチーム投稿前に呼出する。 |
 | `GET` | `/:token/members` | JWT (member以上) | **メンバー一覧**を取得します。 |
 | `POST` | `/:token/members` | JWT (admin以上) | **メンバー追加**。`user_id` と `role` を指定。 |
 | `DELETE` | `/:token/members/:userId` | JWT (admin以上) | **メンバー削除**。 |
 | `PATCH` | `/:token` | JWT (owner) | **チーム情報更新**。`name`・`description`・`is_public`。 |
 | `DELETE` | `/:token` | JWT (owner) | **チーム削除**（メンバー・関連情報も削除）。 |
+
+##### チームへの加入
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `POST` | `/:token/join` | JWT | **加入リクエスト**。公開チームで`auto_approve`なら即メンバー化、手動承認なら`pending`の追加。非公開チームは加入自体を拒否。 |
+| `GET` | `/:token/join-requests` | JWT (admin以上) | **加入リクエスト一覧**。 |
+| `PATCH` | `/:token/join-requests/:requestId` | JWT (admin以上) | **加入リクエスト承認・却下**。クエリ`action=approve|reject`。承認されメンバー化。 |
+| `DELETE` | `/:token/join-requests` | JWT | **加入リクエスト取消**。自分の`pending`を取消。 |
 
 ##### チームコンテンツ（投稿）
 
@@ -869,7 +962,7 @@ sequenceDiagram
 
 投稿は `team_posts` テーブルに格納され、`author_name` は必要に応じて `app-db` の `users` から付与されます。非公開チームのコンテンツは、メンバーがログインした場合のみ閲覧可能です。
 
-> **補足:** `:token` は24文字のbase36トークン（約143ビットの熵）で、未予測性によりアクセスを制限します。チームコンテンツ（動画・ゲーム・static-site）の連携は Phase 2 で追加予定。
+> **補足:** `:token` は24文字のbase36トークン（crypto/rand由来、約143ビットの熵）で、未予測性によりアクセスを制限します。チームコンテンツ（動画・ゲーム・static-site）の連携は既に実装済みで、各コンテンツテーブルの`team_id`カラムで所属チームを特定します。
 
 ---
 
@@ -991,3 +1084,4 @@ sequenceDiagram
 
 - **Go:** `gofmt` と `goimports` でフォーマットを統一してください。
 - **TypeScript/React:** PrettierとESLintを導入済みです。コミット前に`npm run lint`を実行してください。
+

@@ -13,6 +13,7 @@
 - [Game Upload API](#game-upload-api)
 - [Static Site Upload API](#static-site-upload-api)
 - [MyPage Service](#mypage-service)
+- [Team Service](#team-service)
 - [Security File Scan Platform (SFSP)](#security-file-scan-platform-sfsp)
 - [Monitoring Service](#monitoring-service)
 
@@ -76,7 +77,7 @@
 | `GET` | `` | `video-worker` | 不要 | 動画リスト取得。公開済みの動画リストを検索クエリ付きで取得します。 | （クエリ: `q=search_term`） | `[{"id": "...", "title": "...", ...}]` |
 | `GET` | `/:id` | `video-worker` | 不要 | 動画詳細取得。指定した動画のメタデータを取得します。 | （なし） | `{"id": "...", "title": "...", ...}` |
 | `PUT` | `/:id` | `video-worker` | JWT | 動画メタデータ更新。指定した動画のタイトルと説明を更新します。 | `{"title": "...", "description": "..."}` | `{"message": "Video updated successfully"}` |
-| `GET` | `/:id/stream/playlist.m3u8` | `video-worker` | 不要 | 動画ストリーミング。HLSのマスタープレイリストを取得します。 | （なし） | （HSLマニフェスト） |
+| `GET` | `/:id/stream/playlist.m3u8` | Nginx（MinIO直配信） | 不要 | 動画ストリーミング。HLSのマスタープレイリストを取得します。NginxがリクエストをMinIO（video-storage）のオブジェクトキーへ変換して直接配信します。 | （なし） | （HSLマニフェスト） |
 
 ---
 
@@ -127,6 +128,49 @@
 
 ---
 
+## Team Service
+
+- **ベースパス:** `/api/teams`
+- **担当サービス:** `team-service`
+- **責務:** チームの作成・メンバー管理と、トークンベースのクローズドコンテンツ共有（Discord招待リンク風）。閲覧（viewing）はトークン(URL)のみで認証不要。
+- **ロール:** メンバーは`owner`(3)・`admin`(2)・`member`(1)の3段階。各エンドポイントは役割ランクでアクセス制御する。
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `GET` | `` | 不要 | 公開チーム一覧取得。`is_public=true` のチームのみを返します。 |
+| `GET` | `/mine` | JWT | 自分が参加しているチーム一覧を取得します。 |
+| `POST` | `` | JWT | チーム作成。24文字のbase36トークンを自動生成して返します。`is_public`・`auto_approve`を指定可能。 |
+| `GET` | `/:token` | 不要 | トークンでチーム詳細取得。URLを持つ誰でも閲覧可能。 |
+| `GET` | `/:token/permission` | 不要 | 権限確認。呼び出し人がそのチームで閲覧・投稿可能かを`{is_public, can_view, can_post, role}`で返す。各アップロードサービスがチーム投稿前に呼出する。 |
+| `GET` | `/:token/members` | JWT (member以上) | メンバー一覧を取得します。 |
+| `POST` | `/:token/members` | JWT (admin以上) | メンバー追加。`user_id` と `role` を指定。 |
+| `DELETE` | `/:token/members/:userId` | JWT (admin以上) | メンバー削除。 |
+| `PATCH` | `/:token` | JWT (owner) | チーム情報更新。`name`・`description`・`is_public`。 |
+| `DELETE` | `/:token` | JWT (owner) | チーム削除（メンバー・関連情報も削除）。 |
+
+##### チームへの加入
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `POST` | `/:token/join` | JWT | 加入リクエスト。公開チームで`auto_approve`なら即メンバー化、手動承認なら`pending`の追加。非公開チームは加入自体を拒否。 |
+| `GET` | `/:token/join-requests` | JWT (admin以上) | 加入リクエスト一覧。 |
+| `PATCH` | `/:token/join-requests/:requestId` | JWT (admin以上) | 加入リクエスト承認・却下。クエリ`action=approve|reject`。承認されメンバー化。 |
+| `DELETE` | `/:token/join-requests` | JWT | 加入リクエスト取消。自分の`pending`を取消。 |
+
+##### チームコンテンツ（投稿）
+
+| メソッド | エンドポイント | 認証 | 説明 |
+|---|---|---|---|
+| `POST` | `/:token/content` | JWT (member以上) | 投稿作成。`title`・`body`を指定。作成者は自動的にメンバー追加は不要で投稿可能。 |
+| `GET` | `/:token/content` | チームが公開なら不要／非公開ならmember以上 | そのチームの投稿一覧を取得します。 |
+| `GET` | `/:token/content/:contentID` | 一覧と同じ | 単一投稿取得。 |
+
+投稿は `team_posts` テーブルに格納され、`author_name` は必要に応じて `app-db` の `users` から付与されます。非公開チームのコンテンツは、メンバーがログインした場合のみ閲覧可能です。
+
+> **補足:** `:token` は24文字のbase36トークン（crypto/rand由来、約143ビットの熵）で、未予測性によりアクセスを制限します。チームコンテンツ（動画・ゲーム・static-site）の連携は既に実装済みで、各コンテンツテーブルの`team_id`カラムで所属チームを特定します。
+
+---
+
 ## Security File Scan Platform (SFSP)
 
 - **ベースパス:** `/api/v1`
@@ -165,4 +209,4 @@
 ## 補足
 
 - 各エンドポイントの詳細（内部処理ロジックや関連ファイル）は、プロジェクトの `README.md` の「APIエンドポイント仕様」セクションに記載されています。
-- 動画ストリーミングはHLS形式を使用します。フロントエンドは `/api/videos/:id/stream/playlist.m3u8` 経由でNginxを通じ、ローカルのHLSファイルにアクセスします。
+- 動画ストリーミングはHLS形式を使用します。フロントエンドは `/api/videos/:id/stream/...` 経由でNginxを通じ、MinIO（video-storage）のHLSファイルにアクセスします。NginxがURLをMinIOのオブジェクトキーへ変換して直接配信します。

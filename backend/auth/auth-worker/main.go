@@ -386,30 +386,31 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	// profile-service へ管理者の初期プロフィール作成を非同期リクエスト
-	go func(userIDStr, uname string) {
-		profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
-		if profileServiceURL == "" {
-			profileServiceURL = "http://profile-service:8084"
+	// profile-service へ管理者の初期プロフィール作成を同期で要求する（失敗時はログ出力）
+	profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
+	if profileServiceURL == "" {
+		profileServiceURL = "http://profile-service:8084"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":  userID.String(),
+		"username": username,
+	})
+	profileResp, profileErr := http.Post(
+		fmt.Sprintf("%s/api/profile/internal/create", profileServiceURL),
+		"application/json",
+		bytes.NewBuffer(payload),
+	)
+	if profileErr != nil {
+		log.Printf("ERROR: Failed to call profile-service creation endpoint: %v", profileErr)
+	} else {
+		defer profileResp.Body.Close()
+		if profileResp.StatusCode != http.StatusOK && profileResp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(profileResp.Body)
+			log.Printf("ERROR: profile-service creation endpoint returned status %d: %s", profileResp.StatusCode, string(body))
+		} else {
+			log.Printf("INFO: Profile created for admin %s", userID.String())
 		}
-
-		payload, _ := json.Marshal(map[string]string{
-			"user_id":  userIDStr,
-			"username": uname,
-		})
-
-		resp, err := http.Post(
-			fmt.Sprintf("%s/api/profile/internal/create", profileServiceURL),
-			"application/json",
-			bytes.NewBuffer(payload),
-		)
-		if err != nil {
-			log.Printf("ERROR: Failed to call profile-service creation endpoint: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-		log.Printf("DEBUG: Profile creation triggered for admin %s", userIDStr)
-	}(userID.String(), username)
+	}
 
 	c.JSON(http.StatusCreated, gin.H{"message": "Admin user created successfully", "userID": userID.String()})
 }

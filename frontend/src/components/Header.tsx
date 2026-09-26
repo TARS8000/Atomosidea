@@ -1,11 +1,8 @@
 import { useState } from 'react';
-import { AppBar, Toolbar, Typography, Button, Box, Avatar, Menu, MenuItem, ListItemIcon, ListItemText, useTheme } from '@mui/material';
+import { AppBar, Toolbar, Typography, Button, Box, Avatar, Menu, MenuItem, ListItemText, useTheme } from '@mui/material';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import UploadIcon from '@mui/icons-material/Upload';
-import VideocamIcon from '@mui/icons-material/Videocam';
-import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
-import PublicIcon from '@mui/icons-material/Public'; // Import PublicIcon
 import GroupIcon from '@mui/icons-material/Group';
 import AccountDeletionModal from './AccountDeletionModal';
 import axios from 'axios';
@@ -15,20 +12,14 @@ const Header = () => {
   const navigate = useNavigate();
   const theme = useTheme();
   const [userMenuAnchorEl, setUserMenuAnchorEl] = useState<null | HTMLElement>(null);
-  const [uploadMenuAnchorEl, setUploadMenuAnchorEl] = useState<null | HTMLElement>(null);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
 
   const handleUserMenu = (event: React.MouseEvent<HTMLElement>) => {
     setUserMenuAnchorEl(event.currentTarget);
   };
 
-  const handleUploadMenu = (event: React.MouseEvent<HTMLElement>) => {
-    setUploadMenuAnchorEl(event.currentTarget);
-  };
-
   const handleClose = () => {
     setUserMenuAnchorEl(null);
-    setUploadMenuAnchorEl(null);
   };
 
   const handleLogout = async () => {
@@ -82,8 +73,9 @@ const Header = () => {
         {isAuthenticated && user ? (
           <Box sx={{ display: 'flex', alignItems: 'center' }}>
             <Button
+              component={RouterLink}
+              to="/upload"
               variant="outlined"
-              onClick={handleUploadMenu}
               startIcon={<UploadIcon />}
               sx={{ mr: 2 }}
             >
@@ -92,30 +84,6 @@ const Header = () => {
             <Button component={RouterLink} to="/teams" startIcon={<GroupIcon />} sx={{ mr: 2, color: 'text.primary' }}>
               チーム
             </Button>
-            <Menu
-              anchorEl={uploadMenuAnchorEl}
-              open={Boolean(uploadMenuAnchorEl)}
-              onClose={handleClose}
-            >
-              <MenuItem component={RouterLink} to="/upload" onClick={handleClose}>
-                <ListItemIcon>
-                  <VideocamIcon fontSize="small" />
-                </ListItemIcon>
-                <ListItemText>動画をアップロード</ListItemText>
-              </MenuItem>
-              <MenuItem component={RouterLink} to="/upload-game" onClick={handleClose}>
-                <ListItemIcon>
-                  <SportsEsportsIcon fontSize="small" />
-                </ListItemIcon>
-                <ListItemText>ゲームをアップロード</ListItemText>
-              </MenuItem>
-              <MenuItem component={RouterLink} to="/upload-static-site" onClick={handleClose}>
-                <ListItemIcon>
-                  <PublicIcon fontSize="small" />
-                </ListItemIcon>
-                <ListItemText>静的サイトをアップロード</ListItemText>
-              </MenuItem>
-            </Menu>
 
             <Button component={RouterLink} to="/mypage" sx={{ color: 'text.primary', mr: 2 }}>マイページ</Button>
             

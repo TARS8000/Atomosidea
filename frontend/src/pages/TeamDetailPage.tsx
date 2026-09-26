@@ -22,37 +22,39 @@ import {
   CardMedia,
   CardContent,
   CardActions,
-  InputLabel,
-  Accordion,
-  AccordionSummary,
-  AccordionDetails,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  FormControlLabel,
+  Switch,
 } from '@mui/material';
 import MenuItem from '@mui/material/MenuItem';
-import AddIcon from '@mui/icons-material/Add';
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
+import GroupIcon from '@mui/icons-material/Group';
 import SearchIcon from '@mui/icons-material/Search';
 import VideoIcon from '@mui/icons-material/PlayArrow';
 import GamesIcon from '@mui/icons-material/SportsEsports';
 import WebIcon from '@mui/icons-material/Web';
 import LockIcon from '@mui/icons-material/Lock';
 import PublicIcon from '@mui/icons-material/Public';
-import axios from 'axios';
+import PersonIcon from '@mui/icons-material/Person';
 import {
   teamApi,
   Team,
   TeamMember,
+  JoinRequest,
   TEAM_ROLE_RANK,
   contentApi,
   TeamContentItem,
   TeamContentType,
   CONTENT_LINKS,
-  CONTENT_UPLOAD_FIELDS,
 } from '../api/team';
 import { useAuth } from '../context/AuthContext';
+import axios from 'axios';
 
-const ROLE_LABEL: Record<string, string> = { owner: '所有者', admin: '管理者', member: 'メンバー' };
+const ROLE_LABEL: Record<string, string> = { owner: 'ホスト', admin: 'オペレーター', member: 'メンバー' };
 
 const TABS: { key: string; label: string }[] = [
   { key: 'all', label: 'すべて' },
@@ -83,12 +85,24 @@ const TeamDetailPage = () => {
   const [error, setError] = useState('');
 
   // アクティブタブ
-  const [activeTab, setActiveTab] = useState('posts');
+  const [activeTab, setActiveTab] = useState('all');
 
 // メンバー
-  const [memberUserId, setMemberUserId] = useState('');
-  const [memberRole, setMemberRole] = useState('member');
-  const [memberError, setMemberError] = useState('');
+
+  // チーム設定
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [autoApprove, setAutoApprove] = useState(false);
+  const [isPublic, setIsPublic] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState('');
+  const [teamName, setTeamName] = useState('');
+  const [teamDescription, setTeamDescription] = useState('');
+  const [allowMemberInvite, setAllowMemberInvite] = useState(false);
+
+  // 参加リクエスト管理
+  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [joinRequestsLoading, setJoinRequestsLoading] = useState(false);
+  const [joinMessage, setJoinMessage] = useState('');
 
   // コンテンツ（動画/ゲーム/サイト）
   const [contentSearch, setContentSearch] = useState<Record<TeamContentType, string>>({
@@ -101,20 +115,7 @@ const TeamDetailPage = () => {
   const [staticSites, setStaticSites] = useState<TeamContentItem[]>([]);
   const [contentLoading, setContentLoading] = useState(false);
   const [contentError, setContentError] = useState('');
-
-  // アップロード状態
-  const [uploading, setUploading] = useState<Record<TeamContentType, boolean>>({
-    videos: false,
-    games: false,
-    sites: false,
-  });
-  const [uploadForm, setUploadForm] = useState<Record<TeamContentType, { title: string; description: string; file: File | null; thumbnail: File | null }>>({
-    videos: { title: '', description: '', file: null, thumbnail: null },
-    games: { title: '', description: '', file: null, thumbnail: null },
-    sites: { title: '', description: '', file: null, thumbnail: null },
-  });
-  const [uploadError, setUploadError] = useState<Record<TeamContentType, string>>({ videos: '', games: '', sites: '' });
-  const [uploadSuccess, setUploadSuccess] = useState<Record<TeamContentType, string>>({ videos: '', games: '', sites: '' });
+  const [usernames, setUsernames] = useState<Record<string, string>>({});
 
   const myRole = (() => {
     if (!user) return '';
@@ -132,16 +133,24 @@ const TeamDetailPage = () => {
       const teamRes = await teamApi.get(token!);
       setTeam(teamRes.data);
 
+      // メンバー一覧を先に取得する。非公開チームのアクセス判定は myRole に依存するため、
+      // members が空の段階で判定するとメンバー（ホスト含む）でも閲覧不可になってしまう。
+      let role = '';
+      await teamApi.listMembers(token!).then((r) => {
+        const list = r.data || [];
+        setMembers(list);
+        const m = list.find((x) => x.user_id === user?.userID);
+        role = m ? m.role : '';
+      }).catch(() => {});
+
       // 非公開チームでメンバー以外（或未認証）は閲覧不可
       if (!teamRes.data.is_public) {
-        if (!isAuthenticated || !myRole) {
+        if (!isAuthenticated || !role) {
           setError('このチームは非公開です。メンバーがログインしてください。');
           setLoading(false);
           return;
         }
       }
-
-      await teamApi.listMembers(token!).then((r) => setMembers(r.data || [])).catch(() => {});
     } catch (err: any) {
       if (err.response?.status === 401) {
         setError('このチームを閲覧するにはログインが必要です。');
@@ -155,7 +164,7 @@ const TeamDetailPage = () => {
     } finally {
       setLoading(false);
     }
-  }, [token, isAuthenticated, myRole]);
+  }, [token, isAuthenticated, user?.userID]);
 
   useEffect(() => {
     load();
@@ -172,12 +181,15 @@ const TeamDetailPage = () => {
         if (type === 'videos') {
           const r = await contentApi.listVideos(token, search);
           setVideos(r.data || []);
+          void loadUsernames(r.data || []);
         } else if (type === 'games') {
           const r = await contentApi.listGames(token, search);
           setGames(r.data || []);
+          void loadUsernames(r.data || []);
         } else {
           const r = await contentApi.listStaticSites(token, search);
           setStaticSites(r.data || []);
+          void loadUsernames(r.data || []);
         }
       } catch (err: any) {
         setContentError('一覧の取得に失敗しました。');
@@ -187,6 +199,25 @@ const TeamDetailPage = () => {
     },
     [token, contentSearch]
   );
+
+  // 投稿者の名前を一括取得（詳細ページと同じく /api/profile/:id を使用）
+  const loadUsernames = useCallback(async (items: Array<{ uploader_id?: string | null; user_id?: string | null }>) => {
+    const ids = Array.from(new Set(items.map((it) => it.uploader_id ?? it.user_id).filter(Boolean) as string[]));
+    if (ids.length === 0) return;
+    try {
+      const resps = await Promise.all(
+        ids.map((id) => axios.get<{ username: string }>(`/api/profile/${id}`).catch(() => ({ data: { username: '' } })))
+      );
+      const map: Record<string, string> = {};
+      resps.forEach((r, i) => {
+        const uname = r.data?.username?.trim();
+        if (uname) map[ids[i]] = uname;
+      });
+      setUsernames((prev) => ({ ...prev, ...map }));
+    } catch {
+      // 名前取得失敗時はカード側でuploader_idを表示
+    }
+  }, []);
 
   useEffect(() => {
     if (activeTab === 'all') {
@@ -200,18 +231,21 @@ const TeamDetailPage = () => {
     }
   }, [activeTab, loadContent]);
 
-  const handleAddMember = async () => {
-    if (!memberUserId.trim()) {
-      setMemberError('ユーザーIDを入力してください。');
-      return;
-    }
-    setMemberError('');
+  // メンバーと参加リクエストの名前を取得
+  useEffect(() => {
+    if (members.length > 0) void loadUsernames(members);
+  }, [members]);
+
+  useEffect(() => {
+    if (joinRequests.length > 0) void loadUsernames(joinRequests);
+  }, [joinRequests]);
+
+  const handleRoleChange = async (userId: string, role: string) => {
     try {
-      await teamApi.addMember(token!, memberUserId.trim(), memberRole);
+      await teamApi.addMember(token!, userId, role);
       await load();
-      setMemberUserId('');
     } catch (err: any) {
-      setMemberError(err.response?.data?.error || 'メンバー追加に失敗しました。');
+      setError(err.response?.data?.error || '権限変更に失敗しました。');
     }
   };
 
@@ -233,40 +267,62 @@ const TeamDetailPage = () => {
     }
   };
 
-  // コンテンツアップロード
-  const handleUpload = async (type: TeamContentType) => {
-    const form = uploadForm[type];
-    if (!form.title.trim()) {
-      setUploadError((prev) => ({ ...prev, [type]: 'タイトルを入力してください。' }));
-      return;
-    }
-    if (!form.file) {
-      setUploadError((prev) => ({ ...prev, [type]: 'ファイルを選択してください。' }));
-      return;
-    }
-    setUploading((prev) => ({ ...prev, [type]: true }));
-    setUploadError((prev) => ({ ...prev, [type]: '' }));
-    setUploadSuccess((prev) => ({ ...prev, [type]: '' }));
-
+  // 参加リクエスト一覧の取得
+  const loadJoinRequests = async () => {
+    setJoinRequestsLoading(true);
     try {
-      const fields = CONTENT_UPLOAD_FIELDS[type];
-      const formData = new FormData();
-      formData.append('title', form.title.trim());
-      formData.append('description', form.description);
-      formData.append('team_id', token!);
-      formData.append(fields.fileField, form.file);
-      if (form.thumbnail) {
-        formData.append('thumbnail', form.thumbnail);
-      }
-
-      const res = await axios.post(fields.endpoint, formData);
-      setUploadSuccess((prev) => ({ ...prev, [type]: res.data.message || 'アップロードが開始されました。処理が完了するまでしばらくお待ちください。' }));
-      setUploadForm((prev) => ({ ...prev, [type]: { title: '', description: '', file: null, thumbnail: null } }));
-      await loadContent(type);
-    } catch (err: any) {
-      setUploadError((prev) => ({ ...prev, [type]: err.response?.data?.error || 'アップロードに失敗しました。' }));
+      const r = await teamApi.listJoinRequests(token!);
+      setJoinRequests(r.data || []);
+    } catch (err) {
+      console.error(err);
     } finally {
-      setUploading((prev) => ({ ...prev, [type]: false }));
+      setJoinRequestsLoading(false);
+    }
+  };
+
+  const openSettings = () => {
+    if (!team) return;
+    setTeamName(team.name);
+    setTeamDescription(team.description || '');
+    setAutoApprove(team.auto_approve);
+    setIsPublic(team.is_public);
+    setAllowMemberInvite(!!team.allow_member_invite);
+    setSettingsMessage('');
+    setSettingsOpen(true);
+  };
+
+  const saveSettings = async () => {
+    setSavingSettings(true);
+    setSettingsMessage('');
+    try {
+      await teamApi.update(token!, { name: teamName, description: teamDescription, is_public: isPublic, auto_approve: autoApprove, allow_member_invite: allowMemberInvite });
+      setSettingsMessage('設定を保存しました。');
+      await load();
+    } catch (err: any) {
+      setSettingsMessage(err.response?.data?.error || '保存に失敗しました。');
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const handleReviewJoinRequest = async (requestId: string, action: 'approve' | 'reject') => {
+    try {
+      await teamApi.reviewJoinRequest(token!, requestId, action);
+      setJoinMessage(action === 'approve' ? '参加リクエストを承認しました。' : '参加リクエストを拒否しました。');
+      await loadJoinRequests();
+    } catch (err: any) {
+      setJoinMessage(err.response?.data?.error || '処理に失敗しました。');
+    }
+  };
+
+  const handleJoin = async () => {
+    setJoinMessage('参加リクエストを送信しています...');
+    try {
+      await teamApi.join(token!);
+      setJoinMessage('チームに参加しました。');
+      await load();
+    } catch (err: any) {
+      setJoinMessage(err.response?.data?.error || '参加に失敗しました。');
     }
   };
 
@@ -287,13 +343,6 @@ const TeamDetailPage = () => {
     }
   };
 
-  const setUploadField = (type: TeamContentType, field: 'title' | 'description', value: string) => {
-    setUploadForm((prev) => ({ ...prev, [type]: { ...prev[type], [field]: value } }));
-  };
-  const setUploadFile = (type: TeamContentType, file: File | null, field: 'file' | 'thumbnail') => {
-    setUploadForm((prev) => ({ ...prev, [type]: { ...prev[type], [field]: file } }));
-  };
-
   const renderContentThumbnail = (item: TeamContentItem) => {
     const thumb = item.thumbnail_path || item.thumbnail_url;
     if (thumb) {
@@ -308,14 +357,13 @@ const TeamDetailPage = () => {
 
   const renderContentGrid = (type: TeamContentType, items: TeamContentItem[]) => {
     const link = CONTENT_LINKS[type];
-    const icons = { videos: <VideoIcon />, games: <GamesIcon />, sites: <WebIcon /> };
     return (
       <Grid container spacing={3}>
         {items.map((item) => (
           <Grid item key={`${type}-${item.id}`} xs={12} sm={6} md={4} lg={3}>
             <Card
-                component="a"
-                href={link.detail(item.id)}
+                component="div"
+                onClick={() => navigate(link.detail(item.id))}
                 sx={{
                   display: 'flex',
                   flexDirection: 'column',
@@ -338,13 +386,18 @@ const TeamDetailPage = () => {
                   </Typography>
                   <Chip size="small" label={item.status} sx={{ mt: 1 }} color={item.status === 'public' ? 'success' : 'default'} />
                 </CardContent>
-                <CardActions sx={{ mt: 'auto' }}>
-                  <Button size="small" onClick={(e) => e.stopPropagation()} startIcon={icons[type]}>
-                    詳細
-                  </Button>
-                  <Button size="small" onClick={(e) => e.stopPropagation()} startIcon={<EditIcon />}>
-                    編集
-                  </Button>
+                <CardActions sx={{ mt: 'auto', alignItems: 'center' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', flexGrow: 1, minWidth: 0, mr: 1 }}>
+                    <PersonIcon sx={{ fontSize: 16, mr: 0.5, color: 'text.secondary' }} />
+                    <Typography variant="body2" noWrap sx={{ flexGrow: 1, minWidth: 0 }} title={usernames[item.uploader_id ?? ''] || item.uploader_id || undefined}>
+                      {usernames[item.uploader_id ?? ''] || '投稿者不明'}
+                    </Typography>
+                  </Box>
+                  {item.uploader_id === user?.userID && (
+                    <Button size="small" onClick={(e) => { e.stopPropagation(); navigate(link.edit(item.id)); }} startIcon={<EditIcon />}>
+                      編集
+                    </Button>
+                  )}
                   {canManageTeam && (
                     <Button
                       size="small"
@@ -363,72 +416,6 @@ const TeamDetailPage = () => {
           </Grid>
         ))}
       </Grid>
-    );
-  };
-
-  const renderUploadForm = (type: TeamContentType, label: string, accept: string, hint: string) => {
-    const form = uploadForm[type];
-    const error = uploadError[type];
-    const success = uploadSuccess[type];
-    return (
-      <Accordion variant="outlined" sx={{ mb: 3 }}>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography sx={{ fontWeight: 600 }}>
-            <AddIcon sx={{ mr: 1, verticalAlign: 'middle' }} />
-            {label}をアップロード
-          </Typography>
-        </AccordionSummary>
-        <AccordionDetails sx={{ display: 'flex', flexDirection: 'column' }}>
-          {error && <Alert severity="error" sx={{ mb: 1 }}>{error}</Alert>}
-          {success && <Alert severity="success" sx={{ mb: 1 }}>{success}</Alert>}
-          <TextField
-            fullWidth
-            margin="normal"
-            label="タイトル"
-            required
-            value={form.title}
-            onChange={(e) => setUploadField(type, 'title', e.target.value)}
-          />
-          <TextField
-            fullWidth
-            margin="normal"
-            label="説明"
-            multiline
-            minRows={3}
-            value={form.description}
-            onChange={(e) => setUploadField(type, 'description', e.target.value)}
-          />
-          <Box sx={{ mt: 1 }}>
-            <InputLabel>ファイル</InputLabel>
-            <Button variant="outlined" component="label" sx={{ mt: 0.5 }}>
-              {form.file ? form.file.name : 'ファイルを選択'}
-              <input type="file" hidden accept={accept} onChange={(e) => setUploadFile(type, e.target.files?.[0] ?? null, 'file')} />
-            </Button>
-            {form.file && (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                {form.file.name} ({(form.file.size / 1024 / 1024).toFixed(2)} MB)
-              </Typography>
-            )}
-            <Typography variant="caption" color="text.secondary">{hint}</Typography>
-          </Box>
-          <Box sx={{ mt: 1 }}>
-            <InputLabel>サムネイル画像（任意）</InputLabel>
-            <Button variant="text" component="label" sx={{ mt: 0.5 }}>
-              {form.thumbnail ? form.thumbnail.name : 'サムネイルを選択'}
-              <input type="file" hidden accept="image/*" onChange={(e) => setUploadFile(type, e.target.files?.[0] ?? null, 'thumbnail')} />
-            </Button>
-          </Box>
-          <Button
-            variant="contained"
-            onClick={() => handleUpload(type)}
-            disabled={uploading[type] || !form.file || !form.title.trim()}
-            sx={{ mt: 2 }}
-            startIcon={uploading[type] ? <CircularProgress size={20} /> : <AddIcon />}
-          >
-            {uploading[type] ? 'アップロード中' : 'アップロード'}
-          </Button>
-        </AccordionDetails>
-      </Accordion>
     );
   };
 
@@ -451,10 +438,10 @@ const TeamDetailPage = () => {
 
       {team && !error && (
         <>
-          <Paper sx={{ p: 3, mb: 3, borderTop: `4px solid ${theme.palette.primary.main}` }}>
-            <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-              <Box>
-                <Typography variant="h4" component="h1" fontWeight="bold">{team.name}</Typography>
+<Paper sx={{ p: 3, mb: 3, borderTop: `4px solid ${theme.palette.primary.main}` }}>
+             <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 2 }}>
+               <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+                 <Typography variant="h4" component="h1" fontWeight="bold" noWrap title={team.name}>{team.name}</Typography>
                 <Box sx={{ display: 'flex', alignItems: 'center', mt: 1, mb: 1 }}>
                   <Chip size="small" icon={team.is_public ? <PublicIcon /> : <LockIcon />} label={team.is_public ? '公開チーム' : '非公開チーム'} sx={{ ml: 1 }} />
                 </Box>
@@ -465,14 +452,31 @@ const TeamDetailPage = () => {
                 )}
               </Box>
               {canManageTeam && (
-                <Button size="small" onClick={handleDeleteTeam} color="error">
-                  チームを削除
+                <>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mr: 1 }}>
+                    <Button variant="contained" size="small" onClick={openSettings} startIcon={<EditIcon />} color="primary">
+                      チーム設定
+                    </Button>
+                    <Button variant="contained" size="small" onClick={handleDeleteTeam} startIcon={<DeleteIcon />} color="error">
+                      チームを削除
+                    </Button>
+                  </Box>
+                  {!canPost && team?.is_public && (
+                    <Button size="small" variant="outlined" startIcon={<GroupIcon />} onClick={handleJoin}>
+                      チームへ加入
+                    </Button>
+                  )}
+                </>
+              )}
+              {!canManageTeam && !canPost && team?.is_public && (
+                <Button size="small" variant="outlined" startIcon={<GroupIcon />} onClick={handleJoin}>
+                  チームへ加入
                 </Button>
               )}
             </Box>
           </Paper>
 
-          <Paper sx={{ p: 1, mb: 2 }}>
+<Paper sx={{ p: 1, mb: 2 }}>
             <Tabs
               value={activeTab}
               onChange={(_e, v) => setActiveTab(v)}
@@ -540,12 +544,11 @@ const TeamDetailPage = () => {
                       placeholder="動画を検索..."
                       value={contentSearch.videos}
                       onChange={(e) => setContentSearch((prev) => ({ ...prev, videos: e.target.value }))}
-                      InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }} />, endAdornment: <></> }}
-                    />
-                  </Box>
-                  {renderUploadForm('videos', '動画', 'video/*,video/webm', '動画ファイルを選択してください。')}
-                </>
-              )}
+InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }} />, endAdornment: <></> }}
+                      />
+                    </Box>
+                  </>
+                )}
               {contentLoading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}><CircularProgress /></Box>
               ) : contentError ? (
@@ -575,7 +578,6 @@ const TeamDetailPage = () => {
                   />
                 </Box>
               )}
-              {renderUploadForm('games', 'ゲーム', '.zip,application/x-zip-compressed', 'ZIPファイル（Unity WebGL版）を選択してください。')}
               {contentLoading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}><CircularProgress /></Box>
               ) : contentError ? (
@@ -605,7 +607,6 @@ const TeamDetailPage = () => {
                   />
                 </Box>
               )}
-              {renderUploadForm('sites', '静的サイト', '.zip,application/x-zip-compressed', 'HTML/CSS/JSファイルを含むZIPファイルを選択してください。')}
               {contentLoading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}><CircularProgress /></Box>
               ) : contentError ? (
@@ -620,23 +621,74 @@ const TeamDetailPage = () => {
             </>
           )}
 
-          {/* メンバー */}
-          {activeTab === 'members' && (
-            <>
-              {canManageMembers && (
+{/* メンバー */}
+{activeTab === 'members' && (
+              <>
+                {canManageTeam && (
                 <>
-                  <Typography variant="h6" gutterBottom>メンバー管理</Typography>
-                  {members.length === 0 ? (
-                    <Alert severity="info">メンバーがいません。</Alert>
+                  <Typography variant="h6" gutterBottom>参加リクエスト管理</Typography>
+                  {joinRequestsLoading ? (
+                    <CircularProgress size={20} />
+                  ) : joinRequests.length === 0 ? (
+                    <Alert severity="info">参加リクエストはありません。</Alert>
                   ) : (
-                    members.map((m) => (
-                      <Box key={`${m.user_id}-${m.role}`} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1 }}>
+                    joinRequests.map((r) => (
+                      <Box key={r.id} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1 }}>
                         <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                          <Avatar sx={{ width: 32, height: 32, mr: 1 }}>{(r.user_id || '?').charAt(0).toUpperCase()}</Avatar>
+                          <Typography variant="body2" noWrap title={usernames[r.user_id] || r.user_id}>{usernames[r.user_id] || r.user_id}</Typography>
+                          <Chip size="small" label={r.status} sx={{ ml: 1 }} color={r.status === 'pending' ? 'warning' : 'default'} />
+                        </Box>
+                        <Box sx={{ display: 'flex', gap: 1 }}>
+                          <Button size="small" color="success" onClick={() => handleReviewJoinRequest(r.id, 'approve')}>承認</Button>
+                          <Button size="small" color="error" onClick={() => handleReviewJoinRequest(r.id, 'reject')}>拒否</Button>
+                        </Box>
+                      </Box>
+                    ))
+                  )}
+
+                  {joinMessage && <Alert severity="info" sx={{ mt: 1 }}>{joinMessage}</Alert>}
+
+                  <Divider sx={{ my: 2 }} />
+                </>
+              )}
+              <Box sx={{ mb: 2 }}>
+                <Typography variant="h6" gutterBottom>メンバー管理</Typography>
+                {members.length === 0 ? (
+                  <Alert severity="info">メンバーがいません。</Alert>
+                ) : (
+                  members.map((m) => {
+                    const isSelf = m.user_id === user?.userID;
+                    return (
+                      <Box key={`${m.user_id}-${m.role}`} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1, gap: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', flexGrow: 1, minWidth: 0 }}>
                           <Avatar sx={{ width: 32, height: 32, mr: 1 }}>{(m.user_id || '?').charAt(0).toUpperCase()}</Avatar>
-                          <Typography variant="body2">{m.user_id}</Typography>
+                          <Box>
+                            <Typography variant="body1" fontWeight="bold" noWrap title={usernames[m.user_id] || m.user_id}>
+                              {usernames[m.user_id] || m.user_id}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" noWrap>
+                              {m.user_id}
+                            </Typography>
+                          </Box>
                           <Chip size="small" label={ROLE_LABEL[m.role] || m.role} sx={{ ml: 1 }} />
                         </Box>
-                        {canManageTeam && m.role !== 'owner' && (
+                        {canManageMembers && (
+                          <TextField
+                            select
+                            size="small"
+                            value={m.role}
+                            disabled={isSelf}
+                            onChange={(e) => handleRoleChange(m.user_id, e.target.value)}
+                            sx={{ minWidth: 150 }}
+                            label="権限"
+                          >
+                            <MenuItem value="owner">ホスト</MenuItem>
+                            <MenuItem value="admin">オペレーター</MenuItem>
+                            <MenuItem value="member">メンバー</MenuItem>
+                          </TextField>
+                        )}
+                        {canManageTeam && m.role !== 'owner' && !isSelf && (
                           <Tooltip title="メンバーを削除">
                             <IconButton onClick={() => handleRemoveMember(m.user_id)} size="small">
                               <DeleteIcon fontSize="small" />
@@ -644,35 +696,10 @@ const TeamDetailPage = () => {
                           </Tooltip>
                         )}
                       </Box>
-                    ))
-                  )}
-
-                  <Divider sx={{ my: 2 }} />
-                  {memberError && <Alert severity="error" sx={{ mb: 1 }}>{memberError}</Alert>}
-                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                    <TextField label="追加ユーザーID" value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)} size="small" />
-                    <Box sx={{ display: 'flex', gap: 1 }}>
-                      <TextField
-                        select
-                        size="small"
-                        value={memberRole}
-                        onChange={(e) => setMemberRole(e.target.value)}
-                        sx={{ maxWidth: 200 }}
-                      >
-                        <MenuItem value="member">メンバー</MenuItem>
-                        <MenuItem value="admin">管理者</MenuItem>
-                        <MenuItem value="owner">所有者</MenuItem>
-                      </TextField>
-                      <Button variant="outlined" onClick={handleAddMember} sx={{ flexShrink: 0 }}>
-                        メンバーを追加
-                      </Button>
-                    </Box>
-                  </Box>
-                </>
-              )}
-              {!canManageMembers && (
-                <Alert severity="info">メンバー管理には管理者権限が必要です。</Alert>
-              )}
+                    );
+                  })
+                )}
+              </Box>
             </>
           )}
         </>
@@ -681,6 +708,73 @@ const TeamDetailPage = () => {
       <Box sx={{ mt: 3 }}>
         <Button onClick={() => navigate('/teams')}>← チーム一覧に戻る</Button>
       </Box>
+
+      {/* チーム設定ダイアログ */}
+      <Dialog open={settingsOpen} onClose={() => setSettingsOpen(false)} maxWidth="xs" fullWidth PaperProps={{ sx: { maxHeight: 'calc(100vh - 100px)', overflow: 'auto' } }}>
+        <DialogTitle>チーム設定</DialogTitle>
+        <DialogContent sx={{ pt: '12px !important' }}>
+          <TextField
+            label="チーム名"
+            fullWidth
+            size="small"
+            value={teamName}
+            onChange={(e) => setTeamName(e.target.value)}
+            sx={{ mb: 2, overflow: 'visible', '& .MuiInputBase-root': { overflow: 'visible' } }}
+          />
+          <TextField
+            label="チーム説明"
+            fullWidth
+            size="small"
+            multiline
+            rows={3}
+            value={teamDescription}
+            onChange={(e) => setTeamDescription(e.target.value)}
+          />
+          <FormControlLabel
+            control={
+              <Switch
+                checked={isPublic}
+                onChange={(e) => setIsPublic(e.target.checked)}
+              />
+            }
+            label="公開チームにする（誰でも閲覧可）"
+          />
+          <Box sx={{ mt: 2 }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={autoApprove}
+                  onChange={(e) => setAutoApprove(e.target.checked)}
+                  disabled={!isPublic}
+                />
+              }
+              label="参加を自動承認する（公開チームのみ）"
+            />
+            {!isPublic && (
+              <Typography variant="caption" color="text.secondary">
+                非公開チームでは参加リクエストを手動で承認する必要があります。
+              </Typography>
+            )}
+          </Box>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={allowMemberInvite}
+                onChange={(e) => setAllowMemberInvite(e.target.checked)}
+              />
+            }
+            label="メンバーへの招待URL共有を許可する"
+          />
+          <Typography variant="caption" color="text.secondary">
+            ONにすると、ホスト以外のメンバーも招待URLを共有できます。
+          </Typography>
+          {settingsMessage && <Alert severity="info" sx={{ mt: 2 }}>{settingsMessage}</Alert>}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSettingsOpen(false)}>キャンセル</Button>
+          <Button variant="contained" onClick={saveSettings} disabled={savingSettings}>保存</Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 };

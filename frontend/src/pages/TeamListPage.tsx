@@ -22,13 +22,25 @@ const TeamListPage = () => {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [isPublic, setIsPublic] = useState(true);
+  const [autoApprove, setAutoApprove] = useState(false);
 
   const loadTeams = async () => {
     setLoading(true);
     setError('');
     try {
-      const res = await teamApi.listPublic();
-      setTeams(res.data || []);
+      const [publicRes, mineRes] = await Promise.all([
+        teamApi.listPublic().catch(() => ({ data: [] })),
+        teamApi.listMine().catch(() => ({ data: [] })),
+      ]);
+      const sources = [...(publicRes.data || []), ...(mineRes.data || [])];
+      const byId = new Map();
+      sources.forEach((t) => {
+        const existing = byId.get(t.id);
+        if (!existing || (t.is_public && !existing.is_public)) {
+          byId.set(t.id, t);
+        }
+      });
+      setTeams(Array.from(byId.values()).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()));
     } catch (err) {
       console.error(err);
       setError('チームの一覧を取得できませんでした。');
@@ -49,11 +61,12 @@ const TeamListPage = () => {
     setCreating(true);
     setError('');
     try {
-      await teamApi.create({ name: name.trim(), description: description.trim(), is_public: isPublic });
+      await teamApi.create({ name: name.trim(), description: description.trim(), is_public: isPublic, auto_approve: autoApprove });
       setCreateOpen(false);
       setName('');
       setDescription('');
       setIsPublic(true);
+      setAutoApprove(false);
       await loadTeams();
     } catch (err: any) {
       setError(err.response?.data?.error || 'チーム作成に失敗しました。');
@@ -85,6 +98,10 @@ const TeamListPage = () => {
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>
       )}
+
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+        あなたが作成または参加したチーム（非公開含む）と、公開チームを表示します。
+      </Typography>
 
       {loading ? (
         <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}>
@@ -154,6 +171,17 @@ const TeamListPage = () => {
               <Checkbox checked={isPublic} onChange={(e) => setIsPublic(e.target.checked)} color="primary" />
             }
             label="公開チームにする（トークンを持つ誰でも閲覧可能）"
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={autoApprove}
+                onChange={(e) => setAutoApprove(e.target.checked)}
+                color="primary"
+                disabled={!isPublic}
+              />
+            }
+            label="自動参加を許可する（公開チームのみ有効）"
           />
         </DialogContent>
         <DialogActions>

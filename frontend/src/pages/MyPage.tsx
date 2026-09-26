@@ -10,6 +10,7 @@ import VideocamIcon from '@mui/icons-material/Videocam';
 import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
 import PublicIcon from '@mui/icons-material/Public';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
+import CopyIcon from '@mui/icons-material/ContentCopy';
 
 interface Content {
   id: string;
@@ -46,6 +47,7 @@ const MyPage = () => {
   const [isBioDialogOpen, setIsBioDialogOpen] = useState(false);
   const [isBioOverflowing, setIsBioOverflowing] = useState(false);
   const bioRef = useRef<HTMLParagraphElement>(null);
+  const [copiedId, setCopiedId] = useState(false);
   const staticSiteDomain = import.meta.env.VITE_STATIC_SITE_DOMAIN || 'localhost';
 
   useEffect(() => {
@@ -93,6 +95,22 @@ const MyPage = () => {
   }, [profile]);
 
   const handleTabChange = (_: React.SyntheticEvent, newValue: number) => setTabIndex(newValue);
+
+  const handleCopyUserId = async () => {
+    if (!user) return;
+    try {
+      await navigator.clipboard.writeText(user.userID);
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = user.userID;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+    }
+    setCopiedId(true);
+    setTimeout(() => setCopiedId(false), 1500);
+  };
 
   const handleDelete = async (type: 'video' | 'game' | 'static-site', id: string) => {
     if (window.confirm(`本当にこの${type === 'video' ? '動画' : type === 'game' ? 'ゲーム' : '静的サイト'}を削除しますか？`)) {
@@ -198,13 +216,22 @@ const MyPage = () => {
           <Box sx={{ px: 3, pb: 3, pt: 7, bgcolor: 'background.paper', position: 'relative' }}>
             <Avatar src={profile.icon_url || '/default-icon.png'} sx={{ width: 100, height: 100, position: 'absolute', top: -50, left: 24, border: `4px solid ${theme.palette.background.paper}`, bgcolor: theme.palette.grey[400], boxShadow: `0 0 0 2px ${theme.palette.grey[400]}` }} />
             <Typography variant="h4" component="h1" fontWeight="bold">{profile.username}</Typography>
-            {profile.bio && (
-              <Box sx={{ mt: 2 }}>
-                <Typography ref={bioRef} variant="h6" color="text.secondary" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: '1.5em', maxHeight: '4.5em', overflow: 'hidden' }}>{profile.bio}</Typography>
-                {isBioOverflowing && <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}><MuiButton onClick={() => setIsBioDialogOpen(true)} size="small" sx={{ mt: 0.5, textTransform: 'none', padding: 0, fontWeight: 'bold' }}>さらに表示</MuiButton></Box>}
-              </Box>
-            )}
-          </Box>
+{profile.bio && (
+               <Box sx={{ mt: 2 }}>
+                 <Typography ref={bioRef} variant="h6" color="text.secondary" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: '1.5em', maxHeight: '4.5em', overflow: 'hidden' }}>{profile.bio}</Typography>
+                 {isBioOverflowing && <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}><MuiButton onClick={() => setIsBioDialogOpen(true)} size="small" sx={{ mt: 0.5, textTransform: 'none', padding: 0, fontWeight: 'bold' }}>さらに表示</MuiButton></Box>}
+               </Box>
+             )}
+             <Box sx={{ mt: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+               <Box>
+                 <Typography variant="caption" color="text.secondary" display="block">UserID</Typography>
+                 <Typography variant="body2" sx={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>{user.userID}</Typography>
+               </Box>
+               <IconButton size="small" onClick={handleCopyUserId} title={copiedId ? 'コピーしました' : 'UserIDをコピー'}>
+                 <CopyIcon fontSize="small" />
+               </IconButton>
+             </Box>
+           </Box>
         </Paper>
       )}
       <Dialog open={isBioDialogOpen} onClose={() => setIsBioDialogOpen(false)} maxWidth="md" fullWidth>

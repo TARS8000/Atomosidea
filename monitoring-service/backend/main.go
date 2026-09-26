@@ -16,6 +16,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -39,13 +40,31 @@ type LogMessage struct {
 }
 
 type ContainerInfo struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	Image   string    `json:"image"`
-	Status  string    `json:"status"`
-	State   string    `json:"state"`
-	Created time.Time `json:"created"`
-	IsError bool      `json:"isError"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Image        string   `json:"image"`
+	Status       string   `json:"status"`
+	State        string   `json:"state"`
+	Health       string   `json:"health"`
+	Created      time.Time `json:"created"`
+	StartedAt    string    `json:"startedAt"`
+	Uptime       string    `json:"uptime"`
+	RestartCount int       `json:"restartCount"`
+	Networks     []string  `json:"networks"`
+	IsError      bool      `json:"isError"`
+}
+
+type TopologyNode struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Networks []string `json:"networks"`
+}
+
+type VolumeInfo struct {
+	Name       string              `json:"name"`
+	Driver     string              `json:"driver"`
+	Mountpoint string              `json:"mountpoint"`
+	Labels     map[string]string   `json:"labels"`
 }
 
 type MinioItem struct {
@@ -89,6 +108,8 @@ func main() {
 	router.HandleFunc("/api/containers/stats", getContainerStats(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/restart/{name}", restartContainer(cli)).Methods("POST", "OPTIONS")
 	router.HandleFunc("/api/connections/count", getActiveUserCount(cli)).Methods("GET")
+	router.HandleFunc("/api/topology", getTopology(cli)).Methods("GET")
+	router.HandleFunc("/api/volumes", listVolumes(cli)).Methods("GET")
 
 	// ルーティング修正: パス変数とクエリパラメーターの両方に対応
 	router.HandleFunc("/ws/logs", serveWs(cli)).Methods("GET")
@@ -238,24 +259,139 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 		}
 
 		var containerInfos []ContainerInfo
-		for _, c := range containers {
-			name := strings.TrimPrefix(c.Names[0], "/")
-			createdTime := time.Unix(c.Created, 0)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
 
-			info := ContainerInfo{
-				ID:      c.ID[:12],
-				Name:    name,
-				Image:   c.Image,
-				Status:  c.Status,
-				State:   c.State,
-				Created: createdTime,
-				IsError: false,
-			}
-			containerInfos = append(containerInfos, info)
+		for _, c := range containers {
+			wg.Add(1)
+			go func(c types.Container) {
+				defer wg.Done()
+				name := strings.TrimPrefix(c.Names[0], "/")
+				createdTime := time.Unix(c.Created, 0)
+
+				meta := inspectContainerMeta(cli, c.ID)
+				info := ContainerInfo{
+					ID:           c.ID[:12],
+					Name:         name,
+					Image:        c.Image,
+					Status:       c.Status,
+					State:        c.State,
+					RestartCount: meta.restartCount,
+					Created:      createdTime,
+					Networks:     getContainerNetworks(cli, c.ID),
+					Health:       meta.health,
+					StartedAt:    meta.startedAt,
+					Uptime:       getContainerUptime(meta.startedAt),
+					IsError:      false,
+				}
+				mu.Lock()
+				containerInfos = append(containerInfos, info)
+				mu.Unlock()
+			}(c)
 		}
+		wg.Wait()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(containerInfos)
+	}
+}
+
+func getContainerNetworks(cli *client.Client, id string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return nil
+	}
+	networks := make([]string, 0, len(info.NetworkSettings.Networks))
+	for name := range info.NetworkSettings.Networks {
+		networks = append(networks, name)
+	}
+	return networks
+}
+
+type containerMeta struct {
+	restartCount int
+	health       string
+	startedAt    string
+}
+
+func inspectContainerMeta(cli *client.Client, id string) containerMeta {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := cli.ContainerInspect(ctx, id)
+	if err != nil || info.State == nil {
+		return containerMeta{}
+	}
+	var health string
+	if info.State.Health != nil {
+		health = info.State.Health.Status
+	}
+	var startedAt string
+	if info.State.StartedAt != "" {
+		startedAt = info.State.StartedAt
+	}
+	return containerMeta{
+		restartCount: int(info.RestartCount),
+		health:       health,
+		startedAt:    startedAt,
+	}
+}
+
+func getContainerUptime(startedAt string) string {
+	if startedAt == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+		return time.Since(t).Round(time.Second).String()
+	}
+	return ""
+}
+
+func getTopology(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		containers, err := cli.ContainerList(context.Background(), container.ListOptions{All: true})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to list containers: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		nodes := make([]TopologyNode, 0, len(containers))
+		for _, c := range containers {
+			name := strings.TrimPrefix(c.Names[0], "/")
+			nodes = append(nodes, TopologyNode{
+				ID:       c.ID[:12],
+				Name:     name,
+				Networks: getContainerNetworks(cli, c.ID),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(nodes)
+	}
+}
+
+func listVolumes(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		resp, err := cli.VolumeList(ctx, volume.ListOptions{})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to list volumes: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		vols := make([]VolumeInfo, 0, len(resp.Volumes))
+		for _, v := range resp.Volumes {
+			vols = append(vols, VolumeInfo{
+				Name:       v.Name,
+				Driver:     v.Driver,
+				Mountpoint: v.Mountpoint,
+				Labels:     v.Labels,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(vols)
 	}
 }
 

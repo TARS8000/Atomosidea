@@ -103,7 +103,7 @@ Atomosideaの永続層は、論理分離と物理分離の両方でリスクを�
 Discordの招待リンク風、トークン（URL）ベースのクローズドコンテンツ共有を管理します。`gen_random_uuid()`（`pgcrypto`）を使用。
 
 - **テーブル**
-  - `teams` — チーム。`id` UUID（PK）、`token` VARCHAR(24)（UNIQUE、base36・crypto/randで生成・約143ビットの熵）、`name` VARCHAR(255)（NOT NULL）、`description` TEXT、`is_public` BOOLEAN（デフォルト`false`）、`created_by` UUID、`created_at` タイスタンプ
+  - `teams` — チーム。`id` UUID（PK）、`token` VARCHAR(24)（UNIQUE、base36・crypto/randで生成・約143ビットの熵）、`name` VARCHAR(255)（NOT NULL）、`description` TEXT、`is_public` BOOLEAN（デフォルト`false`）、`auto_approve` BOOLEAN（デフォルト`false`）、`allow_member_invite` BOOLEAN（デフォルト`false`）、`created_by` UUID、`created_at` タイスタンプ
   - `team_members` — チーム所属。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`user_id` UUID、`role`（`owner`/`admin`/`member`、デフォルト`member`）、`joined_at` タイスタンプ。`UNIQUE(team_id, user_id)`
   - `team_content` — 既存コンテンツ（動画・ゲーム・static-site）をチームに紐付けるためのリンク表（Phase 2用）。`id` UUID（PK）、`team_id`（`teams.id`へのFK）、`content_type`、`content_id`、`created_at`
   - `team_posts` — チーム原生の投稿（Phase 1）。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`author_id` UUID、`title` VARCHAR(255)、`body` TEXT、`created_at` タイスタンプ
@@ -268,6 +268,7 @@ SFSP用MinIOは、アップロードAPI・SFSP API・各ワーカーごとに**�
 | `backend/auth/auth-datebase/auth-db/init.sql` | auth-dbのスキーマ・ロール・デフォルト管理者 |
 | `backend/datebase/app-db/init.sql` | app-dbの3テーブル・インデックス・トリガー・sfsp_worker権限 |
 | `backend/profile-service/profile-db/init.sql` | profile-dbのusersテーブル・テストデータ |
+| `backend/team-service/team-db/init.sql` | team-dbのteams/team_members/team_join_requests/team_content/team_postsスキーマ |
 | `backend/security/sfsp-db/001_sfsp_initial_schema.sql` | sfsp-dbのfiles/scan_jobs/scan_resultsスキーマ |
 
 ### MinIO初期化・ポリシー

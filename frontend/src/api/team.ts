@@ -6,8 +6,11 @@ export interface Team {
   name: string;
   description: string | null;
   is_public: boolean;
+  auto_approve: boolean;
+  allow_member_invite?: boolean;
   created_by: string | null;
   created_at: string;
+  _joined?: boolean;
 }
 
 export interface TeamPost {
@@ -26,14 +29,35 @@ export interface TeamMember {
   joined_at: string;
 }
 
+export interface JoinRequest {
+  id: string;
+  team_id: string;
+  user_id: string;
+  status: string;
+  requested_at: string;
+  reviewed_at: string;
+  reviewed_by: string;
+}
+
+export interface TeamPermission {
+  is_public: boolean;
+  can_view: boolean;
+  can_post: boolean;
+  role: string;
+}
+
 // axios interceptor (AuthContext) が Authorization ヘッダーを自動付与するため、
 // ここでは相対パスのみを指定する。
 export const teamApi = {
   listPublic: () => axios.get<Team[]>('/api/teams'),
   listMine: () => axios.get<Team[]>('/api/teams/mine'),
   get: (teamToken: string) => axios.get<Team>(`/api/teams/${teamToken}`),
-  create: (data: { name: string; description?: string; is_public?: boolean }) =>
+  create: (data: { name: string; description?: string; is_public?: boolean; auto_approve?: boolean }) =>
     axios.post<Team>('/api/teams', data),
+  update: (teamToken: string, data: { name?: string; description?: string; is_public?: boolean; auto_approve?: boolean; allow_member_invite?: boolean }) =>
+    axios.patch(`/api/teams/${teamToken}`, data),
+  deleteTeam: (teamToken: string) => axios.delete(`/api/teams/${teamToken}`),
+  permission: (teamToken: string) => axios.get<TeamPermission>(`/api/teams/${teamToken}/permission`),
   listPosts: (teamToken: string) => axios.get<TeamPost[]>(`/api/teams/${teamToken}/content`),
   getPost: (teamToken: string, postId: string) =>
     axios.get<TeamPost>(`/api/teams/${teamToken}/content/${postId}`),
@@ -44,9 +68,13 @@ export const teamApi = {
     axios.post(`/api/teams/${teamToken}/members`, { user_id: userId, role }),
   removeMember: (teamToken: string, userId: string) =>
     axios.delete(`/api/teams/${teamToken}/members/${userId}`),
-  updateTeam: (teamToken: string, data: { name?: string; description?: string; is_public?: boolean }) =>
-    axios.patch(`/api/teams/${teamToken}`, data),
-  deleteTeam: (teamToken: string) => axios.delete(`/api/teams/${teamToken}`),
+  join: (teamToken: string) => axios.post(`/api/teams/${teamToken}/join`),
+  listJoinRequests: (teamToken: string) =>
+    axios.get<JoinRequest[]>(`/api/teams/${teamToken}/join-requests`),
+  reviewJoinRequest: (teamToken: string, requestId: string, action: 'approve' | 'reject') =>
+    axios.patch(`/api/teams/${teamToken}/join-requests/${requestId}`, {}, { params: { action } }),
+  cancelJoinRequest: (teamToken: string) =>
+    axios.delete(`/api/teams/${teamToken}/join-requests`),
 };
 
 export const TEAM_ROLE_RANK: Record<string, number> = { owner: 3, admin: 2, member: 1 };

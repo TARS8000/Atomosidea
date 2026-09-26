@@ -109,6 +109,8 @@ type Team struct {
 	Name        string         `json:"name"`
 	Description NullableString `json:"description"`
 	IsPublic    bool           `json:"is_public"`
+	AutoApprove bool           `json:"auto_approve"`
+	AllowMemberInvite bool       `json:"allow_member_invite"`
 	CreatedBy   NullableString `json:"created_by"`
 	CreatedAt   time.Time      `json:"created_at"`
 }
@@ -117,9 +119,11 @@ type Team struct {
 func createTeamHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	var req struct {
-		Name        string `json:"name" binding:"required"`
-		Description string `json:"description"`
-		IsPublic    *bool  `json:"is_public"`
+		Name              string `json:"name" binding:"required"`
+		Description       string `json:"description"`
+		IsPublic          *bool  `json:"is_public"`
+		AutoApprove       *bool  `json:"auto_approve"`
+		AllowMemberInvite *bool  `json:"allow_member_invite"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
@@ -129,14 +133,26 @@ func createTeamHandler(c *gin.Context) {
 	if req.IsPublic != nil {
 		isPublic = *req.IsPublic
 	}
+	autoApprove := false
+	if req.AutoApprove != nil {
+		autoApprove = *req.AutoApprove
+	}
+	// 自動認証は公開チームのみ有効。非公開チームでは強制的に false。
+	if !isPublic {
+		autoApprove = false
+	}
+	allowMemberInvite := false
+	if req.AllowMemberInvite != nil {
+		allowMemberInvite = *req.AllowMemberInvite
+	}
 
 	token := generateToken()
 	var team Team
 	for i := 0; i < 5; i++ {
 		err := dbTeam.QueryRow(c.Request.Context(),
-			"INSERT INTO teams (token, name, description, is_public, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING id, token, name, description, is_public, created_by, created_at",
-			token, req.Name, req.Description, isPublic, userID).
-			Scan(&team.ID, &team.Token, &team.Name, &team.Description, &team.IsPublic, &team.CreatedBy, &team.CreatedAt)
+			"INSERT INTO teams (token, name, description, is_public, auto_approve, allow_member_invite, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, token, name, description, is_public, auto_approve, allow_member_invite, created_by, created_at",
+			token, req.Name, req.Description, isPublic, autoApprove, allowMemberInvite, userID).
+			Scan(&team.ID, &team.Token, &team.Name, &team.Description, &team.IsPublic, &team.AutoApprove, &team.AllowMemberInvite, &team.CreatedBy, &team.CreatedAt)
 		if err != nil {
 			if strings.Contains(err.Error(), "unique") {
 				token = generateToken()
@@ -160,8 +176,8 @@ func getTeamByTokenHandler(c *gin.Context) {
 	token := c.Param("token")
 	t := &Team{}
 	err := dbTeam.QueryRow(c.Request.Context(),
-		"SELECT id, token, name, description, is_public, created_by, created_at FROM teams WHERE token = $1",
-		token).Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.CreatedBy, &t.CreatedAt)
+		"SELECT id, token, name, description, is_public, auto_approve, allow_member_invite, created_by, created_at FROM teams WHERE token = $1",
+		token).Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.AutoApprove, &t.AllowMemberInvite, &t.CreatedBy, &t.CreatedAt)
 	if err == pgx.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
 		return
@@ -176,7 +192,7 @@ func getTeamByTokenHandler(c *gin.Context) {
 // listPublicTeamsHandler: no auth. List public teams.
 func listPublicTeamsHandler(c *gin.Context) {
 	rows, err := dbTeam.Query(c.Request.Context(),
-		"SELECT id, token, name, description, is_public, created_by, created_at FROM teams WHERE is_public = true ORDER BY created_at DESC")
+		"SELECT id, token, name, description, is_public, auto_approve, allow_member_invite, created_by, created_at FROM teams WHERE is_public = true ORDER BY created_at DESC")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -185,7 +201,7 @@ func listPublicTeamsHandler(c *gin.Context) {
 	var teams []Team
 	for rows.Next() {
 		t := &Team{}
-		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.CreatedBy, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.AutoApprove, &t.AllowMemberInvite, &t.CreatedBy, &t.CreatedAt); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -198,7 +214,7 @@ func listPublicTeamsHandler(c *gin.Context) {
 func listMyTeamsHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	rows, err := dbTeam.Query(c.Request.Context(),
-		"SELECT t.id, t.token, t.name, t.description, t.is_public, t.created_by, t.created_at FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = $1 ORDER BY t.created_at DESC",
+		"SELECT t.id, t.token, t.name, t.description, t.is_public, t.auto_approve, t.allow_member_invite, t.created_by, t.created_at FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = $1 ORDER BY t.created_at DESC",
 		userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -208,7 +224,7 @@ func listMyTeamsHandler(c *gin.Context) {
 	var teams []Team
 	for rows.Next() {
 		t := &Team{}
-		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.CreatedBy, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.AutoApprove, &t.AllowMemberInvite, &t.CreatedBy, &t.CreatedAt); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -343,9 +359,11 @@ func updateTeamHandler(c *gin.Context) {
 	}
 	token := c.Param("token")
 	var req struct {
-		Name        string         `json:"name"`
-		Description sql.NullString `json:"description"`
-		IsPublic    *bool          `json:"is_public"`
+		Name                string   `json:"name"`
+		Description         *string  `json:"description"`
+		IsPublic            *bool    `json:"is_public"`
+		AutoApprove         *bool    `json:"auto_approve"`
+		AllowMemberInvite   *bool    `json:"allow_member_invite"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -363,6 +381,19 @@ func updateTeamHandler(c *gin.Context) {
 	if req.IsPublic != nil {
 		set = append(set, "is_public = $"+strconv.Itoa(len(args)+1))
 		args = append(args, *req.IsPublic)
+	}
+	if req.AutoApprove != nil {
+		// 自動認証は公開チームのみ有効。非公開に切り替える場合は強制的に false。
+		val := *req.AutoApprove
+		if req.IsPublic != nil && !*req.IsPublic {
+			val = false
+		}
+		set = append(set, "auto_approve = $"+strconv.Itoa(len(args)+1))
+		args = append(args, val)
+	}
+	if req.AllowMemberInvite != nil {
+		set = append(set, "allow_member_invite = $"+strconv.Itoa(len(args)+1))
+		args = append(args, *req.AllowMemberInvite)
 	}
 	if len(set) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
@@ -391,12 +422,23 @@ func deleteTeamHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "team deleted"})
 }
 
+// JoinRequest は承認型加入リクエストを表します。
+type JoinRequest struct {
+	ID          string         `json:"id"`
+	TeamID      string         `json:"team_id"`
+	UserID      string         `json:"user_id"`
+	Status      string         `json:"status"`
+	RequestedAt time.Time      `json:"requested_at"`
+	ReviewedAt  NullableString `json:"reviewed_at"`
+	ReviewedBy  NullableString `json:"reviewed_by"`
+}
+
 // resolveTeam: no auth. Fetch a team by token. Returns nil and writes a response if not found.
 func resolveTeam(c *gin.Context, token string) *Team {
 	t := &Team{}
 	err := dbTeam.QueryRow(c.Request.Context(),
-		"SELECT id, token, name, description, is_public, created_by, created_at FROM teams WHERE token = $1",
-		token).Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.CreatedBy, &t.CreatedAt)
+		"SELECT id, token, name, description, is_public, auto_approve, allow_member_invite, created_by, created_at FROM teams WHERE token = $1",
+		token).Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.AutoApprove, &t.AllowMemberInvite, &t.CreatedBy, &t.CreatedAt)
 	if err == pgx.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
 		return nil
@@ -556,6 +598,175 @@ func getPostHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, post)
 }
 
+// joinRequestHandler: JWT auth. Join a team.
+// Public + auto_approve: immediately inserts into team_members.
+// Otherwise: inserts a pending join request (or rejects if already member/pending).
+func joinRequestHandler(c *gin.Context) {
+	token := c.Param("token")
+	team := resolveTeam(c, token)
+	if team == nil {
+		return
+	}
+	if !verifyToken(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	userID := c.GetString("userID")
+
+	// 既にメンバーか？
+	var existingRole string
+	err := dbTeam.QueryRow(c.Request.Context(),
+		"SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2", team.ID, userID).Scan(&existingRole)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "already_member", "role": existingRole})
+		return
+	}
+	if err != pgx.ErrNoRows {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自動承認（公開チームかつ auto_approve）
+	if team.IsPublic && team.AutoApprove {
+		role := "member"
+		_, err := dbTeam.Exec(c.Request.Context(),
+			"INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+			team.ID, userID, role)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "approved", "role": role})
+		return
+	}
+
+	// 非公開チームは加入自体を拒否
+	if !team.IsPublic {
+		c.JSON(http.StatusForbidden, gin.H{"error": "private team cannot be joined"})
+		return
+	}
+
+	// 公開チームかつ手動承認: リクエスト作成（重複は unique 制約で防ぐ）
+	var reqID string
+	err = dbTeam.QueryRow(c.Request.Context(),
+		"INSERT INTO team_join_requests (team_id, user_id, status) VALUES ($1,$2,'pending') RETURNING id",
+		team.ID, userID).Scan(&reqID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "pending", "request_id": reqID})
+}
+
+// listJoinRequestsHandler: JWT auth, owner/admin only.
+func listJoinRequestsHandler(c *gin.Context) {
+	token := c.Param("token")
+	if !requireTeamRole(c, "admin") {
+		return
+	}
+	rows, err := dbTeam.Query(c.Request.Context(),
+		"SELECT id, team_id, user_id, status, requested_at, reviewed_at, reviewed_by FROM team_join_requests WHERE team_id = (SELECT id FROM teams WHERE token = $1) ORDER BY requested_at DESC",
+		token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var reqs []JoinRequest
+	for rows.Next() {
+		var r JoinRequest
+		if err := rows.Scan(&r.ID, &r.TeamID, &r.UserID, &r.Status, &r.RequestedAt, &r.ReviewedAt, &r.ReviewedBy); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		reqs = append(reqs, r)
+	}
+	c.JSON(http.StatusOK, reqs)
+}
+
+// reviewJoinRequestHandler: JWT auth, owner/admin only. Approve or reject a join request.
+func reviewJoinRequestHandler(c *gin.Context) {
+	token := c.Param("token")
+	if !requireTeamRole(c, "admin") {
+		return
+	}
+	requestID := c.Param("requestId")
+	action := c.Query("action") // "approve" or "reject"
+	if action != "approve" && action != "reject" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action=approve or action=reject is required"})
+		return
+	}
+	userID := c.GetString("userID")
+	newStatus := "approved"
+	if action == "reject" {
+		newStatus = "rejected"
+	}
+	_, err := dbTeam.Exec(c.Request.Context(),
+		"UPDATE team_join_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3 AND team_id = (SELECT id FROM teams WHERE token = $4)",
+		newStatus, userID, requestID, token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if action == "approve" {
+		_, err = dbTeam.Exec(c.Request.Context(),
+			"INSERT INTO team_members (team_id, user_id, role) VALUES ((SELECT id FROM teams WHERE token = $1), $2, 'member') ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+			token, userID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"status": newStatus})
+}
+
+// cancelJoinRequestHandler: JWT auth. Cancel own pending join request.
+func cancelJoinRequestHandler(c *gin.Context) {
+	token := c.Param("token")
+	if !verifyToken(c) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	userID := c.GetString("userID")
+	_, err := dbTeam.Exec(c.Request.Context(),
+		"UPDATE team_join_requests SET status = 'cancelled' WHERE team_id = (SELECT id FROM teams WHERE token = $1) AND user_id = $2 AND status = 'pending'",
+		token, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "join request cancelled"})
+}
+
+// teamPermissionHandler: returns what the caller can do with a team.
+// No auth required: public teams are viewable by anyone.
+// Posting requires membership (member+).
+func teamPermissionHandler(c *gin.Context) {
+	token := c.Param("token")
+	team := resolveTeam(c, token)
+	if team == nil {
+		return
+	}
+	resp := gin.H{"is_public": team.IsPublic, "can_view": true, "can_post": false, "role": ""}
+	if !team.IsPublic {
+		resp["can_view"] = false
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	if !verifyToken(c) {
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	role, ok := callerRole(c, token)
+	if ok {
+		resp["role"] = role
+		if roleRank(role) >= roleRank("member") {
+			resp["can_post"] = true
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 func main() {
 	dbTeam = connectDB(os.Getenv("TEAM_DATABASE_URL"))
 	if os.Getenv("APP_DATABASE_URL") != "" {
@@ -570,6 +781,7 @@ func main() {
 		api.GET("/mine", authMiddleware(), listMyTeamsHandler)
 		api.POST("", authMiddleware(), createTeamHandler)
 		api.GET("/:token", getTeamByTokenHandler)
+		api.GET("/:token/permission", teamPermissionHandler)
 		api.GET("/:token/members", authMiddleware(), getMembersHandler)
 		api.POST("/:token/members", authMiddleware(), addMemberHandler)
 		api.DELETE("/:token/members/:userId", authMiddleware(), removeMemberHandler)
@@ -578,6 +790,10 @@ func main() {
 		api.POST("/:token/content", authMiddleware(), createPostHandler)
 		api.GET("/:token/content", listPostsHandler)
 		api.GET("/:token/content/:contentID", getPostHandler)
+		api.POST("/:token/join", authMiddleware(), joinRequestHandler)
+		api.GET("/:token/join-requests", authMiddleware(), listJoinRequestsHandler)
+		api.PATCH("/:token/join-requests/:requestId", authMiddleware(), reviewJoinRequestHandler)
+		api.DELETE("/:token/join-requests", authMiddleware(), cancelJoinRequestHandler)
 	}
 
 	log.Println("team-service listening on :8080")
