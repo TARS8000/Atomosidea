@@ -359,13 +359,23 @@ const getContainerGroup = (name) => {
   return 'Unknown';
 };
 
-const groupLabelMap = { UI: 'Frontend', API: 'Backend/API', Workers: 'Workers', DB: 'DB/Cache', Storage: 'Storage', Unknown: 'Other' };
+const groupLabelMap = { UI: 'Frontend', Backend: 'Backend', DB: 'DB/Cache', Storage: 'Storage' };
 
 const SRC_LAYERS = new Set(['UI', 'API']);
 const DEP_LAYERS = new Set(['Workers', 'DB', 'Storage', 'Unknown']);
 const SYSTEM_CONTAINERS = new Set(['mon-backend', 'mon-nginx', 'mon-frontend-builder']);
 
-const isSystemContainer = (name) => SYSTEM_CONTAINERS.has(name) || (name || '').startsWith('mon-') || /-builder$/.test(name);
+// プロジェクト所属外のコンテナ（監視対象外）
+const EXTERNAL_CONTAINERS = new Set(['ba_halo_db', 'ba_halo_worker', 'open-webui']);
+
+const isSystemContainer = (name) => SYSTEM_CONTAINERS.has(name) || (name || '').startsWith('mon-') || /-builder$/.test(name) || EXTERNAL_CONTAINERS.has(name);
+
+// 同一サービス群の共通接頭辞抽出（game-upload-api/game-worker -> "game"、sfsp-api/sfsp-worker/sfsp-db -> "sfsp"）
+const getBaseName = (name) => {
+  let n = name.replace(/^atmosidea-/i, '');
+  n = n.replace(/-(service|db|worker|storage|upload-api|api|builder)$/i, '');
+  return n || name;
+};
 
 const networkColor = (nets) => {
   if (!nets || nets.length === 0) return '#06b6d4';
@@ -610,10 +620,9 @@ export default function App() {
     }
   };
 
-  // --- ベース名ごとの縦積み列のレイアウト配置設定 ---
-  // 同種（game/video/sfsp等、接頭辞が同じ）のコンテナを1列として縦積み。
-  // 列内は層順（API→Workers→DB→Storage）→名前の順で固定し、upload-serviceの上に対応workerが来る。
-  // 列が画面幅を超えたら次のバンドに折り返し、1画面（幅高揃い）に収める。
+  // --- グリッド配置：横軸=カテゴリ（game等）、縦軸=サービス種別（Frontend/Backend/Workers/DB/Storage）---
+  // 同種（game/video/sfsp等、接頭辞が同じ）のコンテナを1列（縦列）として、層順（API→Workers→DB→Storage）で縦積み。
+  // 行（横列）はサービス種別でくくり、各カテゴリ列で縦積みを揃えて整列させる。
   const { containerPositions, layersLayout, canvasSize } = useMemo(() => {
     const cardW = 176; // w-44
     const cardH = 96; // h-24
@@ -621,70 +630,95 @@ export default function App() {
     const colGap = 40;
     const leftMargin = 96;
     const topMargin = 84;
+    const rowLabelWidth = 160; // 縦軸ラベル用
     const positions = {};
 
     // 利用可能幅（右HUDパネル＋余白を除外）
     const availW = Math.max(900, (typeof window !== 'undefined' ? window.innerWidth : 1600) - 280);
 
-    // サービスタイプ（レイヤー）ごとに分類。層順（UI→API→Workers→DB→Storage）で固定。
-    const groupOrder = ['UI', 'API', 'Workers', 'DB', 'Storage', 'Unknown'];
-    const byGroup = {};
-    groupOrder.forEach(g => byGroup[g] = []);
+    // 縦軸：サービス種別（層順）。Frontend最上段、Backend（API+Workers）その下。
+    const rowOrder = ['UI', 'Backend', 'DB', 'Storage'];
+    // コンテナグループをグリッド行にマッピング（APIとWorkersを統合）
+    const rowMap = { UI: 'UI', API: 'Backend', Workers: 'Backend', DB: 'DB', Storage: 'Storage', Unknown: 'Storage' };
+
+    // 横軸：カテゴリ（接頭辞）を抽出して昇順で固定
+    const categories = new Set();
     containers.forEach(c => {
       if (isSystemContainer(c.name)) return;
-      const group = getContainerGroup(c.name);
-      if (!byGroup[group]) byGroup[group] = [];
-      byGroup[group].push(c);
+      categories.add(getBaseName(c.name));
+    });
+    const catList = [...categories].sort((a, b) => a.localeCompare(b));
+
+    // 各セル（カテゴリ×サービス種別）にコンテナを配置
+    const grid = {};
+    catList.forEach(cat => {
+      grid[cat] = {};
+      rowOrder.forEach(row => grid[cat][row] = []);
+    });
+    containers.forEach(c => {
+      if (isSystemContainer(c.name)) return;
+      const cat = getBaseName(c.name);
+      const row = rowMap[getContainerGroup(c.name)] ?? 'Storage';
+      if (!grid[cat][row]) grid[cat][row] = [];
+      grid[cat][row].push(c);
     });
 
-    // 各グループ内は層順→名前の順でソート（upload-serviceの上にworkerが来る）
-    const colInfo = {};
-    groupOrder.forEach(group => {
-      const members = byGroup[group].sort((a, b) => {
-        const la = MONITOR_LAYERS[getContainerGroup(a.name)]?.row ?? 99;
-        const lb = MONITOR_LAYERS[getContainerGroup(b.name)]?.row ?? 99;
-        if (la !== lb) return la - lb;
-        return a.name.localeCompare(b.name);
+    // 各カテゴリ列の最大高を計算（層順に積み）
+    const catHeights = {};
+    catList.forEach(cat => {
+      let maxH = 0;
+      rowOrder.forEach(row => {
+        const members = grid[cat][row];
+        maxH = Math.max(maxH, members.length * (cardH + gap) - gap);
       });
-      colInfo[group] = { members, height: members.length };
+      catHeights[cat] = maxH;
     });
 
-    // 空でないグループのみ列として使用
-    const cols = groupOrder.filter(g => colInfo[g].members.length > 0);
-
-    // 列を幅で貪欲パック（バンドに折り返し）
+    // 列を幅で貪欲パック（1画面に収める）
     const bands = [];
     let cur = [], curW = 0;
-    cols.forEach(group => {
+    catList.forEach(cat => {
       const w = cardW;
       if (cur.length && curW + colGap + w > availW) { bands.push(cur); cur = []; curW = 0; }
-      cur.push(group);
+      cur.push(cat);
       curW += (cur.length > 1 ? colGap : 0) + w;
     });
     if (cur.length) bands.push(cur);
 
-    // 各バンド・各列を縦積み配置
+    // グリッド配置
     let cursorY = topMargin;
-    let canvasWidth = leftMargin + cardW;
-    const bandsMeta = [];
+    let canvasWidth = leftMargin + rowLabelWidth + cardW;
+    const gridMeta = [];
+
     bands.forEach(bandList => {
+      // 各カテゴリ列の最大高で縦位置を揃える
       let bandHeight = 0;
-      bandList.forEach((group, k) => {
-        const x = leftMargin + k * (cardW + colGap);
-        colInfo[group].members.forEach((c, idx) => {
-          positions[c.name] = { x, y: cursorY + idx * (cardH + gap) };
-        });
-        bandHeight = Math.max(bandHeight, colInfo[group].height * cardH + (colInfo[group].height - 1) * gap);
+      bandList.forEach(cat => {
+        bandHeight = Math.max(bandHeight, catHeights[cat]);
       });
-      canvasWidth = Math.max(canvasWidth, leftMargin + bandList.length * (cardW + colGap) - colGap + 28);
-      bandsMeta.push({ top: cursorY, groups: bandList });
-      cursorY += bandHeight + 48; // 次バンド用のスペース（ラベル行含む）
+
+      bandList.forEach((cat, k) => {
+        const x = leftMargin + rowLabelWidth + k * (cardW + colGap);
+        // 縦列を層順に積み（各セルを配置）
+        let rowY = cursorY;
+        rowOrder.forEach(row => {
+          const members = grid[cat][row];
+          members.forEach((c, idx) => {
+            positions[c.name] = { x, y: rowY + idx * (cardH + gap) };
+          });
+          rowY += members.length * (cardH + gap);
+        });
+        gridMeta.push({ cat, x });
+      });
+
+      canvasWidth = Math.max(canvasWidth, leftMargin + rowLabelWidth + bandList.length * (cardW + colGap) - colGap + 28);
+      cursorY += bandHeight + 48; // 次バンド用のスペース
     });
     const canvasHeight = cursorY + 28;
 
     return {
       containerPositions: positions,
-      layersLayout: { bandsMeta, cardH, gap },
+      layersLayout: { gridMeta, rowOrder, cardH, gap },
       canvasSize: { width: canvasWidth, height: canvasHeight }
     };
   }, [containers]);
@@ -797,22 +831,29 @@ export default function App() {
           ))}
         </svg>
 
-        {/* ベース名ラベル（各列の上）& ノードレンダリング */}
+        {/* グリッドラベル（縦軸=サービス種別、横軸=カテゴリ）& ノードレンダリング */}
         <div className="relative w-full h-full z-10">
-          {layersLayout.bandsMeta.map((band, bi) =>
-            band.groups.map((group, k) => {
-              const x = 96 + k * (176 + 40);
-              return (
-                <div
-                  key={`${bi}-${group}`}
-                  className="absolute flex items-center gap-2 text-cyan-400/70 font-mono"
-                  style={{ top: `${band.top - 20}px`, left: `${x}px`, fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
-                >
-                  <h2 className="uppercase tracking-widest text-cyan-400/80">{groupLabelMap[group] || group}</h2>
-                </div>
-              );
-            })
-          )}
+          {/* 縦軸ラベル（サービス種別） */}
+          {layersLayout.rowOrder.map((row, i) => (
+            <div
+              key={`row-${row}`}
+              className="absolute flex items-center gap-2 text-cyan-400/60 font-mono"
+              style={{ top: `${84 + i * (96 + 12) - 8}px`, left: '16px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
+            >
+              <h2 className="uppercase tracking-widest text-cyan-400/70">{groupLabelMap[row] || row}</h2>
+            </div>
+          ))}
+
+          {/* 横軸ラベル（カテゴリ） */}
+          {layersLayout.gridMeta.map(({ cat, x }) => (
+            <div
+              key={`cat-${cat}`}
+              className="absolute flex items-center gap-2 text-cyan-400/70 font-mono"
+              style={{ top: '4px', left: `${x - 30}px`, fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
+            >
+              <h2 className="uppercase tracking-widest text-cyan-400/80">{cat}</h2>
+            </div>
+          ))}
 
           {containers.filter(c => !isSystemContainer(c.name)).map(c => (
             <ContainerNode
