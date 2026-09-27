@@ -105,13 +105,13 @@ const SystemLoadMonitor = ({ totalCpu, totalMemUsageGB, totalMemLimitGB }) => {
 
 
 // --- Component: ConnectionLine (縦方向 上→下 ルーティング) ---
-const ConnectionLine = ({ from, to, isActive, hasError, networks }) => {
+const ConnectionLine = ({ from, to, isActive, hasError, networks, cardW }) => {
   if (!from || !to) return null;
 
-  // 上から下への配線：送信元の「下端中央」 -> 送信先の「上端中央」
-  const startX = from.x + 96;  // ノード幅 192px の中央
-  const startY = from.y + 96;  // ノード高さ 96px の下端
-  const endX = to.x + 96;
+  // 上から下への配線：送信元の「下端中央」 -> 送信先の「上端中央」（カード幅は可変）
+  const startX = from.x + cardW / 2;
+  const startY = from.y + 96;
+  const endX = to.x + cardW / 2;
   const endY = to.y;           // ノードの上端
 
   // 縦方向の直角（Orthogonal）配線パス
@@ -158,7 +158,7 @@ const ConnectionLine = ({ from, to, isActive, hasError, networks }) => {
 };
 
 // --- Component: ContainerNode ---
-const ContainerNode = ({ container, onClick, isActive, hasError, position, stats, health, restartCount, uptime }) => {
+const ContainerNode = ({ container, onClick, isActive, hasError, position, stats, health, restartCount, uptime, cardW }) => {
   const isRunning = container.state === 'running';
   const isStarting = container.state === 'starting' || container.state === 'restarting';
   const isUnhealthy = health === 'unhealthy';
@@ -192,7 +192,7 @@ const ContainerNode = ({ container, onClick, isActive, hasError, position, stats
         <div className="absolute -inset-1 bg-cyan-500/20 rounded-lg blur-sm animate-pulse" />
       )}
 
-      <div className={`w-44 h-24 p-2 bg-slate-950/85 backdrop-blur-md border ${themeBorder} cyber-card hover:border-cyan-400 transition-all shadow-xl relative overflow-hidden flex flex-col justify-between`}>
+      <div className={`h-24 p-2 bg-slate-950/85 backdrop-blur-md border ${themeBorder} cyber-card hover:border-cyan-400 transition-all shadow-xl relative overflow-hidden flex flex-col justify-between`} style={{ width: cardW + 'px' }}>
         <div className="absolute inset-0 bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.3)_50%)] bg-[length:100%_4px] pointer-events-none opacity-40" />
 
         <div className="flex justify-between items-start relative z-10">
@@ -359,7 +359,7 @@ const getContainerGroup = (name) => {
   return 'Unknown';
 };
 
-const groupLabelMap = { UI: 'Frontend', Backend: 'Backend', DB: 'DB/Cache', Storage: 'Storage' };
+const groupLabelMap = { UI: 'Frontend', API: 'API', Upload: 'Upload', Worker: 'Worker', DB: 'DB/Cache', Storage: 'Storage' };
 
 const SRC_LAYERS = new Set(['UI', 'API']);
 const DEP_LAYERS = new Set(['Workers', 'DB', 'Storage', 'Unknown']);
@@ -415,6 +415,7 @@ const VolumesModal = ({ onClose, volumes }) => (
 // --- Main App Component ---
 export default function App() {
   const [containers, setContainers] = useState([]);
+  const [viewportWidth, setViewportWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 1920));
   const [containerStats, setContainerStats] = useState({});
   const [selectedContainer, setSelectedContainer] = useState(null);
   const [activeTab, setActiveTab] = useState('logs');
@@ -441,6 +442,13 @@ export default function App() {
   const pulseTimeoutsRef = useRef({});
   const reconnectTimeoutsRef = useRef({});
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const fetchContainers = useCallback(async () => {
     try {
@@ -620,26 +628,36 @@ export default function App() {
     }
   };
 
-  // --- グリッド配置：横軸=カテゴリ（game等）、縦軸=サービス種別（Frontend/Backend/Workers/DB/Storage）---
+// --- グリッド配置：横軸=カテゴリ（game等）、縦軸=サービス種別（Frontend/Backend/Workers/DB/Storage）---
   // 同種（game/video/sfsp等、接頭辞が同じ）のコンテナを1列（縦列）として、層順（API→Workers→DB→Storage）で縦積み。
   // 行（横列）はサービス種別でくくり、各カテゴリ列で縦積みを揃えて整列させる。
-  const { containerPositions, layersLayout, canvasSize } = useMemo(() => {
-    const cardW = 176; // w-44
-    const cardH = 96; // h-24
-    const gap = 12;
-    const colGap = 40;
+  // カード幅は画面幅に対して単一バンド（6行）が収まるよう可変（minCardW~maxCardW）。
+  const { containerPositions, layersLayout, canvasSize, cardW } = useMemo(() => {
+    // 単一バンド（全カテゴリを1行に配置）。カード幅は画面幅から算出（固定値ではない）
+    const cardH = 96;
+    const gap = 8;
+    const colGap = 4;
     const leftMargin = 96;
     const topMargin = 84;
-    const rowLabelWidth = 160; // 縦軸ラベル用
+    const rowLabelWidth = 120; // 縦軸ラベル用
+    const rightMargin = 320; // 右余白（HUDパネル分を含む）
+    const minCardW = 84; // カードの最小幅（可読性維持）
+    const maxCardW = 130; // カードの最大幅
     const positions = {};
 
-    // 利用可能幅（右HUDパネル＋余白を除外）
-    const availW = Math.max(900, (typeof window !== 'undefined' ? window.innerWidth : 1600) - 280);
-
-    // 縦軸：サービス種別（層順）。Frontend最上段、Backend（API+Workers）その下。
-    const rowOrder = ['UI', 'Backend', 'DB', 'Storage'];
-    // コンテナグループをグリッド行にマッピング（APIとWorkersを統合）
-    const rowMap = { UI: 'UI', API: 'Backend', Workers: 'Backend', DB: 'DB', Storage: 'Storage', Unknown: 'Storage' };
+    // 縦軸：サービス種別（層順）。Frontend最上段→Backend(API)→Upload→Worker→DB→Storage
+    const rowOrder = ['UI', 'API', 'Upload', 'Worker', 'DB', 'Storage'];
+    // コンテナグループをグリッド行にマッピング（UploadとWorkerを分離）
+    const rowMap = { UI: 'UI', API: 'API', Workers: 'Workers', DB: 'DB', Storage: 'Storage', Unknown: 'Storage' };
+    const getGridRow = (name) => {
+      const group = getContainerGroup(name);
+      if (group === 'Workers') {
+        const n = name.toLowerCase();
+        if (n.includes('upload')) return 'Upload';
+        return 'Worker';
+      }
+      return rowMap[group] ?? 'Storage';
+    };
 
     // 横軸：カテゴリ（接頭辞）を抽出して昇順で固定
     const categories = new Set();
@@ -648,6 +666,12 @@ export default function App() {
       categories.add(getBaseName(c.name));
     });
     const catList = [...categories].sort((a, b) => a.localeCompare(b));
+
+    // 単一バンドを維持したまま、画面幅に収まるようカード幅を可変（FHDで端から端にならないよう余白込み）
+    const usableWidth = Math.max(500, viewportWidth - leftMargin - rowLabelWidth - rightMargin);
+    const cardW = Math.min(maxCardW, Math.max(minCardW, Math.floor(usableWidth / Math.max(1, catList.length)) - colGap));
+    const colWidth = cardW + colGap; // 列幅（カード＋列間隔）
+    const rowH = cardH + gap; // 行高（カード＋行間隔）
 
     // 各セル（カテゴリ×サービス種別）にコンテナを配置
     const grid = {};
@@ -658,71 +682,40 @@ export default function App() {
     containers.forEach(c => {
       if (isSystemContainer(c.name)) return;
       const cat = getBaseName(c.name);
-      const row = rowMap[getContainerGroup(c.name)] ?? 'Storage';
+      const row = getGridRow(c.name);
       if (!grid[cat][row]) grid[cat][row] = [];
       grid[cat][row].push(c);
     });
 
-    // 各カテゴリ列の最大高を計算（層順に積み）
-    const catHeights = {};
-    catList.forEach(cat => {
-      let maxH = 0;
-      rowOrder.forEach(row => {
-        const members = grid[cat][row];
-        maxH = Math.max(maxH, members.length * (cardH + gap) - gap);
-      });
-      catHeights[cat] = maxH;
-    });
-
-    // 列を幅で貪欲パック（1画面に収める）
-    const bands = [];
-    let cur = [], curW = 0;
-    catList.forEach(cat => {
-      const w = cardW;
-      if (cur.length && curW + colGap + w > availW) { bands.push(cur); cur = []; curW = 0; }
-      cur.push(cat);
-      curW += (cur.length > 1 ? colGap : 0) + w;
-    });
-    if (cur.length) bands.push(cur);
-
-    // グリッド配置
-    let cursorY = topMargin;
-    let canvasWidth = leftMargin + rowLabelWidth + cardW;
+    // グリッド配置（単一バンド。行は固定スロットで全列を縦揃え。空行も高さを確保）
+    const cursorY = topMargin;
+    const canvasWidth = Math.max(leftMargin + rowLabelWidth + cardW, leftMargin + rowLabelWidth + catList.length * colWidth - colGap + 28);
     const gridMeta = [];
+    const bandTops = [cursorY];
 
-    bands.forEach(bandList => {
-      // 各カテゴリ列の最大高で縦位置を揃える
-      let bandHeight = 0;
-      bandList.forEach(cat => {
-        bandHeight = Math.max(bandHeight, catHeights[cat]);
-      });
-
-      bandList.forEach((cat, k) => {
-        const x = leftMargin + rowLabelWidth + k * (cardW + colGap);
-        // 縦列を層順に積み（各セルを配置）
-        let rowY = cursorY;
-        rowOrder.forEach(row => {
-          const members = grid[cat][row];
-          members.forEach((c, idx) => {
-            positions[c.name] = { x, y: rowY + idx * (cardH + gap) };
-          });
-          rowY += members.length * (cardH + gap);
+    catList.forEach((cat, k) => {
+      const colStart = leftMargin + rowLabelWidth + k * colWidth;
+      const x = colStart;
+      rowOrder.forEach((row, i) => {
+        const members = grid[cat][row];
+        members.forEach((c) => {
+          const slotTop = cursorY + i * rowH;
+          const y = slotTop + (rowH - cardH) / 2;
+          positions[c.name] = { x, y };
         });
-        gridMeta.push({ cat, x });
       });
-
-      canvasWidth = Math.max(canvasWidth, leftMargin + rowLabelWidth + bandList.length * (cardW + colGap) - colGap + 28);
-      cursorY += bandHeight + 48; // 次バンド用のスペース
+      gridMeta.push({ cat, x: colStart, y: cursorY, colWidth });
     });
-    const canvasHeight = cursorY + 28;
+
+    const canvasHeight = cursorY + rowOrder.length * rowH + 28;
 
     return {
       containerPositions: positions,
-      layersLayout: { gridMeta, rowOrder, cardH, gap },
-      canvasSize: { width: canvasWidth, height: canvasHeight }
+      layersLayout: { gridMeta, bandTops, rowOrder, cardH, gap },
+      canvasSize: { width: canvasWidth, height: canvasHeight },
+      cardW
     };
-  }, [containers]);
-
+  }, [containers, viewportWidth]);
   // --- 接続ポロジー（ネットワーク共有から動的生成）---
   const connections = useMemo(() => {
     const netIndex = {};
@@ -816,7 +809,7 @@ export default function App() {
         />
       </div>
 
-      <div className="w-full h-full relative overflow-hidden" style={{ minWidth: canvasSize.width, minHeight: canvasSize.height }}>
+      <div className="w-full h-full relative overflow-visible" style={{ minWidth: canvasSize.width, minHeight: canvasSize.height }}>
         {/* SVG パケット接続線 */}
         <svg className="absolute top-0 left-0 w-full h-full" style={{ zIndex: 1 }}>
           {connections.map((conn, i) => (
@@ -826,34 +819,51 @@ export default function App() {
               to={containerPositions[conn.to]}
               isActive={!!(activeLogsMap[conn.from] || activeLogsMap[conn.to])}
               hasError={!!(errorLogsMap[conn.from] || errorLogsMap[conn.to])}
-              networks={conn.networks}
-            />
+networks={conn.networks}
+               cardW={cardW}
+             />
           ))}
         </svg>
 
         {/* グリッドラベル（縦軸=サービス種別、横軸=カテゴリ）& ノードレンダリング */}
         <div className="relative w-full h-full z-10">
-          {/* 縦軸ラベル（サービス種別） */}
-          {layersLayout.rowOrder.map((row, i) => (
-            <div
-              key={`row-${row}`}
-              className="absolute flex items-center gap-2 text-cyan-400/60 font-mono"
-              style={{ top: `${84 + i * (96 + 12) - 8}px`, left: '16px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
-            >
-              <h2 className="uppercase tracking-widest text-cyan-400/70">{groupLabelMap[row] || row}</h2>
-            </div>
-          ))}
+{/* 縦軸ラベル（サービス種別）。層構造は全バンドで共通のため1セットのみ描画（1バンド目の行に合わせ全バンドの行と整列）*/}
+            {(() => {
+              const rowH = layersLayout.cardH + layersLayout.gap;
+              const bandTop = layersLayout.bandTops[0] ?? 0;
+              return layersLayout.rowOrder.map((row, i) => (
+                <div
+                  key={`row-${row}`}
+                  className="absolute flex items-center gap-2 font-mono"
+                  style={{ top: `${bandTop + i * rowH + rowH / 2 - 8 + 44}px`, left: '16px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em', color: 'rgba(34,211,238,0.6)' }}
+                >
+                  <h2 className="uppercase tracking-widest text-cyan-400/70">{groupLabelMap[row] || row}</h2>
+                </div>
+              ));
+            })()}
 
-          {/* 横軸ラベル（カテゴリ） */}
-          {layersLayout.gridMeta.map(({ cat, x }) => (
-            <div
-              key={`cat-${cat}`}
-              className="absolute flex items-center gap-2 text-cyan-400/70 font-mono"
-              style={{ top: '4px', left: `${x - 30}px`, fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
-            >
-              <h2 className="uppercase tracking-widest text-cyan-400/80">{cat}</h2>
-            </div>
-          ))}
+{/* 横軸ラベル（カテゴリ）を各バンドの先頭左端に描画 */}
+            {layersLayout.gridMeta.map(({ cat, x, y }) => (
+              <div
+                key={`cat-${cat}`}
+                className="absolute flex items-center text-cyan-400/70 font-mono"
+                style={{ top: `${y + 4}px`, left: `${x}px`, fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
+              >
+                <h2 className="uppercase tracking-widest text-cyan-400/80">{cat}</h2>
+              </div>
+            ))}
+
+            {/* Frontend(UI)とBackend(API)の区切り線 */}
+            {(() => {
+              const sepRowH = layersLayout.cardH + layersLayout.gap;
+              const sepTop = (layersLayout.bandTops[0] ?? 0) + sepRowH;
+              return (
+                <div
+                  className="absolute left-0 border-t border-dashed border-cyan-400/30"
+                  style={{ top: `${sepTop}px`, width: `${canvasSize.width}px`, height: '1px' }}
+                />
+              );
+            })()}
 
           {containers.filter(c => !isSystemContainer(c.name)).map(c => (
             <ContainerNode
@@ -864,10 +874,11 @@ export default function App() {
               hasError={!!(errorLogsMap[c.name] || c.health === 'unhealthy')}
               position={containerPositions[c.name]}
               stats={containerStats[c.name]}
-              health={c.health}
-              restartCount={c.restartCount}
-              uptime={c.uptime}
-            />
+health={c.health}
+               restartCount={c.restartCount}
+               uptime={c.uptime}
+               cardW={cardW}
+             />
           ))}
         </div>
       </div>
