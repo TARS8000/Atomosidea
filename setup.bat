@@ -26,13 +26,14 @@ echo Creating .env file...
 >> .env echo # Passwords for service-specific DB users
 >> .env echo AUTH_SERVICE_DB_PASSWORD=auth_service_strong_password
 >> .env echo MYPAGE_SERVICE_DB_PASSWORD=mypage_service_strong_password
+>> .env echo TEAM_SERVICE_DB_PASSWORD=team_service_strong_password
 >> .env echo.
 >> .env echo # Application Settings
 >> .env echo JWT_SECRET=your-super-secret-and-long-random-string
 >> .env echo UPLOAD_DIR=/storage/videos
 >> .env echo THUMBNAIL_DIR=/storage/thumbnails
 >> .env echo APP_URL=http://localhost:3001
->> .env echo CACHE_BUSTER=1
+>> .env echo CACHE_BUSTER=2
 >> .env echo.
 >> .env echo # Static Site Hosting
 >> .env echo STATIC_SITE_DOMAIN=localhost
@@ -46,6 +47,9 @@ echo Creating .env file...
 >> .env echo.
 >> .env echo # --- MinIO Settings ---
 >> .env echo MINIO_USE_SSL=false
+>> .env echo # MinIO Root Credentials (root user for admin/console access)
+>> .env echo MINIO_ROOT_USER=minioadmin
+>> .env echo MINIO_ROOT_PASSWORD=minioadminpassword
 >> .env echo.
 >> .env echo # Game Storage (MinIO)
 >> .env echo GAME_MINIO_ACCESS_KEY_ID=minioadmin
@@ -98,6 +102,12 @@ echo Creating .env file...
 >> .env echo # SFSP MinIO Credentials for static-site-worker (clean-minio)
 >> .env echo SFSP_STATIC_SITE_WORKER_ACCESS_KEY=sfsp-static-site-worker-access-key
 >> .env echo SFSP_STATIC_SITE_WORKER_SECRET_KEY=sfsp-static-site-worker-secret-key
+>> .env echo # SFSP MinIO Credentials for profile-worker (clean-minio)
+>> .env echo SFSP_PROFILE_WORKER_ACCESS_KEY=sfsp-profile-worker-access-key
+>> .env echo SFSP_PROFILE_WORKER_SECRET_KEY=sfsp-profile-worker-secret-key
+>> .env echo # SFSP MinIO Credentials for video-worker (clean-minio)
+>> .env echo SFSP_VIDEO_WORKER_ACCESS_KEY=sfsp-video-worker-access-key
+>> .env echo SFSP_VIDEO_WORKER_SECRET_KEY=sfsp-video-worker-secret-key
 
 echo .env file created successfully.
 echo.
