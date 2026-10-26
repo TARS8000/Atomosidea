@@ -46,11 +46,11 @@ The goal is to stop the bleeding and prevent further damage.
 -   **Short-term Containment (Example Actions)**:
     -   **Sandbox Escape / Host Compromise (SEV-1)**:
         -   Immediately isolate the affected host from the network.
-        -   Shut down the `sfsp-worker` service to prevent new jobs from running.
+        -   Shut down the `sfsp-worker` and `sfsp-docker-proxy` services to prevent new jobs and sandbox containers from running.
         -   Consider taking the entire SFSP offline.
     -   **API Compromise (SEV-2)**:
         -   Block the attacker's IP address at the firewall/API gateway.
-        -   Rotate credentials and API keys associated with the `sfsp-api` service.
+        -   Rotate the credentials associated with the `sfsp-api` service: `SFSP_API_KEY` (the `X-SFSP-API-Key` header value, which every caller must be updated to send), `REDIS_PASSWORD`, and the MinIO keys (`SFSP_API_ACCESS_KEY` / `SFSP_API_SECRET_KEY`). Change them in `.env` and recreate the affected services (`docker compose up -d`).
         -   Restart the `sfsp-api` service from a known-good image.
     -   **DoS Attack (SEV-2)**:
         -   Implement rate limiting or IP blocking at a higher level (e.g., Cloudflare, AWS WAF).
@@ -95,17 +95,18 @@ This is the most important phase for long-term improvement.
 
 -   **Identification**: A file scan results in unexpected activity on the worker host (e.g., new processes, network connections, file modifications).
 -   **Containment**:
-    1.  Immediately execute `docker compose stop sfsp-worker`.
+    1.  Immediately execute `docker compose stop sfsp-worker sfsp-docker-proxy`.
     2.  Isolate the host from the network.
-    3.  Preserve the malicious file from MinIO for analysis.
+    3.  Preserve the malicious file from MinIO for analysis. After a job reaches its final status the file is deleted from `raw-files`; a `malicious` or `suspicious` file is kept in the `quarantine` bucket under the object key `<file_id>` (the job's `file_id` is in `sfsp-db`). For a job that has not finished yet, the file is still in `raw-files`.
+    4.  Note the job IDs in `sfsp:scan_queue`, `sfsp:scan_queue:processing`, and `sfsp:scan_queue:dead`. Jobs left in `:processing` are moved back to `sfsp:scan_queue` when the worker starts again, so the offending job will be scanned again unless it is removed or the scanner is patched first.
 -   **Eradication**:
     1.  Analyze the file and the scanner vulnerability that was exploited.
     2.  The host must be considered fully compromised. Rebuild it from scratch.
     3.  Patch the scanner or its base image.
 -   **Recovery**:
-    1.  Deploy the patched worker and scanner images.
+    1.  Deploy the patched worker and scanner images (rebuild with `docker compose build --pull sfsp-clamav-client sfsp-yara-client sfsp-worker`).
     2.  Bring the new host online.
-    3.  Resume worker service.
+    3.  Resume the services (`docker compose up -d sfsp-docker-proxy sfsp-worker`) after reviewing the queues listed above.
 -   **Lessons Learned**: Was the sandbox configuration adequate? Was the vulnerability in a known CVE? How can we improve our detection of sandbox escapes?
 
 ---

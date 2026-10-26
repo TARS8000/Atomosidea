@@ -48,7 +48,7 @@ const EditStaticSitePage = () => {
     }
   };
 
-  const pollStaticSite = async (signal: AbortSignal): Promise<{ thumbnailUrl?: string; accepted: boolean }> => {
+  const pollStaticSite = async (signal: AbortSignal): Promise<{ thumbnailUrl: string; accepted: boolean }> => {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
       const pollInterval = setInterval(async () => {
@@ -57,12 +57,15 @@ const EditStaticSitePage = () => {
           const site = siteRes.data;
           if (!site.thumbnail_sfsp_job_id) {
             clearInterval(pollInterval);
-            // A thumbnail_url set here means the SFSP worker wrote the clean
-            // thumbnail to storage. When the scan rejected the file, the job_id
-            // is cleared but thumbnail_url stays empty.
+            // The job_id is cleared when the scan finishes. A new thumbnail is
+            // only accepted when the stored URL changed from the one we started
+            // with (the worker writes a fresh object on success, leaving the old
+            // URL untouched when the scan rejects the file).
+            const storedUrl = typeof site.thumbnail_url === 'string' ? site.thumbnail_url : '';
+            const accepted = storedUrl !== existingThumbnailUrl;
             resolve({
-              thumbnailUrl: site.thumbnail_url || existingThumbnailUrl,
-              accepted: !!site.thumbnail_url,
+              thumbnailUrl: accepted ? storedUrl : existingThumbnailUrl,
+              accepted,
             });
           }
         } catch (err) {
@@ -92,8 +95,6 @@ const EditStaticSitePage = () => {
     const controller = new AbortController();
 
     try {
-      let newThumbnailUrl = thumbnailUrl;
-
       if (thumbnail) {
         // Step 1: upload thumbnail only (triggers SFSP scan). Title/description
         // are deferred until the scan completes so the site is not half-updated
@@ -109,32 +110,38 @@ const EditStaticSitePage = () => {
           signal: controller.signal,
         });
         if (res.data.status === 'scanning') {
+          // Wait for the SFSP scan to finish. The worker writes the clean
+          // thumbnail to storage and clears the job id; the stored URL then
+          // differs from the one we started with.
           const result = await pollStaticSite(controller.signal);
           if (!result.accepted) {
+            // Rejected: keep the previous thumbnail and surface the error.
             setIsScanningThumbnail(false);
-            setError('サムネイルがセキュリティスキャンで拒否されました。');
+            setThumbnailUrl(existingThumbnailUrl);
+            setError('サムネイルがセキュリティスキャンで拒否されました。別の画像を選択してください。');
             return;
           }
-          // Step 2: scan finished and the thumbnail was written to storage.
-          // Commit title/description now.
-          const infoFormData = new FormData();
-          infoFormData.append('title', title);
-          infoFormData.append('description', description);
-          await axios.put(`/api/static-sites/${id}`, infoFormData, {
-            headers: {
-              'Content-Type': 'multipart/form-data',
-              Authorization: `Bearer ${token}`,
-            },
-            signal: controller.signal,
-          });
-          setSuccess('更新が完了しました。');
+          // Accepted: show the freshly written thumbnail from storage.
+          setThumbnailUrl(result.thumbnailUrl);
         } else if (res.data.thumbnail_url) {
-          newThumbnailUrl = res.data.thumbnail_url;
-          setSuccess('サイト情報が更新されました。');
-        } else {
-          setSuccess('サイト情報が更新されました。');
+          // SFSP returned immediately (e.g. a deduplicated clean file).
+          setThumbnailUrl(res.data.thumbnail_url);
         }
+
+        // Step 2: scan finished (or was skipped). Commit title/description.
+        const infoFormData = new FormData();
+        infoFormData.append('title', title);
+        infoFormData.append('description', description);
+        await axios.put(`/api/static-sites/${id}`, infoFormData, {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+            Authorization: `Bearer ${token}`,
+          },
+          signal: controller.signal,
+        });
+        setSuccess('更新が完了しました。');
       } else {
+        // No thumbnail uploaded: just update title/description.
         const formData = new FormData();
         formData.append('title', title);
         formData.append('description', description);
@@ -148,22 +155,10 @@ const EditStaticSitePage = () => {
         setSuccess('サイト情報が更新されました。');
       }
 
-      // Preload the freshly-written thumbnail (cache-buster to bypass any stale
-      // browser cache of the old image) and keep the overlay up until it has
-      // loaded, then swap the displayed image only once it is fully ready, so
-      // the old thumbnail never flashes during the transition.
-      const bust = newThumbnailUrl.includes('?') ? '&' : '?';
-      const freshUrl = newThumbnailUrl + bust + 't=' + Date.now();
-      const preload = new Image();
-      const reveal = () => {
-        setIsScanningThumbnail(false);
-        setThumbnailUrl(freshUrl);
-        setError('');
-        setTimeout(() => navigate(`/static-sites/${id}`), 2000);
-      };
-      preload.onload = reveal;
-      preload.onerror = reveal;
-      preload.src = freshUrl;
+      // Navigate to the detail page once the UI has settled (short delay keeps
+      // any success message visible). The preview already points at the
+      // server-side thumbnail, so no client-side preloading is required.
+      setTimeout(() => navigate(`/static-sites/${id}`), 1500);
     } catch (err) {
       if (!axios.isCancel(err)) {
         setError('更新に失敗しました。');

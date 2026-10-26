@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Folder, FileText, Database, ChevronRight, ArrowLeft, Server, Upload, Trash2, RefreshCw, Terminal, HardDrive,
-  RotateCw, Loader2, AlertTriangle, X, Cpu, GitBranch, Waypoints, Layers, Activity, Users
+  RotateCw, Loader2, AlertTriangle, X, Cpu, GitBranch, Waypoints, Activity, Users
 } from 'lucide-react';
 
 // --- SFチックなカスタムCSS ---
@@ -105,20 +105,20 @@ const SystemLoadMonitor = ({ totalCpu, totalMemUsageGB, totalMemLimitGB }) => {
 
 
 // --- Component: ConnectionLine (縦方向 上→下 ルーティング) ---
-const ConnectionLine = ({ from, to, isActive, hasError }) => {
+const ConnectionLine = ({ from, to, isActive, hasError, networks, cardW }) => {
   if (!from || !to) return null;
 
-  // 上から下への配線：送信元の「下端中央」 -> 送信先の「上端中央」
-  const startX = from.x + 96;  // ノード幅 192px の中央
-  const startY = from.y + 96;  // ノード高さ 96px の下端
-  const endX = to.x + 96;
+  // 上から下への配線：送信元の「下端中央」 -> 送信先の「上端中央」（カード幅は可変）
+  const startX = from.x + cardW / 2;
+  const startY = from.y + 96;
+  const endX = to.x + cardW / 2;
   const endY = to.y;           // ノードの上端
 
   // 縦方向の直角（Orthogonal）配線パス
   const midY = startY + (endY - startY) / 2;
   const d = `M ${startX} ${startY} L ${startX} ${midY} L ${endX} ${midY} L ${endX} ${endY}`;
 
-  const glowColor = hasError ? '#ef4444' : '#06b6d4';
+  const glowColor = hasError ? '#ef4444' : networkColor(networks);
 
   return (
     <g className="pointer-events-none">
@@ -158,11 +158,13 @@ const ConnectionLine = ({ from, to, isActive, hasError }) => {
 };
 
 // --- Component: ContainerNode ---
-const ContainerNode = ({ container, onClick, isActive, hasError, position, stats }) => {
+const ContainerNode = ({ container, onClick, isActive, hasError, position, stats, health, restartCount, uptime, cardW }) => {
   const isRunning = container.state === 'running';
   const isStarting = container.state === 'starting' || container.state === 'restarting';
+  const isUnhealthy = health === 'unhealthy';
+  const isHealthy = health === 'healthy';
 
-  const themeBorder = hasError
+  const themeBorder = hasError || isUnhealthy
     ? 'border-rose-500/80 shadow-rose-900/40'
     : isActive
     ? 'border-cyan-400/80 shadow-cyan-500/30'
@@ -190,7 +192,7 @@ const ContainerNode = ({ container, onClick, isActive, hasError, position, stats
         <div className="absolute -inset-1 bg-cyan-500/20 rounded-lg blur-sm animate-pulse" />
       )}
 
-      <div className={`w-48 h-24 p-2.5 bg-slate-950/85 backdrop-blur-md border ${themeBorder} cyber-card hover:border-cyan-400 transition-all shadow-xl relative overflow-hidden flex flex-col justify-between`}>
+      <div className={`h-24 p-2 bg-slate-950/85 backdrop-blur-md border ${themeBorder} cyber-card hover:border-cyan-400 transition-all shadow-xl relative overflow-hidden flex flex-col justify-between`} style={{ width: cardW + 'px' }}>
         <div className="absolute inset-0 bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.3)_50%)] bg-[length:100%_4px] pointer-events-none opacity-40" />
 
         <div className="flex justify-between items-start relative z-10">
@@ -199,7 +201,10 @@ const ContainerNode = ({ container, onClick, isActive, hasError, position, stats
           </div>
           <div className="flex items-center gap-1">
             {isStarting && <Loader2 className="w-3 h-3 text-amber-400 animate-spin" />}
-            {isRunning && (
+            {(isHealthy || isUnhealthy) && (
+              <span className={`w-2 h-2 rounded-full ${isUnhealthy ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'}`} title={`health: ${health}`} />
+            )}
+            {!isHealthy && !isUnhealthy && isRunning && (
               <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-cyan-400 shadow-[0_0_8px_#22d3ee]' : 'bg-slate-600'}`} />
             )}
           </div>
@@ -207,6 +212,11 @@ const ContainerNode = ({ container, onClick, isActive, hasError, position, stats
 
         <div className="text-[10px] font-mono text-slate-500 truncate relative z-10 -mt-1">
           {container.image}
+        </div>
+
+        <div className="flex items-center justify-between z-10 -mt-0.5 text-[8px] font-mono text-slate-500">
+          {restartCount > 0 ? <span>↻ {restartCount} restarts</span> : <span />}
+          <span>{uptime ? `⏱ ${uptime}` : ''}</span>
         </div>
 
         <div className="space-y-1.5 relative z-10">
@@ -301,9 +311,104 @@ const LogViewerModal = ({ container, onClose, logs, logEndRef, activeTab, setAct
   );
 };
 
+// エラー検出後、赤い強調表示を保持してから状態をリセットするまでの時間（ms）
+const ERROR_HIGHLIGHT_MS = 10000;
+
+const getContainerGroup = (name) => {
+  const n = name.toLowerCase();
+  if (n.endsWith('frontend') || n.includes('frontend-builder')) return 'UI';
+  if (
+    n.endsWith('auth-service') ||
+    n.endsWith('profile-service') ||
+    n.endsWith('team-service') ||
+    n.endsWith('mypage-service')
+  ) return 'API';
+  if (
+    n.endsWith('sfsp-api') ||
+    n.endsWith('sfsp-worker') ||
+    n.endsWith('video-worker') ||
+    n.endsWith('game-worker') ||
+    n.endsWith('static-site-worker') ||
+    n.endsWith('upload-api') ||
+    n.includes('clamav') ||
+    n.includes('yara')
+  ) return 'Workers';
+  if (
+    n.endsWith('auth-db') ||
+    n.endsWith('app-db') ||
+    n.endsWith('profile-db') ||
+    n.endsWith('team-db') ||
+    n.endsWith('sfsp-db') ||
+    n.endsWith('redis')
+  ) return 'DB';
+  if (
+    n.endsWith('profile-storage') ||
+    n.endsWith('game-storage') ||
+    n.endsWith('static-site-storage') ||
+    n.endsWith('video-storage') ||
+    n.includes('minio') ||
+    n.includes('storage')
+  ) return 'Storage';
+  return 'Unknown';
+};
+
+const groupLabelMap = { UI: 'Frontend', API: 'API', Upload: 'Upload', Worker: 'Worker', DB: 'DB/Cache', Storage: 'Storage' };
+
+const SRC_LAYERS = new Set(['UI', 'API']);
+const DEP_LAYERS = new Set(['Workers', 'DB', 'Storage', 'Unknown']);
+const SYSTEM_CONTAINERS = new Set(['mon-backend', 'mon-nginx', 'mon-frontend-builder']);
+
+// プロジェクト所属外のコンテナ（監視対象外）
+const EXTERNAL_CONTAINERS = new Set(['ba_halo_db', 'ba_halo_worker', 'open-webui']);
+
+const isSystemContainer = (name) => SYSTEM_CONTAINERS.has(name) || (name || '').startsWith('mon-') || /-builder$/.test(name) || EXTERNAL_CONTAINERS.has(name);
+
+// 同一サービス群の共通接頭辞抽出（game-upload-api/game-worker -> "game"、sfsp-api/sfsp-worker/sfsp-db -> "sfsp"）
+const getBaseName = (name) => {
+  let n = name.replace(/^atmosidea-/i, '');
+  n = n.replace(/-(service|db|worker|storage|upload-api|api|builder)$/i, '');
+  return n || name;
+};
+
+const networkColor = (nets) => {
+  if (!nets || nets.length === 0) return '#06b6d4';
+  if (nets.some((n) => n.includes('sfsp'))) return '#f59e0b';
+  if (nets.some((n) => n.includes('db'))) return '#10b981';
+  return '#3b82f6';
+};
+
+// --- Monitoring Volumes Panel ---
+const VolumesModal = ({ onClose, volumes }) => (
+  <div className="absolute inset-0 bg-black/60 backdrop-blur-md z-30 flex items-center justify-center p-4">
+    <div className="w-full max-w-2xl bg-slate-950/90 border border-cyan-500/30 rounded-2xl shadow-2xl flex flex-col">
+      <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+        <h1 className="font-mono font-bold text-lg text-slate-100 flex items-center gap-2"><HardDrive className="w-5 h-5 text-cyan-400" />Persistent Volumes</h1>
+        <button onClick={onClose} className="p-2 text-slate-400 hover:text-white"><X className="w-5 h-5" /></button>
+      </div>
+      <div className="p-4 overflow-y-auto max-h-[60vh]">
+        {volumes.length === 0 ? <div className="text-slate-600 italic text-center py-6">Loading...</div> : (
+          <table className="w-full text-left text-xs font-mono">
+            <thead><tr className="border-b border-slate-800 text-slate-500"><th className="p-2">Name</th><th className="p-2">Driver</th><th className="p-2 text-right">Mountpoint</th></tr></thead>
+            <tbody>
+              {volumes.map((v, i) => (
+                <tr key={i} className="border-b border-slate-800/40 hover:bg-slate-900/40">
+                  <td className="p-2 text-slate-200">{v.name}</td>
+                  <td className="p-2 text-slate-400">{v.driver}</td>
+                  <td className="p-2 text-slate-500 text-right truncate max-w-xs" title={v.mountpoint}>{v.mountpoint}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  </div>
+);
+
 // --- Main App Component ---
 export default function App() {
   const [containers, setContainers] = useState([]);
+  const [viewportWidth, setViewportWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 1920));
   const [containerStats, setContainerStats] = useState({});
   const [selectedContainer, setSelectedContainer] = useState(null);
   const [activeTab, setActiveTab] = useState('logs');
@@ -320,13 +425,24 @@ export default function App() {
   const [lps, setLps] = useState(0);
   const [lpsHistory, setLpsHistory] = useState(new Array(30).fill(0));
   const [activeUsers, setActiveUsers] = useState(0);
+  const [topology, setTopology] = useState([]);
+  const [volumes, setVolumes] = useState([]);
+  const [showVolumes, setShowVolumes] = useState(false);
   const logCountRef = useRef(0);
 
   const logEndRef = useRef(null);
   const wsMapRef = useRef({});
   const pulseTimeoutsRef = useRef({});
+  const errorClearTimeoutsRef = useRef({});
   const reconnectTimeoutsRef = useRef({});
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const fetchContainers = useCallback(async () => {
     try {
@@ -358,10 +474,32 @@ export default function App() {
     }
   }, []);
 
+  const fetchTopology = useCallback(async () => {
+    try {
+      const res = await fetch('/api/topology');
+      const data = await res.json();
+      setTopology(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error('Fetch topology error:', err);
+    }
+  }, []);
+
+  const fetchVolumes = useCallback(async () => {
+    try {
+      const res = await fetch('/api/volumes');
+      const data = await res.json();
+      setVolumes(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error('Fetch volumes error:', err);
+    }
+  }, []);
+
   useEffect(() => {
     fetchContainers();
     fetchActiveUsers();
     fetchContainerStats();
+    fetchTopology();
+    fetchVolumes();
     const containerInterval = setInterval(fetchContainers, 3000);
     const statsInterval = setInterval(fetchContainerStats, 3000);
     const userInterval = setInterval(fetchActiveUsers, 10000);
@@ -370,7 +508,7 @@ export default function App() {
       clearInterval(statsInterval);
       clearInterval(userInterval);
     };
-  }, [fetchContainers, fetchActiveUsers, fetchContainerStats]);
+  }, [fetchContainers, fetchActiveUsers, fetchContainerStats, fetchTopology, fetchVolumes]);
 
   useEffect(() => {
     const lpsInterval = setInterval(() => {
@@ -385,6 +523,7 @@ export default function App() {
     if (containers.length === 0) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     containers.forEach(c => {
+      if (isSystemContainer(c.name)) return;
       if (!(c.state === 'running' || c.state === 'starting' || c.state === 'restarting')) {
         if (wsMapRef.current[c.name]) { wsMapRef.current[c.name].close(); delete wsMapRef.current[c.name]; }
         return;
@@ -438,19 +577,28 @@ export default function App() {
     return newErrorMap;
   }, [errorLoopState]);
 
+  // エラー検出後は ERROR_HIGHLIGHT_MS の間だけ赤表示を保持し、その後リセットして再検出可能にする。
+  // （検出直後に即リセットすると赤表示が一瞬で消えてしまうため、遅延させる）
   useEffect(() => {
     containers.forEach(c => {
-      if (errorLogsMap[c.name] && c.state === 'running' && !restartingContainers.has(c.name)) {
-        setErrorLoopState(prev => {
-          const newState = { ...prev };
-          delete newState[c.name];
-          return newState;
-        });
+      if (
+        errorLogsMap[c.name] && c.state === 'running' && !restartingContainers.has(c.name) &&
+        !errorClearTimeoutsRef.current[c.name]
+      ) {
+        errorClearTimeoutsRef.current[c.name] = setTimeout(() => {
+          delete errorClearTimeoutsRef.current[c.name];
+          setErrorLoopState(prev => {
+            const newState = { ...prev };
+            delete newState[c.name];
+            return newState;
+          });
+        }, ERROR_HIGHLIGHT_MS);
       }
     });
   }, [containers, errorLogsMap, restartingContainers]);
 
   useEffect(() => () => {
+    Object.values(errorClearTimeoutsRef.current).forEach(t => clearTimeout(t));
     Object.values(wsMapRef.current).forEach(ws => ws.close());
     Object.values(pulseTimeoutsRef.current).forEach(t => clearTimeout(t));
     Object.values(reconnectTimeoutsRef.current).forEach(t => clearTimeout(t));
@@ -461,6 +609,10 @@ export default function App() {
     if (!confirm(`コンテナ「${containerName}」を再起動しますか？`)) return;
 
     setRestartingContainers(prev => new Set(prev).add(containerName));
+    if (errorClearTimeoutsRef.current[containerName]) {
+      clearTimeout(errorClearTimeoutsRef.current[containerName]);
+      delete errorClearTimeoutsRef.current[containerName];
+    }
     setErrorLoopState(prev => {
       const newState = { ...prev };
       delete newState[containerName];
@@ -483,125 +635,117 @@ export default function App() {
     }
   };
 
-  // --- 階層（縦方向 上→下）のレイアウト配置設定 ---
-  const { containerPositions, connections, layersLayout } = useMemo(() => {
-    // 上から順の階層定義 (row: 縦方向の位置)
-    const layers = {
-      'UI': { row: 0, title: '1. Frontend Layer' },
-      'API': { row: 1, title: '2. API Gateway & Services (Backend)' },
-      'Workers': { row: 2, title: '3. Security Scan & Processing Workers (Backend)' },
-      'DB': { row: 3, title: '4. Databases & Cache' },
-      'Storage': { row: 4, title: '5. Storage & Object Persistence' },
-      'Unknown': { row: 5, title: 'Uncategorized' },
-    };
-
-    // フルネームや部分一致で柔軟に判定するグループ分けロジック
-    const getContainerGroup = (name) => {
-      const n = name.toLowerCase();
-      
-      // 1. UI Layer
-      if (n.endsWith('frontend') || n.includes('frontend-builder')) return 'UI';
-
-      // 2. API Services Layer
-      if (
-        n.endsWith('auth-service') || 
-        n.endsWith('profile-service') || 
-        n.endsWith('upload-service') || 
-        n.endsWith('stream-service') || 
-        n.endsWith('game-upload-api') || 
-        n.endsWith('static-site-upload-api') || 
-        n.endsWith('mypage-service')
-      ) return 'API';
-
-      // 3. Workers & Security Scan Layer
-      if (
-        n.endsWith('sfsp-api') || 
-        n.endsWith('sfsp-worker') || 
-        n.endsWith('video-worker') || 
-        n.endsWith('game-worker') || 
-        n.endsWith('static-site-worker') ||
-        n.includes('clamav') || 
-        n.includes('yara')
-      ) return 'Workers';
-
-      // 4. DB & Cache Layer
-      if (
-        n.endsWith('auth-db') || 
-        n.endsWith('app-db') || 
-        n.endsWith('profile-db') || 
-        n.endsWith('sfsp-db') || 
-        n.endsWith('redis')
-      ) return 'DB';
-
-      // 5. Storage Layer
-      if (
-        n.endsWith('profile-storage') || 
-        n.endsWith('game-storage') || 
-        n.endsWith('static-site-storage') || 
-        n.endsWith('video-storage') || 
-        n.includes('minio') || 
-        n.includes('storage')
-      ) return 'Storage';
-
-      return 'Unknown';
-    };
-
-    // 接続定義（前方・部分一致でノードを探せるように判定側で吸収）
-    const rawConnections = [
-      ['frontend', 'auth-service'], ['frontend', 'profile-service'], ['frontend', 'upload-service'],
-      ['frontend', 'stream-service'], ['frontend', 'game-upload-api'], ['frontend', 'static-site-upload-api'],
-      ['frontend', 'mypage-service'], ['frontend', 'video-storage'],
-
-      ['auth-service', 'auth-db'], ['auth-service', 'app-db'], ['auth-service', 'profile-db'],
-      ['auth-service', 'redis'], ['auth-service', 'profile-storage'], ['auth-service', 'game-storage'],
-      ['auth-service', 'static-site-storage'], ['auth-service', 'profile-service'],
-
-      ['profile-service', 'profile-db'], ['profile-service', 'profile-storage'],
-
-      ['upload-service', 'app-db'], ['upload-service', 'redis'], ['upload-service', 'sfsp-api'], ['upload-service', 'video-storage'],
-      ['game-upload-api', 'app-db'], ['game-upload-api', 'redis'], ['game-upload-api', 'sfsp-api'], ['game-upload-api', 'game-storage'],
-      ['static-site-upload-api', 'app-db'], ['static-site-upload-api', 'redis'], ['static-site-upload-api', 'sfsp-api'], ['static-site-upload-api', 'static-site-storage'],
-
-      ['stream-service', 'app-db'], ['mypage-service', 'auth-db'], ['mypage-service', 'app-db'],
-
-      ['sfsp-api', 'sfsp-db'], ['sfsp-api', 'sfsp-minio'], ['sfsp-api', 'redis'],
-      ['sfsp-worker', 'redis'], ['sfsp-worker', 'sfsp-db'], ['sfsp-worker', 'sfsp-minio'],
-
-      ['video-worker', 'redis'], ['video-worker', 'app-db'], ['video-worker', 'sfsp-minio'], ['video-worker', 'video-storage'],
-      ['game-worker', 'redis'], ['game-worker', 'app-db'], ['game-worker', 'sfsp-minio'], ['game-worker', 'game-storage'],
-      ['static-site-worker', 'redis'], ['static-site-worker', 'app-db'], ['static-site-worker', 'sfsp-minio'], ['static-site-worker', 'static-site-storage'],
-    ];
-
-    const colWidth = 210;
-    const rowHeight = 160;
+// --- グリッド配置：横軸=カテゴリ（game等）、縦軸=サービス種別（Frontend/Backend/Workers/DB/Storage）---
+  // 同種（game/video/sfsp等、接頭辞が同じ）のコンテナを1列（縦列）として、層順（API→Workers→DB→Storage）で縦積み。
+  // 行（横列）はサービス種別でくくり、各カテゴリ列で縦積みを揃えて整列させる。
+  // カード幅は画面幅に対して単一バンド（6行）が収まるよう可変（minCardW~maxCardW）。
+  const { containerPositions, layersLayout, canvasSize, cardW } = useMemo(() => {
+    // 単一バンド（全カテゴリを1行に配置）。カード幅は画面幅から算出（固定値ではない）
+    const cardH = 96;
+    const gap = 8;
+    const colGap = 4;
+    const leftMargin = 96;
+    const topMargin = 84;
+    const rowLabelWidth = 120; // 縦軸ラベル用
+    const rightMargin = 320; // 右余白（HUDパネル分を含む）
+    const minCardW = 84; // カードの最小幅（可読性維持）
+    const maxCardW = 130; // カードの最大幅
     const positions = {};
 
-    const groupedContainers = containers.reduce((acc, c) => {
-      const group = getContainerGroup(c.name);
-      if (!acc[group]) acc[group] = [];
-      acc[group].push(c);
-      return acc;
-    }, {});
-
-    Object.keys(groupedContainers).forEach(group => {
-      const row = layers[group]?.row ?? 5;
-      groupedContainers[group].forEach((c, i) => {
-        positions[c.name] = { x: i * colWidth + 80, y: row * rowHeight + 110 };
-      });
-    });
-
-    // 接続線の名前をコンテナの実際の名前（atmosidea-等が付いた名前）に展開・結線
-    const activeConnections = [];
-    rawConnections.forEach(([fromKey, toKey]) => {
-      const realFrom = containers.find(c => c.name.endsWith(fromKey) || c.name === fromKey)?.name;
-      const realTo = containers.find(c => c.name.endsWith(toKey) || c.name === toKey)?.name;
-      if (realFrom && realTo) {
-        activeConnections.push([realFrom, realTo]);
+    // 縦軸：サービス種別（層順）。Frontend最上段→Backend(API)→Upload→Worker→DB→Storage
+    const rowOrder = ['UI', 'API', 'Upload', 'Worker', 'DB', 'Storage'];
+    // コンテナグループをグリッド行にマッピング（UploadとWorkerを分離）
+    const rowMap = { UI: 'UI', API: 'API', Workers: 'Workers', DB: 'DB', Storage: 'Storage', Unknown: 'Storage' };
+    const getGridRow = (name) => {
+      const group = getContainerGroup(name);
+      if (group === 'Workers') {
+        const n = name.toLowerCase();
+        if (n.includes('upload')) return 'Upload';
+        return 'Worker';
       }
+      return rowMap[group] ?? 'Storage';
+    };
+
+    // 横軸：カテゴリ（接頭辞）を抽出して昇順で固定
+    const categories = new Set();
+    containers.forEach(c => {
+      if (isSystemContainer(c.name)) return;
+      categories.add(getBaseName(c.name));
+    });
+    const catList = [...categories].sort((a, b) => a.localeCompare(b));
+
+    // 単一バンドを維持したまま、画面幅に収まるようカード幅を可変（FHDで端から端にならないよう余白込み）
+    const usableWidth = Math.max(500, viewportWidth - leftMargin - rowLabelWidth - rightMargin);
+    const cardW = Math.min(maxCardW, Math.max(minCardW, Math.floor(usableWidth / Math.max(1, catList.length)) - colGap));
+    const colWidth = cardW + colGap; // 列幅（カード＋列間隔）
+    const rowH = cardH + gap; // 行高（カード＋行間隔）
+
+    // 各セル（カテゴリ×サービス種別）にコンテナを配置
+    const grid = {};
+    catList.forEach(cat => {
+      grid[cat] = {};
+      rowOrder.forEach(row => grid[cat][row] = []);
+    });
+    containers.forEach(c => {
+      if (isSystemContainer(c.name)) return;
+      const cat = getBaseName(c.name);
+      const row = getGridRow(c.name);
+      if (!grid[cat][row]) grid[cat][row] = [];
+      grid[cat][row].push(c);
     });
 
-    return { containerPositions: positions, connections: activeConnections, layersLayout: { layers, groupedContainers, rowHeight } };
-  }, [containers]);
+    // グリッド配置（単一バンド。行は固定スロットで全列を縦揃え。空行も高さを確保）
+    const cursorY = topMargin;
+    const canvasWidth = Math.max(leftMargin + rowLabelWidth + cardW, leftMargin + rowLabelWidth + catList.length * colWidth - colGap + 28);
+    const gridMeta = [];
+    const bandTops = [cursorY];
+
+    catList.forEach((cat, k) => {
+      const colStart = leftMargin + rowLabelWidth + k * colWidth;
+      const x = colStart;
+      rowOrder.forEach((row, i) => {
+        const members = grid[cat][row];
+        members.forEach((c) => {
+          const slotTop = cursorY + i * rowH;
+          const y = slotTop + (rowH - cardH) / 2;
+          positions[c.name] = { x, y };
+        });
+      });
+      gridMeta.push({ cat, x: colStart, y: cursorY, colWidth });
+    });
+
+    const canvasHeight = cursorY + rowOrder.length * rowH + 28;
+
+    return {
+      containerPositions: positions,
+      layersLayout: { gridMeta, bandTops, rowOrder, cardH, gap },
+      canvasSize: { width: canvasWidth, height: canvasHeight },
+      cardW
+    };
+  }, [containers, viewportWidth]);
+  // --- 接続トポロジー（ネットワーク共有から動的生成）---
+  const connections = useMemo(() => {
+    const netIndex = {};
+    topology.forEach(n => { if (!isSystemContainer(n.name)) netIndex[n.name] = new Set(n.networks); });
+    const visible = containers.filter(c => !isSystemContainer(c.name));
+    const result = [];
+    for (const a of visible) {
+      const la = getContainerGroup(a.name);
+      if (!SRC_LAYERS.has(la)) continue;
+      const na = netIndex[a.name];
+      if (!na) continue;
+      for (const b of visible) {
+        if (a === b) continue;
+        const lb = getContainerGroup(b.name);
+        if (!DEP_LAYERS.has(lb) || la === lb) continue;
+        const nb = netIndex[b.name];
+        if (!nb) continue;
+        const shared = [...na].filter(x => nb.has(x));
+        if (shared.length > 0) result.push({ from: a.name, to: b.name, networks: shared });
+      }
+    }
+    return result;
+  }, [containers, topology]);
 
   const handleSelectContainer = (container) => { setSelectedContainer(container); const hasStorage = checkHasStorage(container); setActiveTab(hasStorage ? 'storage' : 'logs'); if (hasStorage) { setCurrentBucket(''); setCurrentPrefix(''); } };
   const handleCloseModal = () => setSelectedContainer(null);
@@ -662,6 +806,7 @@ export default function App() {
       </div>
 
       <div className="absolute top-4 right-4 z-20 flex flex-col gap-4">
+        <button onClick={() => setShowVolumes(true)} className="self-end text-xs font-mono px-3 py-1.5 rounded-lg bg-slate-900/80 backdrop-blur-md border border-cyan-500/30 text-cyan-400 hover:border-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1.5"><HardDrive size={13} />Volumes</button>
         <AccessMonitor lps={lps} history={lpsHistory} />
         <UserCountMonitor count={activeUsers} />
         <SystemLoadMonitor 
@@ -671,48 +816,76 @@ export default function App() {
         />
       </div>
 
-      <div className="w-full h-full relative min-w-[1600px] min-h-[1050px]">
+      <div className="w-full h-full relative overflow-visible" style={{ minWidth: canvasSize.width, minHeight: canvasSize.height }}>
         {/* SVG パケット接続線 */}
         <svg className="absolute top-0 left-0 w-full h-full" style={{ zIndex: 1 }}>
-          {connections.map(([from, to], i) => (
+          {connections.map((conn, i) => (
             <ConnectionLine
               key={i}
-              from={containerPositions[from]}
-              to={containerPositions[to]}
-              isActive={!!(activeLogsMap[from] || activeLogsMap[to])}
-              hasError={!!(errorLogsMap[from] || errorLogsMap[to])}
-            />
+              from={containerPositions[conn.from]}
+              to={containerPositions[conn.to]}
+              isActive={!!(activeLogsMap[conn.from] || activeLogsMap[conn.to])}
+              hasError={!!(errorLogsMap[conn.from] || errorLogsMap[conn.to])}
+networks={conn.networks}
+               cardW={cardW}
+             />
           ))}
         </svg>
 
-        {/* 階層ラベル & ノードレンダリング */}
+        {/* グリッドラベル（縦軸=サービス種別、横軸=カテゴリ）& ノードレンダリング */}
         <div className="relative w-full h-full z-10">
-          {Object.keys(layersLayout.layers).map(group => {
-            const row = layersLayout.layers[group].row;
-            return (
-              <div
-                key={group}
-                className="absolute left-8 flex items-center gap-2 text-cyan-400/80 border-b border-cyan-500/20 pb-1 pr-6"
-                style={{ top: `${row * layersLayout.rowHeight + 80}px` }}
-              >
-                <Layers size={14} />
-                <h2 className="font-mono text-xs font-bold uppercase tracking-widest">
-                  {layersLayout.layers[group].title}
-                </h2>
-              </div>
-            );
-          })}
+{/* 縦軸ラベル（サービス種別）。層構造は全バンドで共通のため1セットのみ描画（1バンド目の行に合わせ全バンドの行と整列）*/}
+            {(() => {
+              const rowH = layersLayout.cardH + layersLayout.gap;
+              const bandTop = layersLayout.bandTops[0] ?? 0;
+              return layersLayout.rowOrder.map((row, i) => (
+                <div
+                  key={`row-${row}`}
+                  className="absolute flex items-center gap-2 font-mono"
+                  style={{ top: `${bandTop + i * rowH + rowH / 2 - 8 + 44}px`, left: '16px', fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em', color: 'rgba(34,211,238,0.6)' }}
+                >
+                  <h2 className="uppercase tracking-widest text-cyan-400/70">{groupLabelMap[row] || row}</h2>
+                </div>
+              ));
+            })()}
 
-          {containers.map(c => containerPositions[c.name] && (
+{/* 横軸ラベル（カテゴリ）を各バンドの先頭左端に描画 */}
+            {layersLayout.gridMeta.map(({ cat, x, y }) => (
+              <div
+                key={`cat-${cat}`}
+                className="absolute flex items-center text-cyan-400/70 font-mono"
+                style={{ top: `${y + 4}px`, left: `${x}px`, fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em' }}
+              >
+                <h2 className="uppercase tracking-widest text-cyan-400/80">{cat}</h2>
+              </div>
+            ))}
+
+            {/* Frontend(UI)とBackend(API)の区切り線 */}
+            {(() => {
+              const sepRowH = layersLayout.cardH + layersLayout.gap;
+              const sepTop = (layersLayout.bandTops[0] ?? 0) + sepRowH;
+              return (
+                <div
+                  className="absolute left-0 border-t border-dashed border-cyan-400/30"
+                  style={{ top: `${sepTop}px`, width: `${canvasSize.width}px`, height: '1px' }}
+                />
+              );
+            })()}
+
+          {containers.filter(c => !isSystemContainer(c.name)).map(c => (
             <ContainerNode
               key={c.id || c.name}
               container={c}
               onClick={handleSelectContainer}
               isActive={!!activeLogsMap[c.name]}
-              hasError={!!errorLogsMap[c.name]}
+              hasError={!!(errorLogsMap[c.name] || c.health === 'unhealthy')}
               position={containerPositions[c.name]}
               stats={containerStats[c.name]}
-            />
+health={c.health}
+               restartCount={c.restartCount}
+               uptime={c.uptime}
+               cardW={cardW}
+             />
           ))}
         </div>
       </div>
@@ -727,6 +900,8 @@ export default function App() {
         canShowStorage={checkHasStorage(selectedContainer)}
         storageProps={storageProps}
       />
+
+      {showVolumes && <VolumesModal onClose={() => setShowVolumes(false)} volumes={volumes} />}
     </div>
   );
 }

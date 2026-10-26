@@ -1,15 +1,16 @@
 -- Roles for the Atmosidea auth-db cluster.
 -- Runs once on a fresh volume via docker-entrypoint-initdb.d/init.sql.
 -- auth-service connects as auth_service_user; mypage-service as mypage_service_user.
--- Passwords mirror AUTH_SERVICE_DB_PASSWORD / MYPAGE_SERVICE_DB_PASSWORD in .env.
+-- Passwords are NOT set here: the db-role-init service (backend/db-init/sync-role-passwords.sh)
+-- sets them from AUTH_SERVICE_DB_PASSWORD / MYPAGE_SERVICE_DB_PASSWORD in .env on every startup.
 
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'auth_service_user') THEN
-    CREATE ROLE auth_service_user WITH LOGIN PASSWORD 'auth_service_strong_password';
+    CREATE ROLE auth_service_user WITH LOGIN;
   END IF;
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mypage_service_user') THEN
-    CREATE ROLE mypage_service_user WITH LOGIN PASSWORD 'mypage_service_strong_password';
+    CREATE ROLE mypage_service_user WITH LOGIN;
   END IF;
 END
 $$;
@@ -35,13 +36,8 @@ CREATE TABLE IF NOT EXISTS users (
     UNIQUE(provider, provider_id)
 );
 
--- Default admin user (password: AdminPassword123!). Inserted only if absent.
--- Hash generated with pgcrypto crypt('AdminPassword123!', gen_salt('bf')) for PostgreSQL 16.
-INSERT INTO users (id, username, email, password_hash, provider, is_admin, status)
-SELECT gen_random_uuid(), 'admin', 'admin@internal.local',
-       '$2a$06$KJWRVBanouBTqLqoyl093uNTqJWJzOYo0xt2ltyNtHBvyBLvZYrNO',
-       'local', TRUE, 'active'
-WHERE NOT EXISTS (SELECT 1 FROM users WHERE email = 'admin@internal.local');
+-- No default admin is seeded (a known password would be public).
+-- Create admins via POST /api/auth/register with ADMIN_REGISTRATION_CODE.
 
 -- Allow the app roles to read/write the shared users table (used by registerHandler,
 -- loginHandler, and googleCallbackHandler). Applied on every fresh volume init.

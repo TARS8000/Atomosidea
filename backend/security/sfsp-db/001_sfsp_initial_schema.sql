@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     processing_details TEXT, -- 処理ステップやエラー詳細情報
     is_cleaned_up BOOLEAN NOT NULL DEFAULT FALSE, -- ★ workerのクリーンアップタスク用フラグ
     cleaned_up_at TIMESTAMPTZ,                  -- ★ クリーンアップ実行日時
+    event_published_at TIMESTAMPTZ,             -- 完了イベントを publish した日時（再処理時の二重 publish 防止）
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     );

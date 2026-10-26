@@ -4,18 +4,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"go.uber.org/zap"
 )
+
+// sandboxTimeout は1回のスキャナー実行に許す最大時間
+const sandboxTimeout = 30 * time.Minute
+
+// sandboxTmpfsOptions はサンドボックスの /tmp に使う tmpfs のオプション（実行不可・setuid 無効・512 MiB 上限）
+const sandboxTmpfsOptions = "rw,noexec,nosuid,nodev,size=512m"
 
 type DockerSandbox struct {
 	cli    *client.Client
@@ -47,15 +51,11 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 
 	s.logger.Infof("Running command in sandbox container [%s]: image=%s, command=%v", containerName, imageName, command)
 
-	// イメージの存在確認（なければ pull を試行）
-	_, _, err := s.cli.ImageInspectWithRaw(ctx, imageName)
-	if err != nil {
-		s.logger.Warnf("Failed to pull image %s, will try to use local: %v", imageName, err)
-		reader, pullErr := s.cli.ImagePull(ctx, imageName, image.PullOptions{})
-		if pullErr == nil {
-			io.Copy(io.Discard, reader)
-			reader.Close()
-		}
+	// イメージの存在確認。スキャナーのイメージは compose でローカルにビルドするもの
+	// （sfsp-clamav-client / sfsp-yara-client）なので pull はしない。
+	// これにより Docker API で必要なのは images/{name}/json（GET）だけになる（docker-socket-proxy で POST /images/create を許可しなくてよい）
+	if _, err := s.cli.ImageInspect(ctx, imageName); err != nil {
+		return "", "", fmt.Errorf("scanner image %s is not available locally (build it with docker compose build): %w", imageName, err)
 	}
 
 	// ベースディレクトリ (/tmp/sfsp-scan) からの相対パスを安全に取得
@@ -87,9 +87,11 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 	}
 
 	// コンテナ設定（JobID や Scanner 情報のラベルを追加）
+	// スキャナーを直接 ENTRYPOINT として実行する。イメージ側の初期化スクリプト（clamav/clamav の /init 等）は
+	// chown などを行うため、CapDrop: ALL の下では失敗し、スキャン前に非 0 終了してしまう
 	config := &container.Config{
 		Image:      imageName,
-		Cmd:        formattedCmd,
+		Entrypoint: formattedCmd,
 		Tty:        false,
 		WorkingDir: "/scan_target",
 		Labels: map[string]string{
@@ -106,12 +108,34 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 	}
 
 	// Binds設定 (AutoRemoveはfalseにし、明示的にdeferで削除する)
+	// スキャン対象は信頼できないファイルのため、ネットワーク遮断・権限削減・リソース制限を行う
+	pidsLimit := int64(256)
 	hostConfig := &container.HostConfig{
 		Binds: []string{
 			fmt.Sprintf("%s:/scan_target:ro", volumeName),
 		},
-		AutoRemove: false,
+		AutoRemove:  false,
+		NetworkMode: "none",
+		CapDrop:     []string{"ALL"},
+		SecurityOpt: []string{"no-new-privileges"},
+		// ルートファイルシステムは読み取り専用にし、スキャナーが一時ファイルを書く /tmp だけ
+		// サイズ上限付きの tmpfs として与える。tmpfs の使用量は下の Memory 上限にも含まれる。
+		// ClamAV はアーカイブを展開するときに /tmp を使う。上限を超えるとスキャンはエラー終了
+		// （判定不能 = failed）になり、clean にはならない
+		ReadonlyRootfs: true,
+		Tmpfs: map[string]string{
+			"/tmp": sandboxTmpfsOptions,
+		},
+		Resources: container.Resources{
+			Memory:    1536 * 1024 * 1024,
+			NanoCPUs:  1_000_000_000,
+			PidsLimit: &pidsLimit,
+		},
 	}
+
+	// ハングしたスキャンでワーカーが永久に停止しないようタイムアウトを設ける
+	ctx, cancel := context.WithTimeout(ctx, sandboxTimeout)
+	defer cancel()
 
 	// 前回異常終了等で同名コンテナが残っていた場合は事前に削除
 	_ = s.cli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
@@ -156,11 +180,14 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 		}
 
 		s.logger.Infof("Sandbox finished: container=%s image=%s exitCode=%d", containerName, imageName, status.StatusCode)
-		combinedLogs := stdoutBuf.String()
-		if stderrBuf.Len() > 0 {
-			combinedLogs += "\nSTDERR:\n" + stderrBuf.String()
+		if status.Error != nil {
+			return stdoutBuf.String(), stderrBuf.String(), fmt.Errorf("container %s wait error: %s", containerName, status.Error.Message)
 		}
-		return combinedLogs, strconv.FormatInt(status.StatusCode, 10), nil
+		if status.StatusCode != 0 {
+			// 終了コードは呼び出し側（スキャナー）が判定に使うため ExitError として返す
+			return stdoutBuf.String(), stderrBuf.String(), &ExitError{Code: status.StatusCode}
+		}
+		return stdoutBuf.String(), stderrBuf.String(), nil
 	}
 
 	return "", "-1", fmt.Errorf("unexpected end of container execution for %s", containerName)

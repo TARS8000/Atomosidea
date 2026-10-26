@@ -58,27 +58,41 @@ interface DecodedToken {
   is_admin?: boolean;
 }
 
+const isTokenExpired = (token: string): boolean => {
+  try {
+    const decoded: DecodedToken = jwtDecode(token);
+    return Date.now() >= decoded.exp * 1000;
+  } catch {
+    return true;
+  }
+};
+
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const navigate = useNavigate();
 
+  // サーバーに問い合わせずにローカルの認証状態だけを破棄する
+  const clearSession = useCallback(() => {
+    localStorage.removeItem('token');
+    delete axios.defaults.headers.common['Authorization'];
+    setToken(null);
+    setUser(null);
+  }, []);
+
   const logout = useCallback(async () => {
     const currentToken = localStorage.getItem('token');
-    if (currentToken) {
+    if (currentToken && !isTokenExpired(currentToken)) {
       try {
         await axios.post('/api/auth/logout', {});
       } catch (error) {
         console.error('Logout API call failed:', error);
       }
     }
-    localStorage.removeItem('token');
-    delete axios.defaults.headers.common['Authorization'];
-    setToken(null);
-    setUser(null);
+    clearSession();
     navigate('/login', { replace: true });
-  }, [navigate]);
+  }, [navigate, clearSession]);
 
   useEffect(() => {
     const loadUser = async () => {
@@ -97,10 +111,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
         const decoded: DecodedToken = jwtDecode(storedToken);
 
-        // 期限切れチェック
-        if (Date.now() >= decoded.exp * 1000) {
+        // 期限切れチェック（期限切れトークンでは logout API が 401 になるため、ローカルの破棄のみ行う）
+        if (isTokenExpired(storedToken)) {
           console.warn('[AuthProvider] Token expired');
-          logout();
+          clearSession();
+          navigate('/login', { replace: true });
           setIsLoading(false);
           return;
         }
@@ -130,18 +145,31 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           navigate('/edit-profile', { replace: true });
         }
       } catch (error) {
-        console.error('[AuthProvider] Authentication error:', error);
-        localStorage.removeItem('token');
-        delete axios.defaults.headers.common['Authorization'];
-        setToken(null);
-        setUser(null);
+        // トークン自体が無効（401）な場合のみセッションを破棄する。
+        // プロフィール取得の一時的な失敗等ではログイン状態を維持し、JWT の情報でユーザーを構成する
+        if (axios.isAxiosError(error) && error.response?.status === 401) {
+          console.error('[AuthProvider] Token rejected by server:', error);
+          clearSession();
+        } else {
+          console.error('[AuthProvider] Failed to load profile:', error);
+          try {
+            const decoded: DecodedToken & { username?: string } = jwtDecode(storedToken);
+            setUser({
+              userID: decoded.sub || decoded.userID || decoded.user_id || '',
+              username: decoded.username || '',
+              isAdmin: !!(decoded.isAdmin || decoded.is_admin),
+            });
+          } catch {
+            clearSession();
+          }
+        }
       } finally {
         setIsLoading(false);
       }
     };
 
     loadUser();
-  }, [token, logout, navigate]);
+  }, [token, clearSession, navigate]);
 
   const login = useCallback((newToken: string) => {
     console.log('[AuthProvider] login() called with token');

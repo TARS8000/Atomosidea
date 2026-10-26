@@ -3,12 +3,17 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -16,6 +21,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -39,13 +45,31 @@ type LogMessage struct {
 }
 
 type ContainerInfo struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	Image   string    `json:"image"`
-	Status  string    `json:"status"`
-	State   string    `json:"state"`
-	Created time.Time `json:"created"`
-	IsError bool      `json:"isError"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Image        string   `json:"image"`
+	Status       string   `json:"status"`
+	State        string   `json:"state"`
+	Health       string   `json:"health"`
+	Created      time.Time `json:"created"`
+	StartedAt    string    `json:"startedAt"`
+	Uptime       string    `json:"uptime"`
+	RestartCount int       `json:"restartCount"`
+	Networks     []string  `json:"networks"`
+	IsError      bool      `json:"isError"`
+}
+
+type TopologyNode struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Networks []string `json:"networks"`
+}
+
+type VolumeInfo struct {
+	Name       string              `json:"name"`
+	Driver     string              `json:"driver"`
+	Mountpoint string              `json:"mountpoint"`
+	Labels     map[string]string   `json:"labels"`
 }
 
 type MinioItem struct {
@@ -58,12 +82,94 @@ type MinioItem struct {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     isTrustedRequest,
+}
+
+// allowedHosts はダッシュボードへのアクセスを許可するホスト名。
+// DNS リバインディング対策として Host ヘッダーをこの一覧で検証する。
+// MONITORING_ALLOWED_HOSTS（カンマ区切り）で追加できる。
+var allowedHosts = func() map[string]bool {
+	hosts := map[string]bool{"localhost": true, "127.0.0.1": true, "::1": true}
+	for _, h := range strings.Split(os.Getenv("MONITORING_ALLOWED_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts[strings.ToLower(h)] = true
+		}
+	}
+	return hosts
+}()
+
+func hostnameOf(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return strings.ToLower(strings.Trim(h, "[]"))
+	}
+	return strings.ToLower(strings.Trim(hostport, "[]"))
+}
+
+// isTrustedRequest は Host が許可リストに含まれ、かつ Origin ヘッダーがある場合は
+// 同一ホストからのリクエストであることを確認する。
+// ダッシュボードはコンテナ再起動や MinIO の root 操作ができるため、他サイトのページからの
+// リクエスト（CSRF / クロスサイト WebSocket）を拒否する。
+func isTrustedRequest(r *http.Request) bool {
+	host := hostnameOf(r.Host)
+	if !allowedHosts[host] {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.ToLower(u.Hostname()) == host
 }
 
 var errorKeywords = []string{"ERROR", "FATAL", "panic", "Exception", "failed", "denied", "level=error"}
 
+// ダッシュボードのログイン（HTTP Basic 認証）。MONITOR_USERNAME / MONITOR_PASSWORD（環境変数）と照合する。
+// どちらかが未設定なら全リクエストを拒否する（fail closed）。
+// ブラウザは同一オリジンの fetch と WebSocket のハンドシェイクにも Basic 認証の資格情報を自動で付けるため、
+// フロントエンド側の変更は不要。
+const authRealm = `Basic realm="Atomosidea Monitoring", charset="UTF-8"`
+
+var (
+	monitorUserHash [sha256.Size]byte
+	monitorPassHash [sha256.Size]byte
+	monitorAuthSet  bool
+)
+
+func initMonitorAuth() {
+	user := os.Getenv("MONITOR_USERNAME")
+	pass := os.Getenv("MONITOR_PASSWORD")
+	if user == "" || pass == "" {
+		log.Println("WARNING: MONITOR_USERNAME / MONITOR_PASSWORD is not set. All requests will be rejected.")
+		return
+	}
+	monitorUserHash = sha256.Sum256([]byte(user))
+	monitorPassHash = sha256.Sum256([]byte(pass))
+	monitorAuthSet = true
+}
+
+// isAuthorized は Basic 認証の資格情報を定数時間で比較する（長さの違いも漏らさないようハッシュ同士を比較）。
+func isAuthorized(r *http.Request) bool {
+	if !monitorAuthSet {
+		return false
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	uh := sha256.Sum256([]byte(user))
+	ph := sha256.Sum256([]byte(pass))
+	userOK := subtle.ConstantTimeCompare(uh[:], monitorUserHash[:])
+	passOK := subtle.ConstantTimeCompare(ph[:], monitorPassHash[:])
+	return userOK&passOK == 1
+}
+
 func main() {
+	initMonitorAuth()
+
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Fatalf("Failed to create Docker client: %v", err)
@@ -71,24 +177,42 @@ func main() {
 
 	router := mux.NewRouter()
 
-	// CORSミドルウェア
+	// 同一オリジン以外からのアクセスを拒否し、Basic 認証を必須にするミドルウェア
+	// (フロントエンドは同じ nginx から配信されるため CORS ヘッダーは不要)
 	router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if !isTrustedRequest(r) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if !monitorAuthSet {
+				http.Error(w, "Monitoring login is not configured (set MONITOR_USERNAME / MONITOR_PASSWORD)", http.StatusServiceUnavailable)
+				return
+			}
+			if !isAuthorized(r) {
+				w.Header().Set("WWW-Authenticate", authRealm)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
 			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	})
 
+	// nginx の auth_request 用（UI の静的ファイルも同じ資格情報で保護する）。認証はミドルウェアで済んでいる
+	router.HandleFunc("/auth/check", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}).Methods("GET", "HEAD")
+
 	router.HandleFunc("/api/containers", getContainers(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/stats", getContainerStats(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/restart/{name}", restartContainer(cli)).Methods("POST", "OPTIONS")
 	router.HandleFunc("/api/connections/count", getActiveUserCount(cli)).Methods("GET")
+	router.HandleFunc("/api/topology", getTopology(cli)).Methods("GET")
+	router.HandleFunc("/api/volumes", listVolumes(cli)).Methods("GET")
 
 	// ルーティング修正: パス変数とクエリパラメーターの両方に対応
 	router.HandleFunc("/ws/logs", serveWs(cli)).Methods("GET")
@@ -238,24 +362,139 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 		}
 
 		var containerInfos []ContainerInfo
-		for _, c := range containers {
-			name := strings.TrimPrefix(c.Names[0], "/")
-			createdTime := time.Unix(c.Created, 0)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
 
-			info := ContainerInfo{
-				ID:      c.ID[:12],
-				Name:    name,
-				Image:   c.Image,
-				Status:  c.Status,
-				State:   c.State,
-				Created: createdTime,
-				IsError: false,
-			}
-			containerInfos = append(containerInfos, info)
+		for _, c := range containers {
+			wg.Add(1)
+			go func(c types.Container) {
+				defer wg.Done()
+				name := strings.TrimPrefix(c.Names[0], "/")
+				createdTime := time.Unix(c.Created, 0)
+
+				meta := inspectContainerMeta(cli, c.ID)
+				info := ContainerInfo{
+					ID:           c.ID[:12],
+					Name:         name,
+					Image:        c.Image,
+					Status:       c.Status,
+					State:        c.State,
+					RestartCount: meta.restartCount,
+					Created:      createdTime,
+					Networks:     getContainerNetworks(cli, c.ID),
+					Health:       meta.health,
+					StartedAt:    meta.startedAt,
+					Uptime:       getContainerUptime(meta.startedAt),
+					IsError:      false,
+				}
+				mu.Lock()
+				containerInfos = append(containerInfos, info)
+				mu.Unlock()
+			}(c)
 		}
+		wg.Wait()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(containerInfos)
+	}
+}
+
+func getContainerNetworks(cli *client.Client, id string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return nil
+	}
+	networks := make([]string, 0, len(info.NetworkSettings.Networks))
+	for name := range info.NetworkSettings.Networks {
+		networks = append(networks, name)
+	}
+	return networks
+}
+
+type containerMeta struct {
+	restartCount int
+	health       string
+	startedAt    string
+}
+
+func inspectContainerMeta(cli *client.Client, id string) containerMeta {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := cli.ContainerInspect(ctx, id)
+	if err != nil || info.State == nil {
+		return containerMeta{}
+	}
+	var health string
+	if info.State.Health != nil {
+		health = info.State.Health.Status
+	}
+	var startedAt string
+	if info.State.StartedAt != "" {
+		startedAt = info.State.StartedAt
+	}
+	return containerMeta{
+		restartCount: int(info.RestartCount),
+		health:       health,
+		startedAt:    startedAt,
+	}
+}
+
+func getContainerUptime(startedAt string) string {
+	if startedAt == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+		return time.Since(t).Round(time.Second).String()
+	}
+	return ""
+}
+
+func getTopology(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		containers, err := cli.ContainerList(context.Background(), container.ListOptions{All: true})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to list containers: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		nodes := make([]TopologyNode, 0, len(containers))
+		for _, c := range containers {
+			name := strings.TrimPrefix(c.Names[0], "/")
+			nodes = append(nodes, TopologyNode{
+				ID:       c.ID[:12],
+				Name:     name,
+				Networks: getContainerNetworks(cli, c.ID),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(nodes)
+	}
+}
+
+func listVolumes(cli *client.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		resp, err := cli.VolumeList(ctx, volume.ListOptions{})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to list volumes: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		vols := make([]VolumeInfo, 0, len(resp.Volumes))
+		for _, v := range resp.Volumes {
+			vols = append(vols, VolumeInfo{
+				Name:       v.Name,
+				Driver:     v.Driver,
+				Mountpoint: v.Mountpoint,
+				Labels:     v.Labels,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(vols)
 	}
 }
 

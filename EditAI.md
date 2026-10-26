@@ -1,1149 +1,1024 @@
-# Atmosidea プロジェクト 完全技術仕様書
+# Atomosidea — AI 向け技術仕様書（現行版）
 
-このドキュメントは、`Atmosidea`プロジェクトの全体像、アーキテクチャ、設計思想、操作方法、そして将来の展望までを網羅的に解説するものです。このドキュメントを読むことで、プロジェクトの知識がない開発者（またはAI）でも、システムの全体像と「なぜ」そうなっているのかを完全に理解できることを目的とします。
-絶対遵守（AIは必ずこれを読み守ること）：本文中の内容は絶対に消去しないでください。基本的に内容を追記していく場合でお願いします。大規模な消去を行う場合は必ずユーザーの許可を取ってください。
+このドキュメントは、`Atomosidea`（アトモシデア）の**現在の実装**を、AI がコードを変更するときに参照できる形で記述したものです。
+記載しているパス・テーブル名・キュー名・環境変数名・ポートは、`docker-compose.yml` と `backend/` 以下の実ファイルと照合済みです（最終照合: 2026-10-26、既知の問題への対応後）。
+
+---
+
+## 0. このドキュメントの使い方（AI は最初に必ず読むこと）
+
+### 0.1. 絶対遵守のルール
+
+1. **本文の内容を消去しない。** 基本的に追記・修正で更新する。
+2. **大規模な消去を行う場合は、必ずユーザーの許可を取る。**
+3. このドキュメントは「現在地」を記録する。変更履歴（チェンジログ）は積み重ねず、常に単一の現行状態を記述する。
+   - 古い記述が誤りだと分かった場合は、本文を正しい内容に直したうえで、元の誤った記述を [14. よくある誤解](#14-よくある誤解旧ドキュメントとの差分) に残す。
+4. 実装パス・環境変数名・DB スキーマ・Redis キュー名・API レスポンスを変更したら、**このドキュメントの対応箇所も同じ変更で更新する。**
+
+### 0.2. 情報の優先順位
+
+ドキュメントとコードが食い違ったときは、次の順に信頼する。
+
+1. `docker-compose.yml`（サービス・ネットワーク・環境変数・ボリュームの正）
+2. `backend/` 以下の実コードと `init.sql`
+3. このドキュメント（`EditAI.md`）
+4. `README.md`、`AI_PROJECT_GUIDE.md`、`Docs/*.md`、`SECURITY_EXPLANATION.md`
+
+### 0.3. 目的別の参照先
+
+| やりたいこと | 見る節 |
+|---|---|
+| どのサービスがどのファイルにあるか | [4. サービス一覧](#4-サービス一覧) |
+| テーブル・カラムを確認したい | [5. データベース](#5-データベース) |
+| バケット・MinIO ユーザーを確認したい | [6. オブジェクトストレージ（MinIO）](#6-オブジェクトストレージminio) |
+| キュー名・イベント形式を確認したい | [7. Redis と共有パッケージ](#7-redis-と共有パッケージshared) |
+| アップロード処理を変更したい | [8. 処理フロー](#8-処理フロー) |
+| エンドポイントを追加・変更したい | [9. API 一覧](#9-api-一覧) と [10. Nginx](#10-nginxapi-ゲートウェイ) |
+| 認証・権限を変更したい | [11. 認証・認可](#11-認証認可) |
+| スキャンやサンドボックスを変更したい | [12. セキュリティモデル](#12-セキュリティモデル) |
+| ビルドが失敗する | [13. ビルドと依存関係の制約](#13-ビルドと依存関係の制約) と [16. トラブルシューティング](#16-トラブルシューティング) |
+| 変更前の最終確認 | [17. 変更時のチェックリスト](#17-変更時のチェックリスト) |
+
+---
 
 ## 目次
-1.  [プロジェクト概要](#1-プロジェクト概要)
-2.  [技術スタック](#2-技術スタック)
-3.  [システムアーキテクチャ](#3-システムアーキテクチャ)
-    -   [3.1. 概念図](#31-概念図)
-    -   [3.2. サービス（コンテナ）詳細](#32-サービスコンテナ詳細)
-4.  [主要なワークフロー](#4-主要なワークフロー)
-    -   [4.1. ユーザー認証フロー](#41-ユーザー認証フロー)
-    -   [4.2. ゲームアップロードと処理フロー（最重要）](#42-ゲームアップロードと処理フロー最重要)
-    -   [4.3. 静的サイトアップロードと処理フロー](#43-静的サイトアップロードと処理フロー)
-5.  [表示ロジックの核心（設計思想）](#5-表示ロジックの核心設計思想)
-    -   [5.1. ゲーム表示ロジック](#51-ゲーム表示ロジック)
-    -   [5.2. 動画表示ロジック](#52-動画表示ロジック)
-6.  [認証と認可の仕様（重要）](#6-認証と認可の仕様重要)
-    -   [6.1. 削除・編集時の認証](#61-削除編集時の認証)
-7.  [Nginx設定の規約と設計思想（重要）](#7-nginx設定の規約と設計思想重要)
-    -   [7.1. APIゲートウェイとしての役割](#71-api-ゲートウェイとしての役割)
-    -   [7.2. `proxy_pass`の規約: 末尾のスラッシュ](#72-proxy_passの規約-末尾のスラッシュ)
-    -   [7.3. ヘッダー転送の重要性](#73-ヘッダー転送の重要性)
-    -   [7.4. `location`ブロックの評価順序と使い分け](#74-locationブロックの評価順序と使い分け)
-    -   [7.5. `if`文の例外的使用（技術的負債）](#75-if文の例外的使用技術的負債)
-8.  [APIエンドポイント一覧](#8-apiエンドポイント一覧)
-9.  [ディレクトリと主要ファイルの役割](#9-ディレクトリと主要ファイルの役割)
-10. [データベーススキーマ](#10-データベーススキーマ)
-    -   [10.1. `users` テーブル](#101-users-テーブル)
-    -   [10.2. `games` テーブル](#102-games-テーブル)
-    -   [10.3. `static_sites` テーブル](#103-static_sites-テーブル)
-11. [セットアップと開発フロー](#11-セットアップと開発フロー)
-    -   [11.1. 環境設定 (`.env`)](#111-環境設定-env)
-    -   [11.2. 管理用スクリプト (`.bat`)](#112-管理用スクリプト-bat)
-    -   [11.3. 日常の開発サイクル](#113-日常の開発サイクル)
-12. [将来の課題と改善点](#12-将来の課題と改善点)
-13. [最近の主な変更点 (2026/08/01)](#13-最近の主な変更点-20260801)
-14. [最近の主な変更点 (2026/08/05)](#14-最近の主な変更点-20260805)
-15. [最近の主な変更点 (2026/08/06)](#15-最近の主な変更点-20260806)
-16. [セキュリティモデルの設計思想と注意点](#16-セキュリティモデルの設計思想と注意点)
-17. [セキュリティモデルの設計思想と注意点 (2)](#17-セキュリティモデルの設計思想と注意点-2)
-18. [最近の主な変更点 (2026/08/08)](#18-最近の主な変更点-20260808)
-19. [編集内容の概要 (EDIT_SUMMARY.md)](#19-編集内容の概要-edit_summarymd)
+
+0. [このドキュメントの使い方](#0-このドキュメントの使い方ai-は最初に必ず読むこと)
+1. [プロジェクト概要](#1-プロジェクト概要)
+2. [技術スタック](#2-技術スタック)
+3. [アーキテクチャ全体](#3-アーキテクチャ全体)
+4. [サービス一覧](#4-サービス一覧)
+5. [データベース](#5-データベース)
+6. [オブジェクトストレージ（MinIO）](#6-オブジェクトストレージminio)
+7. [Redis と共有パッケージ（shared）](#7-redis-と共有パッケージshared)
+8. [処理フロー](#8-処理フロー)
+9. [API 一覧](#9-api-一覧)
+10. [Nginx（API ゲートウェイ）](#10-nginxapi-ゲートウェイ)
+11. [認証・認可](#11-認証認可)
+12. [セキュリティモデル](#12-セキュリティモデル)
+13. [ビルドと依存関係の制約](#13-ビルドと依存関係の制約)
+14. [よくある誤解（旧ドキュメントとの差分）](#14-よくある誤解旧ドキュメントとの差分)
+15. [既知の問題（未対応）](#15-既知の問題未対応)
+16. [トラブルシューティング](#16-トラブルシューティング)
+17. [変更時のチェックリスト](#17-変更時のチェックリスト)
+18. [セットアップと管理用スクリプト](#18-セットアップと管理用スクリプト)
 
 ---
 
 ## 1. プロジェクト概要
 
-`Atmosidea`は、動画、Unity WebGLゲーム、そして静的Webサイトのアップロード、共有、閲覧を行うためのWebアプリケーションです。マイクロサービスアーキテクチャを採用し、スケーラビリティとメンテナンス性を高めています。
+- **何か**: 動画共有・Unity WebGL ゲーム配信・静的サイトホスティング・ユーザープロフィール・チームを統合したコンテンツプラットフォーム。
+- **構成**: 機能ごとに独立した Go サービス（マイクロサービス）を Docker Compose で動かす。入口は `frontend` コンテナの Nginx だけ。
+- **公開までの原則**: アップロードされたファイルは、必ず SFSP（Secure File Scanning Platform）でスキャンされ、`clean` と判定されたものだけが公開される。
+- **利用者**: コンテンツクリエイター（動画制作者・ゲーム開発者・Web デザイナー）と閲覧者。
+
+---
 
 ## 2. 技術スタック
 
--   **フロントエンド**: React, TypeScript, Material-UI, Vite
--   **バックエンド**: Go, Gin
--   **データベース**: PostgreSQL
--   **メッセージキュー**: Redis
--   **オブジェクトストレージ**: MinIO (`game-storage`, `profile-storage`, `static-site-storage`)
--   **コンテナ・オーケストレーション**: Docker, Docker Compose
--   **リバースプロキシ / APIゲートウェイ**: Nginx
+| 分類 | 技術 | 用途 |
+|---|---|---|
+| フロントエンド | React, Vite, TypeScript | SPA |
+| | MUI (`@mui/material`, `@mui/icons-material`) | UI コンポーネント |
+| | Axios | HTTP。`AuthContext.tsx` のインターセプターが `Authorization` を付与 |
+| | React Router DOM | ルーティング |
+| | hls.js | HLS 再生 |
+| | jwt-decode | JWT のデコード（期限切れ判定・ユーザー情報） |
+| | react-image-crop | アイコン・背景画像の切り抜き |
+| バックエンド | Go 1.25 | 全サービス |
+| | Gin | HTTP ルーター（監視サービスのみ gorilla/mux + gorilla/websocket） |
+| | pgx/v5 | PostgreSQL（プレースホルダ `$1` を使用。static-site-upload-api / static-site-worker は lib/pq） |
+| | minio-go/v7 | MinIO |
+| | go-redis/v8 | Redis |
+| | golang-jwt/jwt/v5 | JWT（HS256） |
+| データ | PostgreSQL 16 ×5 | `auth-db` / `app-db` / `profile-db` / `team-db` / `sfsp-db` |
+| | Redis 7 | ジョブキュー・完了イベント・JWT ブロックリスト |
+| | MinIO ×1 | オブジェクトストレージ（バケットとユーザーで分離） |
+| セキュリティ | ClamAV, YARA | アップロードのスキャン（Docker サンドボックス内） |
+| 動画 | FFmpeg | HLS 変換・サムネイル生成（`video-upload-api` 内で実行） |
+| 監視 | monitoring-service | Docker ソケット経由のダッシュボード（別 compose） |
 
-## 3. システムアーキテクチャ
+---
 
-### 3.1. 概念図
+## 3. アーキテクチャ全体
+
+### 3.1. リクエストの流れ
 
 ```
-[ユーザー] -> [ブラウザ] -> [Nginx (frontend:80)]
-                                |
-           /api/auth/**         +-> [auth-service:8080] ----> [auth-db:5432]
-           /api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO (profile-storage:9000)] (for icons)
-           /api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
-                                |
-           /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
-                                |   [video-worker:8081] --> [app-db:5432]
-                                |
-           /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
-           /games/**            +-> [MinIO (game-storage:9000)]
-                                |
-           /api/static-sites/** +-> [static-site-upload-api:8085] -> [app-db:5432] -> [Redis:6379]
-           /static-sites/**     +-> [MinIO (static-site-storage:9000)]
-                                |
-           (非同期処理)         [game-worker] <- [Redis:6379] -> [MinIO (game-storage:9000)]
-                                                              -> [app-db:5432]
-           (非同期処理)         [static-site-worker] <- [Redis:6379] -> [MinIO (static-site-storage:9000)]
-                                                                      -> [app-db:5432]
+[ブラウザ] ──:3001──▶ [frontend: Nginx]
+   │
+   ├─ /                         → React（/usr/share/nginx/html）
+   ├─ /api/auth/**              → auth-service:8080
+   ├─ /api/profile/**           → profile-service:8084
+   ├─ /api/my/**                → mypage-service:8083
+   ├─ /api/teams/**             → team-service:8080
+   ├─ /api/games/**             → game-upload-api:8082
+   ├─ /api/static-sites/**      → static-site-upload-api:8085
+   ├─ /api/videos/upload        → video-upload-api:8080
+   ├─ /api/videos/delete/:id    → video-upload-api:8080（/api/videos/:id に書き換え）
+   ├─ /api/videos/:id/thumbnail → video-upload-api:8080（サムネイル削除）
+   ├─ /api/videos/:id/stream/*  → MinIO videos/<id>/*（HLS）
+   ├─ /api/videos/**            → video-worker:8081
+   ├─ /videos|games|static-sites/thumbnails/*, /user-profiles/* → MinIO
+   └─ /games/<id>/*             → 404（メインオリジンでは配信しない）
+
+[ブラウザ] ──:3001, Host: <10桁id>.localhost──▶ [frontend: Nginx サブドメイン用 server]
+   └─ /* → MinIO games/<id>/*、無ければ static-sites/<id>/*
 ```
 
-### 3.2. サービス（コンテナ）詳細
+### 3.2. 非同期処理（スキャン → 公開）
 
-| サービス名              | 内部ポート | 技術          | 責務                                                                                                                                                             |
-| ----------------------- | ---------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `frontend`              | `80`       | Nginx, React  | **UI/APIゲートウェイ**: Reactアプリを提供し、`/api`以下のリクエストを各バックエンドサービスに振り分ける。                                                              |
-| `auth-service`          | `8080`     | Go, Gin       | **認証**: ユーザー登録、Google OAuth、JWT発行を担当。**`auth-db`**に接続。                                                                                        |
-| `profile-service`       | `8084`     | Go, Gin       | **プロフィール管理**: ユーザー名、自己紹介、アイコン、背景画像の取得・更新を担当。**`auth-db`**と**`profile-storage`**に接続。                                        |
-| `mypage-service`        | `8083`     | Go, Gin       | **マイページ**: ログインユーザーの投稿コンテンツ一覧（動画・ゲーム・静的サイト）を取得。**`app-db`**に接続。                                                       |
-| `video-upload-api`        | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
-| `video-worker`        | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
-| `game-upload-api`       | `8082`     | Go, Gin       | **ゲームメタデータAPI**: ゲームのメタデータ管理と、`game-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                                                 |
-| `game-worker`           | -          | Go            | **ゲーム非同期処理**: RedisからJobを受け取り、ZIP解凍、解像度抽出、MinIOへのファイルアップロード、DB更新といった時間のかかる処理を実行。**`app-db`**に接続。          |
-| `static-site-upload-api`| `8085`     | Go, Gin       | **静的サイトAPI**: 静的サイトのZIPアップロード受付、メタデータ管理、`static-site-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                         |
-| `static-site-worker`    | -          | Go            | **静的サイト非同期処理**: RedisからJobを受け取り、ZIP解凍、MinIOへのファイルアップロードを実行。**`app-db`**に接続。                                               |
-| `auth-db`               | `5432`     | PostgreSQL    | **認証・ユーザーDB**: ユーザー情報、プロフィール、アカウント状態を永続化。                                                                                       |
-| `app-db`                | `5432`     | PostgreSQL    | **アプリケーションDB**: 動画、ゲーム、静的サイトのメタデータを永続化。                                                                                           |
-| `redis`                 | `6379`     | Redis         | **メッセージキュー**: `game-upload-api`/`game-worker`間、`static-site-upload-api`/`static-site-worker`間の非同期タスクの受け渡し。                               |
-| `game-storage`          | `9000`     | MinIO         | **オブジェクトストレージ**: ゲームの全アセット（HTML, JS, WASM等）をホスト。                                                                                       |
-| `profile-storage`       | `9000`     | MinIO         | **オブジェクトストレージ**: プロフィール画像（アイコン、背景）をホスト。                                                                                           |
-| `static-site-storage`   | `9000`     | MinIO         | **オブジェクトストレージ**: 静的サイトのHTML, CSS, JSなどのファイルをホスト。                                                                                      |
+```
+アップロード API ──POST /api/v1/files──▶ sfsp-api ──▶ MinIO raw-files
+                                            └──LPUSH──▶ Redis sfsp:scan_queue
+sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:processing）
+   │ zip を上限付きで展開 → 展開したディレクトリ全体を ClamAV(-r) + YARA(-r) でスキャン（サンドボックス）
+   ├─ clean                → MinIO clean-files
+   ├─ malicious/suspicious → MinIO quarantine
+   └─ LPUSH ScanCompletionEvent ──▶ sfsp:completed:<target> → 終端状態の記録とイベント発行の後に Ack
+各ワーカー ◀──BRPOPLPUSH── sfsp:completed:<target>（→ :processing。clean のときだけ公開処理、終端状態を DB に書いてから Ack）
+```
 
-## 4. 主要なワークフロー
+- 取り出しは `backend/shared/queue` の `DequeueReliable` / `Ack` / `RecoverProcessing`（SFSP は `internal/queue` に同じもの）。起動時に `RecoverProcessing` で `<queue>:processing` に残ったメッセージを元のキューに戻す。各キューのコンシューマーは 1 つである前提。
 
-### 4.1. ユーザー認証フロー
-1.  ユーザーがログイン情報を入力すると、`frontend`は`/api/auth/login`にリクエストを送信。
-2.  Nginxがリクエストを`auth-service`に転送。
-3.  `auth-service`はDBのユーザー情報を検証し、成功すればJWT（ペイロードに`userID`, `username`, `isAdmin`を含む）を生成して返す。
-4.  `frontend`は受け取ったJWTを`localStorage`に保存し、以降のAPIリクエストの`Authorization`ヘッダーに含める。
+### 3.3. ネットワーク（`docker-compose.yml` より）
 
-### 4.2. ゲームアップロードと処理フロー（最重要）
-本システムで最も重要な非同期処理フローです。
-1.  **アップロード**: ユーザーが`frontend`からゲームのZIPファイルをアップロード。
-2.  **API受付**: `frontend`は`/api/games/upload`にリクエストを送信。Nginx経由で`game-upload-api`がこれを受け取る。
-3.  **一次保存とJob発行**:
-    -   `game-upload-api`は受け取ったZIPファイルを直接MinIOに一次保存。
-    -   DBの`games`テーブルに`status: 'processing'`でレコードを作成し、`gameId`を取得。
-    -   Redisキューに`{gameId, objectName}`を含むJobをPushする。
-    -   `frontend`に`gameId`を返し、`AdjustGamePage`へリダイレクトさせる。
-4.  **非同期処理**:
-    -   `game-worker`がRedisキューからJobを取得。
-    -   MinIOからZIPファイルをダウンロードし、解凍。
-    -   `index.html`を**正規表現で解析**し、`canvas.style.width`や`width="..."`属性から**ネイティブ解像度（`native_width`, `native_height`）を抽出**。
-    -   解凍した全ファイルを、`/{gameId}/`というプレフィックスでMinIOに再アップロード。
-    -   DBの該当ゲームレコードを`status: 'public'`に更新し、`game_url`と抽出した解像度を保存。
-5.  **ポーリングと表示**:
-    -   `AdjustGamePage`は、`status`が`'public'`になるまで`/api/games/{id}`を数秒おきにポーリング（問い合わせ）。
-    -   `status`が`'public'`になると、ポーリングを停止し、取得した`game_url`と`native_width`/`height`を使ってプレビューを表示する。
+| ネットワーク | 接続しているサービス |
+|---|---|
+| `atmosidea-network`（外向き通信あり） | redis, minio, minio-init, frontend, auth-service, profile-service, team-service, mypage-service, video-upload-api, video-worker, game-upload-api, game-worker, static-site-upload-api, static-site-worker |
+| `backend-db-network`（`internal: true`） | auth-db, app-db, profile-db, team-db, db-role-init, auth-service, profile-service, team-service, mypage-service, 各アップロード API / ワーカー, sfsp-worker（app-db 用） |
+| `sfsp-isolated-net`（`internal: true`） | redis, minio, minio-init, 各アップロード API / ワーカー, profile-service, sfsp-api, sfsp-worker |
+| `sfsp-db-network`（`internal: true`） | sfsp-db, sfsp-api, sfsp-worker のみ |
+| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy, sfsp-worker のみ |
 
-### 4.3. 静的サイトアップロードと処理フロー
-1.  **アップロード**: ユーザーが`frontend`から静적サイトのZIPファイルをアップロード。
-2.  **API受付**: `frontend`は`/api/static-sites/upload`にリクエストを送信。Nginx経由で`static-site-upload-api`がこれを受け取る。
-3.  **一次保存とJob発行**:
-    -   `static-site-upload-api`は受け取ったZIPファイルをMinIO (`static-site-storage`) に一次保存。
-    -   DBの`static_sites`テーブルに`status: 'processing'`でレコードを作成し、`siteId`を取得。
-    -   Redisキューに`{siteId, objectName}`を含むJobをPushする。
-    -   `frontend`に`siteId`を返し、サイト詳細ページへリダイレクトさせる。
-4.  **非同期処理**:
-    -   `static-site-worker`がRedisキューからJobを取得。
-    -   MinIOからZIPファイルをダウンロードし、解凍。
-    -   解凍した全ファイルを、`/{siteId}/`というプレフィックスでMinIO (`static-site-storage`) に再アップロード。
-    -   DBの該当サイトレコードを`status: 'public'`に更新し、`minio_path`を保存。
-5.  **表示**:
-    -   ユーザーは`/static-sites/{siteId}/index.html`のようなURLで静的サイトにアクセスできる。Nginxがこのリクエストを`static-site-storage`にプロキシする。
+- `internal: true` のネットワークは外へ出られない。Google OAuth など外部通信が必要なサービスは `atmosidea-network` にも参加させる。
+- ネットワーク定義を変えた後は `docker compose down` → `up -d` で作り直す必要がある（そのままだと「network needs to be recreated」で失敗する）。
+- ホストに公開されているポートは `frontend` の `3001:80` だけ。DB・Redis・MinIO はホストに公開していない。
+- スキャナーを実行するサンドボックスのコンテナは `NetworkMode: none`（ネットワークなし）。
 
-## 5. 表示ロジックの核心（設計思想）
+---
 
-### 5.1. ゲーム表示ロジック
-**課題**: Unityゲームは様々な解像度で作成されるため、固定の`iframe`サイズに合わせると、UIの見切れやアスペクト比の歪みが発生する。
-**解決思想**: Unityのレンダリング解像度には介入せず、React側でCSSの`transform: scale()`を用いて「見た目」だけをスケーリングする。
+## 4. サービス一覧
 
--   **通常表示 (800x450のコンテナ内)**:
-    1.  `game-worker`はUnityの`index.html`に**一切のサイズ変更を加えず**、フッター非表示などの最小限のCSSのみを注入する。
-    2.  `GameDetailPage`は、DBから取得した**ネイティブ解像度**（例: `960x600`）を持つ`<Box>`コンテナを生成する。
-    3.  この`<Box>`の中に、`width: 100%`, `height: 100%`の`iframe`を配置する。
-    4.  `800x450`の親コンテナ（`<Paper>`）に収めるための基本縮小率（`baseScale`）を計算する。
-    5.  `<Box>`に`transform: scale(baseScale * game.scale)`を適用し、見た目上だけを縮小・調整する。
-    6.  これにより、Unityは常にネイティブ解像度でレンダリングするため、UIの見切れや歪みが発生しない。
+ビルドは `context: .`（プロジェクトルート）で、各 Dockerfile が `COPY . .` の後 `WORKDIR /app/<サービスのパス>` でビルドする（理由は [13 章](#13-ビルドと依存関係の制約)）。
 
--   **フルスクリーン表示**:
-    1.  `GameDetailPage`が`fullscreenchange`イベントを検知し、`isFullscreen`ステートを更新する。
-    2.  `isFullscreen`が`true`の場合、`Math.max(画面幅 / ゲーム幅, 画面高さ / ゲーム高さ)`の計算により、画面を完全に覆う「カバー」表示のための拡大率を動的に算出。
-    3.  この拡大率を`<Box>`の`transform: scale()`に適用し、ゲーム画面を拡大する。**ユーザーが設定したオフセット値は無視され、常に中央に配置される。**
-    4.  通常表示とフルスクリーン表示の切り替えは、`transform`プロパティの変更のみで行われるため、CSSの`transition`によって滑らかなズームアニメーションが実現される。
+| サービス | コンテナ名 | 内部ポート | 実装（`main.go` の場所） | 責務 |
+|---|---|---|---|---|
+| `frontend` | atmosidea-frontend | 80（ホスト 3001） | `frontend/`（`nginx.conf` はボリュームでマウント） | React 配信、API ゲートウェイ、MinIO へのプロキシ |
+| `auth-service` | atmosidea-auth-service | 8080 | `backend/auth/auth-worker/` | 登録・ログイン・Google OAuth・JWT・ログアウト・アカウント削除 |
+| `profile-service` | atmosidea-profile-service | 8084 | `backend/profile-service/profile-worker/` | プロフィール CRUD、画像のスキャン依頼、`sfsp:completed:profile` の処理 |
+| `mypage-service` | atmosidea-mypage-service | 8083 | `backend/profile-service/mypage-worker/` | 自分の投稿一覧 |
+| `team-service` | atmosidea-team-service | 8080 | `backend/team-service/team-worker/` | チーム・メンバー・加入申請・投稿・権限確認 |
+| `video-upload-api` | atmosidea-video-upload-api | 8080 | `backend/video-service/video-upload-api/` | 動画アップロード、**`sfsp:completed:stream` の処理（FFmpeg で HLS 変換）**、動画削除 |
+| `video-worker` | atmosidea-video-worker | 8081 | `backend/video-service/video-worker/` | 動画の一覧・詳細・更新 API、`sfsp:completed:video-thumbnail` の処理 |
+| `game-upload-api` | atmosidea-game-upload-api | 8082 | `backend/game-service/game-upload-api/` | ゲームのアップロード・一覧・詳細・更新・調整・削除 |
+| `game-worker` | atmosidea-game-worker | — | `backend/game-service/game-worker/` | `sfsp:completed:game` / `game-thumbnail` の処理 |
+| `static-site-upload-api` | atmosidea-static-site-upload-api | 8085 | `backend/static-site-service/static-site-upload-api/` | 静的サイトのアップロード・一覧・詳細・更新・削除 |
+| `static-site-worker` | atmosidea-static-site-worker | — | `backend/static-site-service/static-site-worker/` | `sfsp:completed:static-site` / `site-thumbnail` の処理 |
+| `sfsp-api` | sfsp-api | 8080 | `backend/security/sfsp/cmd/sfsp-api/`、`internal/api/` | スキャン依頼の受付、ジョブ登録 |
+| `sfsp-worker` | sfsp-worker | — | `backend/security/sfsp/cmd/sfsp-worker/`、`internal/worker/` | スキャン実行、結果イベントの発行、公開後のクリーンアップ |
+| `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用 |
+| `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用 |
+| `sfsp-scan-volume-init` | sfsp-scan-volume-init | — | docker-compose.yml（`sfsp-yara-client` イメージを root で一時利用） | 起動のたびに 1 回だけ動き、スキャン用ボリューム `sfsp_temp_scan` の所有者を 10001 に揃える（非 root 化前に作られた既存ボリューム用）。`CHOWN` / `FOWNER` / `DAC_READ_SEARCH` のみ許可、ネットワークなし、読み取り専用ルート。`sfsp-worker` はこの完了を待つ |
+| `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | sfsp-worker 用の Docker API プロキシ。`CONTAINERS` / `IMAGES` / `POST` / `PING` / `VERSION` のみ許可 |
+| `db-role-init` | atmosidea-db-role-init | — | `backend/db-init/sync-role-passwords.sh` | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを `ALTER ROLE` する |
+| `auth-db` ほか DB | atmosidea-*-db / sfsp-db | 5432 | 各 `init.sql` | [5 章](#5-データベース) |
+| `redis` | atmosidea-redis | 6379 | — | [7 章](#7-redis-と共有パッケージshared) |
+| `minio` | atmosidea-minio | 9000 | データ: `./backend/storage_data` | [6 章](#6-オブジェクトストレージminio) |
+| `minio-init` | atmosidea-minio-init | — | `docker-compose.yml` の entrypoint、`backend/minio-init/*.json` | バケット・ポリシー・ユーザーの作成（起動のたびに 1 回実行） |
 
-### 5.2. 動画表示ロジック
--   動画は`800x450`の固定サイズの黒いコンテナ内に表示。
--   `<video>`タグに`object-fit: contain`スタイルを適用。これにより、動画のアスペクト比を維持したままコンテナ内に収まり、アスペクト比が異なる場合は自動的に黒帯（レターボックスまたはピラーボックス）が追加される。
+監視ダッシュボード（別 compose: `monitoring-service/docker-compose.monitoring.yml`）
 
-## 6. 認証と認可の仕様（重要）
+| サービス | コンテナ名 | ポート | 実装 |
+|---|---|---|---|
+| `mon-nginx` | mon-nginx | `127.0.0.1:8090:80` | `monitoring-service/nginx.conf` |
+| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットを `:ro` でマウント。全ルートで HTTP Basic 認証） |
+| `mon-frontend` | mon-frontend-builder | — | `monitoring-service/frontend/`（ビルドして `dist/` に出力するだけ） |
 
-### 6.1. 削除・編集時の認証
-**課題**: 誰でもコンテンツを削除・編集できてしまうと、セキュリティ上の問題となる。
-**解決策**: コンテンツの所有者または管理者のみが操作できるように、バックエンドで厳格な認可チェックを行う。
+### 4.1. フロントエンドのルート（`frontend/src/App.tsx`）
 
--   **フロントエンドの責務**: `DELETE`や`PUT`リクエストを送信する際、必ず`Authorization: Bearer <token>`ヘッダーを付与する。
-    ```javascript
-    // 例: GameDetailPage.tsx
-    await axios.delete(`/api/games/${gameIdFromPath}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    ```
--   **バックエンドの責務**:
-    1.  `authMiddleware`がJWTを検証し、リクエストコンテキストに`userID`と`isAdmin`フラグをセットする。
-    2.  各ハンドラ（`deleteGameHandler`など）は、まずDBからコンテンツの`uploader_id`を取得する。
-    3.  コンテキストの`userID`が`uploader_id`と一致するか、または`isAdmin`が`true`であるかを検証する。条件を満たさない場合は`403 Forbidden`エラーを返す。
+| パス | ページ |
+|---|---|
+| `/` | `HomePage` |
+| `/upload`（`?type=game` / `?type=site`） | `UnifiedUploadPage` |
+| `/upload-game`, `/upload-static-site` | `/upload?type=...` へリダイレクト |
+| `/login`, `/register`, `/login/success` | `LoginPage`, `RegisterPage`, `LoginSuccessPage` |
+| `/videos/:id`, `/games/:id`, `/static-sites/:id` | `VideoDetailPage`, `GameDetailPage`, `StaticSiteDetailPage` |
+| `/edit-video/:id`, `/edit-game/:id`, `/edit-static-site/:id` | `EditVideoPage`, `EditGamePage`, `EditStaticSitePage` |
+| `/adjust-game/:id` | `AdjustGamePage` |
+| `/mypage`, `/edit-profile` | `MyPage`, `EditProfilePage` |
+| `/teams`, `/teams/:token` | `TeamListPage`, `TeamDetailPage` |
 
-## 7. Nginx設定の規約と設計思想（重要）
+共通コンポーネント: `components/Header.tsx`, `PrivateRoute.tsx`, `ImageCropperModal.tsx`, `AccountDeletionModal.tsx`。チーム API のクライアント: `api/team.ts`。認証状態: `context/AuthContext.tsx`。
 
-このプロジェクトの`nginx.conf`は、単なる静的ファイル配信だけでなく、システム全体の入り口となる**APIゲートウェイ**としての重要な役割を担っています。将来の変更時にも以下の規約を維持することで、システムの安定性を保ってください。
+---
 
-### 7.1. APIゲートウェイとしての役割
--   **責務**: `frontend`コンテナ内のNginxは、すべてのHTTPリクエストを受け取ります。
--   **静的コンテンツ**: `/`など、API以外のパスへのリクエストには、ビルドされたReactアプリ (`index.html`) を返します。
--   **動的コンテンツ**: `/api/...` へのリクエストは、パスに応じて適切なバックエンドサービスに転送（プロキシ）します。
+## 5. データベース
 
-### 7.2. `proxy_pass`の規約: 末尾のスラッシュ
-**最重要規約**: `proxy_pass`ディレクティブのURLの末尾にスラッシュを**付けません**。
+すべて `postgres:16`。ホストにポートを公開していない。
+
+| コンテナ | DB 名 | 初期化スクリプト（compose がマウントするもの） | 接続ユーザー |
+|---|---|---|---|
+| `auth-db` | `auth_db` | `backend/auth/auth-datebase/auth-db/init.sql` | auth-service: `auth_service_user`、mypage-service: `mypage_service_user` |
+| `app-db` | `app_db` | `backend/datebase/app-db/init.sql`（同じディレクトリの `001_*.sql` / `002_*.sql` は既存ボリューム向けのマイグレーションで、compose はマウントしない） | `POSTGRES_USER`（sfsp-worker は `sfsp_worker`） |
+| `profile-db` | `profile_db` | `backend/profile-service/profile-db/init.sql` | `POSTGRES_USER` |
+| `team-db` | `team_db` | `backend/team-service/team-db/init.sql` | `team_service_user` |
+| `sfsp-db` | `sfsp_db` | `backend/security/sfsp-db/`（ディレクトリごと） | `POSTGRES_USER` |
+
+> - `datebase` は誤記ではなく実ディレクトリ名。
+> - `backend/auth/auth-db/init.sql` も存在するが、compose がマウントしているのは `backend/auth/auth-datebase/auth-db/init.sql`。
+> - `init.sql` が実行されるのはボリュームが空のとき（初回）だけ。既存の DB にスキーマ変更を反映するには、マイグレーション SQL を手動で流すか、ボリュームを作り直す。
+
+### 5.1. auth-db
+
+**users**
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | UUID PK | ユーザー ID（UUID v7 で生成） |
+| `username` | VARCHAR(255) | ユーザー名 |
+| `google_name` | VARCHAR(255) | Google のアカウント名 |
+| `email` | VARCHAR(255) NOT NULL | メールアドレス |
+| `password_hash` | VARCHAR(255) | bcrypt ハッシュ（ローカルアカウントのみ） |
+| `provider` | VARCHAR(50) | `local` / `google` |
+| `provider_id` | VARCHAR(255) | Google のユーザー ID |
+| `is_admin` | BOOLEAN | 管理者フラグ |
+| `status` | VARCHAR(50) | `active` / `pending` / `deleted_data` |
+| `created_at` | TIMESTAMPTZ | 作成日時 |
+
+制約: `UNIQUE(provider, email)`, `UNIQUE(provider, provider_id)`。初期データの管理者は投入しない（管理者は `ADMIN_REGISTRATION_CODE` で登録する）。古いボリュームに残っている `admin@internal.local` は `DELETE FROM users WHERE email = 'admin@internal.local' AND provider = 'local';` で削除する。
+- ログインできるのは `status` が `active` / `pending` のユーザーだけ（`deleted_data` などはパスワードログイン・Google ログイン・`authMiddleware` のすべてで拒否）。
+
+### 5.2. profile-db
+
+**users**（auth-db とは別のテーブル。ID は共通）
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | UUID PK | ユーザー ID |
+| `username` | VARCHAR(255) | 表示名 |
+| `bio` | TEXT | 自己紹介 |
+| `icon_url` | TEXT | `/user-profiles/icons/...` |
+| `background_image_url` | TEXT | `/user-profiles/backgrounds/...` |
+| `icon_sfsp_job_id` | UUID | スキャン中のアイコンのジョブ ID |
+| `background_sfsp_job_id` | UUID | スキャン中の背景のジョブ ID |
+| `status` | VARCHAR(50) | `offline`（既定）/ `active` / `pending` / `online` |
+| `created_at` / `updated_at` | TIMESTAMP | 作成・更新日時 |
+
+- `GET /api/profile/me` は、行が無ければ JWT の `username` で行を作成する（`username` が空なら `status = 'pending'`）。
+- フロントエンドは `status === 'pending'` のとき `/edit-profile` へ遷移させる。
+
+### 5.3. app-db
+
+**videos**
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | VARCHAR(10) PK | 動画 ID（ランダムな小文字英数字 10 桁） |
+| `uploader_id` | UUID NOT NULL | 投稿者 |
+| `title` | VARCHAR(255) NOT NULL | タイトル |
+| `description` | TEXT | 説明 |
+| `filename` | VARCHAR(255) NOT NULL | 公開後は `/videos/<id>/playlist.m3u8` |
+| `thumbnail_path` | VARCHAR(255) | `/videos/thumbnails/<id>` |
+| `status` | VARCHAR(50) | `scanning` → `processing` → `public` / `error` / `quarantined`（スキャン結果が `failed` / `invalid` ならその値） |
+| `sfsp_job_id` | UUID | 本体のスキャンジョブ |
+| `thumbnail_sfsp_job_id` | UUID | サムネイル差し替えのスキャンジョブ |
+| `processing_details` | TEXT | 失敗理由など |
+| `team_id` | VARCHAR(24) | チームトークン。NULL なら全体公開、値があればそのチーム限定 |
+| `created_at` / `updated_at` | TIMESTAMPTZ | 作成・更新日時 |
+
+**games**
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | VARCHAR(10) PK | ゲーム ID |
+| `user_id` | UUID NOT NULL | 投稿者（※ videos は `uploader_id`、games / static_sites は `user_id`） |
+| `title` / `description` | | |
+| `status` | VARCHAR(50) | `scanning` → `processing` → `public` / `quarantined` / `failed`（処理エラーは `failed`。videos の `error` に相当）/ `invalid` |
+| `sfsp_job_id` / `thumbnail_sfsp_job_id` | UUID | |
+| `processing_details` | TEXT | |
+| `team_id` | VARCHAR(24) | |
+| `game_url` | VARCHAR(255) | `http://<id>.<STATIC_SITE_DOMAIN>:<port>/index.html` |
+| `thumbnail_url` | VARCHAR(255) | `/games/thumbnails/<id>` |
+| `scale` | REAL（既定 1.0） | 表示倍率（ユーザー調整） |
+| `offset_x` / `offset_y` | INTEGER（既定 0） | 表示位置（ユーザー調整） |
+| `native_width` / `native_height` | INTEGER（既定 1280 / 720） | `index.html` から抽出したネイティブ解像度 |
+| `created_at` / `updated_at` | TIMESTAMPTZ | |
+
+**static_sites**
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | VARCHAR(10) PK | サイト ID |
+| `user_id` | UUID NOT NULL | 投稿者 |
+| `title` / `description` | | |
+| `status` | VARCHAR(50) | `scanning` → `processing` → `public` / `quarantined` / `error`（不正なパス・`index.html` が無い等）/ `failed`（展開上限超過・panic 等） |
+| `sfsp_job_id` / `thumbnail_sfsp_job_id` | UUID | |
+| `processing_details` | TEXT | |
+| `team_id` | VARCHAR(24) | |
+| `minio_path` | VARCHAR(255) NOT NULL | `static-sites` バケット内のプレフィックス |
+| `entry_point_path` | VARCHAR(255)（既定 `index.html`） | エントリーポイント |
+| `thumbnail_url` | VARCHAR(255) | `/static-sites/thumbnails/<ランダム>.<拡張子>` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | |
+
+> app-db に `users` テーブルは無い。team-service は投稿者名を profile-service の `GET /api/profile/:id`（`PROFILE_SERVICE_URL`）から取得する（最大 8 並列、5 分キャッシュ。失敗時は空文字）。
+> ゲーム・静的サイトのアップロード API は、**SFSP に送る前に**行を `status = 'scanning'`（job_id は NULL）で INSERT し、sfsp-api の応答ごとに `sfsp_job_id` / `thumbnail_sfsp_job_id` を UPDATE する。送信に失敗したら行を削除する。動画は逆順で、sfsp-api の応答を受けてから `sfsp_job_id` 付きで INSERT する（`video-upload-api` の `findVideoByJob` が、完了イベントが先に届いた場合に 2 秒間隔で最大 10 回探し直す）。
+
+### 5.4. team-db
+
+| テーブル | カラム | 制約 |
+|---|---|---|
+| `teams` | `id` UUID PK, `token` VARCHAR(24), `name`, `description`, `is_public` BOOL, `auto_approve` BOOL, `allow_member_invite` BOOL, `created_by` UUID, `created_at` | `UNIQUE(token)` |
+| `team_members` | `id` UUID PK, `team_id` UUID FK→teams, `user_id` UUID, `role` VARCHAR(20)（`owner` / `admin` / `member`）, `joined_at` | `UNIQUE(team_id, user_id)`、チーム削除で CASCADE |
+| `team_join_requests` | `id` UUID PK, `team_id` UUID FK, `user_id` UUID, `status`（`pending` / `approved` / `rejected` / `cancelled`）, `requested_at`, `reviewed_at`, `reviewed_by` UUID | `UNIQUE(team_id, user_id)` |
+| `team_content` | `id` UUID PK, `team_id` UUID FK, `content_type`（`video` / `game` / `static-site`）, `content_id` VARCHAR(20), `created_at` | `UNIQUE(team_id, content_type, content_id)` |
+| `team_posts` | `id` UUID PK, `team_id` UUID FK, `author_id` UUID, `title`, `body`, `created_at` | |
+
+- `token` は crypto/rand から作る 24 文字の base36（約 124 ビット）。URL にそのまま使う。
+- ロールの強さ: `owner`(3) > `admin`(2) > `member`(1)。`requireTeamRole(c, "admin")` のようにランクで判定する。
+- `team_members.team_id` は UUID。URL の `token` をそのまま入れてはいけない（`SELECT id FROM teams WHERE token = $1` で引く）。
+- `team_join_requests` の `UNIQUE(team_id, user_id)` はそのまま。却下・取り消し済み（または脱退済みで approved のまま）の行は、再申請時に UPSERT で `pending` に戻す。
+
+### 5.5. sfsp-db
+
+| テーブル | カラム |
+|---|---|
+| `files` | `id` UUID PK, `filename`, `filesize` BIGINT, `mime_type`, `sha256`（UNIQUE なし）, `storage_path`, `file_type`（`video` / `html` / `zip` / `other`）, `target_service`, `created_at` |
+| `scan_jobs` | `id` UUID PK, `file_id` FK→files, `status`, `processing_details`, `is_cleaned_up` BOOL, `cleaned_up_at`, `created_at`, `updated_at` |
+| `scan_results` | `id` UUID PK, `job_id` FK→scan_jobs, `scanner`（`clamav` / `yara`）, `result`（`clean` / `suspicious` / `malicious` / `error`）, `details`, `raw_output` JSONB（`stdout` / `stderr`）, `scanned_at` |
+
+- `scan_jobs.status` の実際の値: `queued` → `running` → `clean` / `malicious` / `suspicious` / `failed` / `invalid`。
+- `scan_jobs.event_published_at`（TIMESTAMPTZ）: 完了イベントを発行した日時。再処理を冪等にするために使う（sfsp-worker が起動時に `ADD COLUMN IF NOT EXISTS`）。
+- `target_service` に使える値は [7.2](#72-スキャン完了イベントのキュー) の表を参照。
+
+---
+
+## 6. オブジェクトストレージ（MinIO）
+
+MinIO は **1 インスタンス**（`atmosidea-minio`、`minio:9000`）。データはホストの `./backend/storage_data` に保存される。権限はバケットとユーザーで分ける。
+
+### 6.1. バケット
+
+`minio-init` が作成する（`mc mb --ignore-existing`）。
+
+| バケット | 匿名ダウンロード | オブジェクトのキー |
+|---|---|---|
+| `videos` | 可 | `<videoId>/playlist.m3u8`、`<videoId>/<360p…1080p>/...`、`thumbnails/<videoId>` |
+| `games` | 可 | `<gameId>/...`（展開したゲーム）、`thumbnails/<gameId>` |
+| `static-sites` | 可 | `<siteId>/...`（展開したサイト）、`thumbnails/<32桁hex>.<jpg/png/gif/webp>` |
+| `user-profiles` | 可 | `icons/<userId>-<uuid>.<ext>`、`backgrounds/<userId>-<uuid>.<ext>` |
+| `raw-files` | 不可 | `<fileId>`（スキャン前） |
+| `clean-files` | 不可 | `<fileId>`（スキャン済み・clean） |
+| `quarantine` | 不可 | `<fileId>`（malicious / suspicious） |
+
+### 6.2. ユーザーとポリシー
+
+`minio-init` が、`.env` の値でユーザーを作り、`backend/minio-init/*.json` のポリシーを付ける。
+
+| 環境変数（アクセスキー） | ポリシー | 権限 | 使うサービス |
+|---|---|---|---|
+| `MINIO_ROOT_USER` | （root） | すべて | `minio-init` のみ |
+| `GAME_MINIO_ACCESS_KEY_ID` | `app-game-policy` | `games` に `s3:*` | game-upload-api, game-worker, auth-service（削除時） |
+| `PROFILE_MINIO_ACCESS_KEY_ID` | `app-profile-policy` | `user-profiles` に `s3:*` | profile-service, auth-service（削除時） |
+| `STATIC_SITE_MINIO_ACCESS_KEY_ID` | `app-static-site-policy` | `static-sites` に `s3:*` | static-site-upload-api, static-site-worker, auth-service（削除時） |
+| `VIDEO_MINIO_ACCESS_KEY_ID` | `app-video-policy` | `videos` に `s3:*` | video-upload-api, video-worker |
+| `SFSP_UPLOAD_ACCESS_KEY` | `sfsp-upload-policy` | `raw-files` に PutObject | 各アップロード API（raw 側の設定） |
+| `SFSP_API_ACCESS_KEY` | `sfsp-api-policy` | `raw-files` に `s3:*` | sfsp-api |
+| `SFSP_WORKER_RAW_ACCESS_KEY` | `sfsp-worker-raw-policy` | `raw-files` に Get / Delete / List | sfsp-worker |
+| `SFSP_WORKER_CLEAN_ACCESS_KEY` | `sfsp-worker-clean-policy` | `clean-files` / `quarantine` / `raw-files` に `s3:*` | sfsp-worker, video-upload-api（clean 側） |
+| `SFSP_GAME_WORKER_ACCESS_KEY` | `sfsp-game-worker-policy` | `clean-files` に GetObject | game-upload-api, game-worker |
+| `SFSP_STATIC_SITE_WORKER_ACCESS_KEY` | `sfsp-static-site-worker-policy` | `clean-files` に Get / Delete | static-site-upload-api, static-site-worker |
+| `SFSP_PROFILE_WORKER_ACCESS_KEY` | `sfsp-profile-worker-policy` | `clean-files` に GetObject | profile-service |
+| `SFSP_VIDEO_WORKER_ACCESS_KEY` | `sfsp-video-worker-policy` | `clean-files` に GetObject | video-worker |
+
+- どのアプリ用ポリシーにも `s3:ListAllMyBuckets` と `s3:GetBucketLocation` が付いている（起動時の `ListBuckets` / `BucketExists` に必要）。
+- 旧 `backend/minio-init/sfsp-worker-policy.json` と `initialize.sh`（旧マルチ MinIO 構成用）は未使用だったため削除した。`minio-init` が使うポリシーは compose がマウントする 12 個の `*-policy.json` だけ。
+- **ユーザーやポリシーを変更するときは、`docker-compose.yml` の `minio-init`（environment / entrypoint / volumes の 3 か所）と `backend/minio-init/*.json` を同じ変更で更新する。**
+- `.env.example` では、アクセスキーをサービスごとに別の値にしている。同じ値にすると MinIO 上では 1 ユーザーになり、ポリシーが合算される。
+
+---
+
+## 7. Redis と共有パッケージ（shared）
+
+### 7.1. Redis のキー
+
+| キー | 型 | 書き込み | 読み出し |
+|---|---|---|---|
+| `sfsp:scan_queue` | List | sfsp-api（LPUSH） | sfsp-worker（`DequeueReliable`） |
+| `sfsp:completed:<target>` | List | sfsp-worker（LPUSH） | 各サービス（`DequeueReliable`） |
+| `<queue>:processing` | List | `DequeueReliable`（BRPOPLPUSH） | `Ack`（LREM）、`RecoverProcessing`（起動時に元のキューへ戻す） |
+| `sfsp:scan_queue:dead` | List | sfsp-worker（5 回失敗し、`failed` の確定もできなかったジョブ） | 手動確認用 |
+| `blocklist:<jti>` | String（TTL = JWT の残り有効期限） | auth-service（ログアウト、アカウント削除） | JWT を検証する全サービスの `authMiddleware` |
+| `oauth_code:<code>` | String（TTL 60 秒） | auth-service（Google コールバック） | auth-service `POST /api/auth/oauth/exchange`（GETDEL で 1 回だけ） |
+
+Redis は `requirepass`（`REDIS_PASSWORD`）で保護している。接続には `REDIS_ADDR` + `REDIS_PASSWORD`、または `REDIS_URL=redis://:<password>@redis:6379`（パスワードは URL エンコードが必要）を使う。
+
+### 7.2. スキャン完了イベントのキュー
+
+`backend/shared/queue/queue.go` の `EnqueueScanCompletionEvent` が `target_service` からキューを決める。
+
+| `target_service` | キュー | 読むサービス | 処理 |
+|---|---|---|---|
+| `stream` | `sfsp:completed:stream` | **video-upload-api** | HLS 変換・サムネイル生成 |
+| `video-thumbnail` | `sfsp:completed:video-thumbnail` | video-worker | サムネイル差し替え |
+| `game` | `sfsp:completed:game` | game-worker | zip 展開・公開 |
+| `game-thumbnail` | `sfsp:completed:game-thumbnail` | game-worker | サムネイル |
+| `static-site` | `sfsp:completed:static-site` | static-site-worker | zip 展開・公開 |
+| `site-thumbnail` | `sfsp:completed:site-thumbnail` | static-site-worker | サムネイル |
+| `thumbnail` | `sfsp:completed:site-thumbnail`（※ site と同じ） | static-site-worker | 互換用の別名 |
+| `profile` | `sfsp:completed:profile` | profile-service | アイコン・背景の反映 |
+
+それ以外の値は sfsp-api が拒否する。各ワーカーは `DequeueReliable` で取り出し、DB を終端状態にしてから `Ack` する。処理エラーは終端状態（`failed` / `error`）を記録して `Ack` する（無限再試行はしない）。DB に書けないときだけ `Ack` せず、次の起動時に `RecoverProcessing` で再処理される。既に終端状態の行への再配信は無視する。
+
+### 7.3. ScanCompletionEvent（`backend/shared/event/event.go`）
+
+```json
+{
+  "job_id": "uuid",
+  "file_id": "uuid",
+  "target_service": "game",
+  "final_status": "clean | malicious | suspicious | failed | invalid",
+  "scanned_at": "RFC3339",
+  "sha256": "hex",
+  "filename": "元のファイル名"
+}
+```
+
+ワーカーは `job_id` を `app-db` の `sfsp_job_id`（サムネイルは `thumbnail_sfsp_job_id`）と照合して対象の行を特定し、`file_id`（または `<file_id>/<filename>`）をキーに `clean-files` から取得する。
+
+### 7.4. shared パッケージ（`github.com/atmosidea/shared`）
+
+| パッケージ | 内容 |
+|---|---|
+| `config/` | 環境変数の読み込み（Viper）、`Retry` |
+| `event/` | `ScanCompletionEvent` |
+| `model/` | 共通モデル |
+| `queue/` | Redis 接続、キュー名の定数、`EnqueueJob` / `DequeueJob` / `EnqueueScanCompletionEvent`、信頼性キュー用の `DequeueReliable` / `Ack` / `RecoverProcessing` |
+
+SFSP（`backend/security/sfsp/`）は shared を使わず、`internal/model`・`internal/queue` に同じ定義を持っている。**キュー名やイベントの形を変えるときは両方を直す。**
+
+---
+
+## 8. 処理フロー
+
+### 8.1. ログイン
+
+1. ローカル: `POST /api/auth/login`（email / password）→ auth-db で bcrypt 照合 → JWT を返す。
+2. Google: `GET /api/auth/google/login`（32 バイトの state を host-only・HttpOnly の Cookie に保存）→ Google → `/api/auth/google/callback`（state を定数時間で照合し Cookie を削除。userinfo は HTTP 200・id / email・`verified_email` を確認）→ 初回は auth-db に `status = 'active'` で作成し、profile-service の `http://profile-service:8084/internal/create`（`X-Internal-Key`）を呼ぶ → JWT を Redis の `oauth_code:<code>` に 60 秒保存し `/login/success?code=...` にリダイレクト → `LoginSuccessPage` が URL からコードを消して `POST /api/auth/oauth/exchange` で JWT を受け取る。**JWT を URL に載せない。**
+   - 無効なユーザー（`deleted_data` 等）はパスワードログインで 403、Google ログインで `/login?error=account_disabled`。
+3. フロントエンド（`AuthContext.tsx`）がトークンを `localStorage['token']` に保存 → `GET /api/profile/me` でユーザー情報を取得。
+   - トークンの期限切れ: logout API は呼ばず、ブラウザ側の状態だけを消して `/login` へ。
+   - `/api/profile/me` が **401** のときだけトークンを消す。それ以外のエラーではログイン状態を保ち、JWT の内容でユーザーを組み立てる。
+
+### 8.2. 管理者登録
+
+`POST /api/auth/register` `{"email", "password", "adminCode"}`
+
+1. `adminCode` を `ADMIN_REGISTRATION_CODE` と定数時間で比較（不一致は 403。入力値はログに出さない）。
+2. email に `@` が必要、password は 8 文字以上（違反は 400）。
+3. 同じ email のローカルアカウントがあれば 409。
+4. `is_admin = TRUE` で作成し、ユーザー名は email の `@` より前。profile-service の `/internal/create` を呼ぶ。
+
+### 8.3. ゲーム
+
+1. `POST /api/games/upload`（multipart: `game` zip、`thumbnail`、`title`、`description`、任意で `team_id`）。
+2. game-upload-api が `games` に `status = 'scanning'` で先に INSERT → sfsp-api（`target_service=game`、ストリーミング送信）、サムネイルは `game-thumbnail` で別途送る → 応答ごとに job_id を UPDATE。上限: `MAX_GAME_UPLOAD_BYTES`（既定 1 GiB）/ `MAX_IMAGE_UPLOAD_BYTES`（既定 10 MiB）を超えると 413、画像以外のサムネイルは 415。
+3. sfsp-worker がスキャン → `sfsp:completed:game`。
+4. game-worker: `clean` なら `processing` → `clean-files` から取得 → 上限付きで展開（`GAME_MAX_EXTRACTED_BYTES` 2 GiB / `GAME_MAX_ZIP_ENTRIES` 20000 / `GAME_MAX_ENTRY_BYTES` 1 GiB。超過・`../`・絶対パス・symlink は `failed`）→ `index.html` を探してルートを決定 → 解像度を抽出して CSS を注入 → `games/<id>/` へアップロード → `status = 'public'`、`game_url`・`native_width/height` を保存。`clean` 以外なら `quarantined` / `failed` / `invalid`。行が見つからないイベント（INSERT との競合）は 1/2/4/8/16 秒間隔で探し直す。
+5. `AdjustGamePage` が `/api/games/:id` をポーリングし、`public` になったら `game_url` を iframe で表示。
+
+### 8.4. 静的サイト
+
+1. `POST /api/static-sites/upload`（multipart: `file` zip、`thumbnail`、`title`、`description`）→ 先に `static_sites` に INSERT → sfsp-api（`static-site`、ストリーミング送信）、サムネイルは `site-thumbnail`。上限: `MAX_SITE_UPLOAD_BYTES`（既定 500 MiB）、画像は `MAX_IMAGE_UPLOAD_BYTES`。展開の上限: `SITE_MAX_EXTRACTED_BYTES` 1 GiB / `SITE_MAX_ZIP_ENTRIES` 20000 / `SITE_MAX_ENTRY_BYTES` 256 MiB（超過は `failed`）。
+   - サムネイル差し替えは `thumbnail_sfsp_job_id` が一致するときだけトランザクション内で確定し、古いオブジェクト（`thumbnails/` 配下で他サイトが参照していないもの）を削除する。却下時は job_id を NULL に戻す。
+2. static-site-worker: `clean` なら zip を取得 → 最初に見つかった `index.html` のディレクトリをルートとする → 各エントリを `static-sites/<id>/<相対パス>` にアップロード。**相対パスが `..` で外に出る・絶対パスのエントリがあれば `status = 'error'`（`Illegal file path in ZIP`）で中止。** → `status = 'public'`。
+3. 表示: `http://<id>.localhost:3001/`（Nginx が `games/<id>/` を試し、404 なら `static-sites/<id>/` を返す。末尾が `/` の URL には `index.html` を補う）。
+
+### 8.5. 動画
+
+1. `POST /api/videos/upload`（multipart: `video`、`title`、`description`）→ sfsp-api（`stream`）→ `videos` に `status = 'scanning'`。
+   - 上限は `MAX_VIDEO_UPLOAD_BYTES`（既定 1 GiB、超過は 413）。sfsp-api へは io.Pipe でストリーミング送信する。
+2. **video-upload-api 内の goroutine**（`videoWorker`）が `sfsp:completed:stream` を `DequeueReliable` で取り出す → `clean` なら `processVideoAsync` を goroutine で実行:
+   - `clean-files` から `UPLOAD_DIR`（`./backend/video-service/upload_workdir` を `/storage` にマウント）の `job-<id>-*` 一時ディレクトリへダウンロード（ユーザーのファイル名は使わない）。
+   - FFmpeg で 360p / 480p / 720p / 1080p の HLS とマスタープレイリストを作成し、サムネイルを生成。同時実行数は `FFMPEG_MAX_CONCURRENCY`（既定 2）、ffmpeg 1 回ごとのタイムアウトは `FFMPEG_TIMEOUT`（既定 2h）。
+   - 処理中に動画が削除されると、削除ハンドラーがジョブをキャンセルし、ジョブ側も行の存在を再確認して `videos/<id>/` と `thumbnails/<id>` を消す。
+   - `videos/<id>/...` と `videos/thumbnails/<id>` にアップロード（失敗時は最大 5 回までバックオフしてリトライ）。
+   - `filename = /videos/<id>/playlist.m3u8`、`status = 'public'` に更新し、ローカルの一時ファイルを削除。
+3. 再生: `VideoDetailPage` → `/api/videos/<id>/stream/playlist.m3u8` → Nginx が MinIO の `videos/<id>/playlist.m3u8` にプロキシ。
+4. サムネイル差し替え: `PUT /api/videos/:id`（video-worker、投稿者 / 管理者のみ）→ `video-thumbnail` でスキャン → video-worker が画像形式を確認して保存。
+
+### 8.6. プロフィール画像
+
+`PUT /api/profile/icon`（`icon`）/ `PUT /api/profile/background`（`background`）→ sfsp-api（`profile`）→ `icon_sfsp_job_id` 等を保存 → profile-service 内のワーカーが `sfsp:completed:profile` を処理 → 画像形式（jpeg / png / gif / webp）なら `user-profiles` に保存して URL を更新し、古い画像を削除。アップロード時点でも先頭 512 バイトで形式を確認し（それ以外は 415）、`MAX_IMAGE_UPLOAD_BYTES` を超えると 413。フロントエンドはスキャン中はローカルプレビューを表示し、ポーリングで完了を検知する。
+
+### 8.7. チーム
+
+- 作成: `POST /api/teams` → 作成者が `owner`。
+- 加入: 公開チームに `POST /:token/join` → `auto_approve` なら即 `member`、そうでなければ `team_join_requests` に `pending`。非公開チームは加入申請できない（403）。
+- 承認: `PATCH /:token/join-requests/:requestId?action=approve`（admin 以上）→ トランザクション内で `pending` の申請だけを `approved` にし、**申請者本人**を `member` として追加（既存メンバーのロールは変えない）。該当する保留中の申請が無ければ 404。
+- チーム限定コンテンツ: 各アップロード API が `GET /api/teams/:token/permission` で投稿権限を確認し、コンテンツの `team_id` にトークンを保存する。閲覧時も動画・ゲーム・サイトの詳細 API と一覧の `?team=` が同じエンドポイントで `can_view` を確認する（Authorization を転送）。
+- 退出・削除: 自分自身はいつでも退出できる（最後の owner は 409 `code: last_owner`）。他人を削除できるのは admin 以上で、相手のロールが自分より弱いときだけ。
+
+### 8.8. アカウント削除
+
+`DELETE /api/auth/me` → ローカルアカウントは物理削除、Google アカウントは `deleted_data` として扱い、app-db の投稿・MinIO（`user-profiles` / `games` / `static-sites` / `videos` の `<id>/` と `thumbnails/<id>`）を削除する。さらに `X-Internal-Key` 付きで次を呼ぶ。
+- profile-service `DELETE /internal/users/:userId` → profile-db の行と icon / background を削除。
+- team-service `DELETE /internal/users/:userId` → メンバー情報・加入申請・本人のチーム投稿を削除。唯一の owner だったチームは、最もロールが強く最も早く参加したメンバーに移譲し、誰もいなければチームごと削除。
+- どこかが失敗しても残りは続け、200 `{"message","cleanupErrors":[...]}` で失敗箇所を返す。使用中のトークンの jti はブロックリストに入れる。
+
+### 8.9. SFSP のクリーンアップ
+
+sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコンテンツの `clean-files` オブジェクトを削除し、`scan_jobs.is_cleaned_up` を立てる（`profile` は対象外）。
+
+---
+
+## 9. API 一覧
+
+認証の列: `—` = 不要、`JWT` = `Authorization: Bearer <token>`、`投稿者` = JWT かつ投稿者本人または管理者。
+
+### 9.1. auth-service — `/api/auth`
+
+| メソッド | パス | 認証 | リクエスト | レスポンス |
+|---|---|---|---|---|
+| POST | `/register` | 管理者コード | `{"email","password","adminCode"}` | 201 `{"message","userID"}` / 400 / 403 / 409 |
+| POST | `/login` | — | `{"email","password"}` | 200 `{"token"}` / 403（無効なユーザー） |
+| GET | `/google/login` | — | — | Google へリダイレクト（`GOOGLE_CLIENT_ID/SECRET` があるときだけ登録されるルート） |
+| GET | `/google/callback` | — | クエリ | `/login/success?code=...` へリダイレクト（コードは 60 秒・1 回限り） |
+| POST | `/oauth/exchange` | — | `{"code"}` | 200 `{"token"}` / 400 / 401（無効・期限切れ） |
+| POST | `/logout` | JWT | — | 200 `{"message":"Successfully logged out"}` |
+| DELETE | `/me` | JWT | — | 200 `{"message","cleanupErrors":[...]}` |
+| GET | `/user/:userId` | — | — | `{"provider":"local\|google"}` |
+
+### 9.2. profile-service — `/api/profile`
+
+| メソッド | パス | 認証 | 説明 |
+|---|---|---|---|
+| GET | `/me` | JWT | 自分のプロフィール（無ければ作成） |
+| GET | `/status` | JWT | `{"status"}` |
+| GET | `/:userId` | — | 公開プロフィール（無ければ 404） |
+| PUT | （ベースパス） | JWT | `{"username","bio"}`、`status` を `active` に |
+| PUT | `/icon` | JWT | multipart `icon` → 202 `{"job_id","status":"scanning"}` |
+| PUT | `/background` | JWT | multipart `background` → 202 |
+| POST | `/internal/create`（旧パス。移行用） | `X-Internal-Key` | `{"user_id","username"}`。Nginx は `/api/profile/internal/` を 404 にする |
+
+内部専用（`/api/profile` の外。Nginx からは届かない。`X-Internal-Key` == `INTERNAL_API_KEY`、未設定なら常に 403）:
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| POST | `/internal/create` | `{"user_id","username"}`（auth-service が使う） |
+| DELETE | `/internal/users/:userId` | プロフィールと画像を削除。冪等、204 |
+
+`PUT /icon` / `PUT /background` は画像以外 415、`MAX_IMAGE_UPLOAD_BYTES` 超過は 413。
+
+### 9.3. 動画 — `/api/videos`
+
+| メソッド | パス | サービス | 認証 | 説明 |
+|---|---|---|---|---|
+| POST | `/upload` | video-upload-api | JWT | multipart `video`, `title`, `description` |
+| DELETE | `/delete/:id` | video-upload-api（Nginx が `/api/videos/:id` に書き換え） | 投稿者 | 動画と HLS・サムネイルを削除 |
+| DELETE | `/:id/thumbnail` | video-upload-api（Nginx の専用 location で振り分け） | 投稿者 | サムネイルを MinIO から削除し `thumbnail_path` を NULL に |
+| GET | （ベースパス） | video-worker | — | 一覧（`?q=`、`?team=`）。`status='public'` のみ。`?team=` が無ければ `team_id IS NULL`、あれば `can_view` が必要（無ければ 403） |
+| GET | `/:id` | video-worker | 任意 | 詳細。投稿者・管理者以外は `public` かつ（`team_id` があれば `can_view`）のときだけ。見せられなければ 404 |
+| PUT | `/:id` | video-worker | 投稿者 | multipart `title`, `description`, 任意で `thumbnail` |
+| GET | `/:id/stream/<path>` | Nginx → MinIO | — | HLS |
+
+### 9.4. ゲーム — `/api/games`（game-upload-api）
+
+| メソッド | パス | 認証 | 説明 |
+|---|---|---|---|
+| POST | `/upload` | JWT | multipart `game`, `thumbnail`, `title`, `description` |
+| GET | （ベースパス） | — | 一覧（`?q=`、`?team=`、`status='public'` のみ。`?team=` は `can_view` が必要） |
+| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` のみ（それ以外 404）、`team_id` があれば `can_view`（無ければ 403、team-service 不達は 502） |
+| PUT | `/:id` | 投稿者本人のみ（管理者でも 403） | multipart `title`, `description`, `thumbnail` |
+| PUT | `/adjust/:id` | 投稿者本人のみ | `{"scale","offset_x","offset_y"}` |
+| DELETE | `/:id` | 投稿者 | ゲームと MinIO のファイルを削除（管理者も可） |
+| DELETE | `/:id/thumbnail` | 投稿者本人のみ | サムネイル削除 |
+
+### 9.5. 静的サイト — `/api/static-sites`（static-site-upload-api）
+
+| メソッド | パス | 認証 | 説明 |
+|---|---|---|---|
+| POST | `/upload` | JWT | multipart `file`, `thumbnail`, `title`, `description` |
+| GET | （ベースパス） | — | 一覧（`?q=`、`?team=`。public かつ `team_id IS NULL`、`?team=` は `can_view` が必要） |
+| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` かつ（`team_id` があれば `can_view`）のときだけ、それ以外 404 |
+| PUT | `/:id` | 投稿者 | タイトル・説明 |
+| DELETE | `/:id` | 投稿者 | サイトと MinIO のファイルを削除 |
+| DELETE | `/:id/thumbnail` | 投稿者 | サムネイル削除 |
+
+### 9.6. mypage-service — `/api/my`
+
+| メソッド | パス | 認証 | 説明 |
+|---|---|---|---|
+| GET | `/videos` | JWT | `uploader_id` が自分の動画 |
+| GET | `/games` | JWT | `user_id` が自分のゲーム |
+| GET | `/static-sites` | JWT | `user_id` が自分のサイト |
+
+### 9.7. team-service — `/api/teams`
+
+| メソッド | パス | 認証 | 説明 |
+|---|---|---|---|
+| GET | （ベースパス） | — | 公開チーム一覧 |
+| GET | `/mine` | JWT | 参加中のチーム |
+| POST | （ベースパス） | JWT | `{"name","description","is_public","auto_approve","allow_member_invite"}` |
+| GET | `/:token` | — | チーム詳細 |
+| PATCH | `/:token` | owner | チーム情報の更新 |
+| DELETE | `/:token` | owner | チーム削除（メンバー等は CASCADE） |
+| GET | `/:token/permission` | 任意 | `{"is_public","can_view","can_post","role"}`。JWT を先に評価し、`can_view` = 公開チームまたはメンバー、`can_post` = member 以上 |
+| GET | `/:token/members` | member 以上 | メンバー一覧 |
+| POST | `/:token/members` | admin 以上 | `{"user_id","role"}`。付与できるのは自分より弱いロールだけ（**例外: owner は owner を付与できる**＝オーナー移譲用）。新規 201 / 変更 200 |
+| DELETE | `/:token/members/:userId` | JWT（自分は退出可） | 他人の削除は admin 以上かつ相手が自分より弱いとき。最後の owner は 409 |
+| POST | `/:token/join` | JWT | 加入申請 |
+| GET | `/:token/join-requests` | admin 以上 | 申請一覧 |
+| PATCH | `/:token/join-requests/:requestId` | admin 以上 | `?action=approve\|reject` → `{"status","user_id"}` / 404 |
+| DELETE | `/:token/join-requests` | JWT | 自分の申請を取り消し |
+| POST | `/:token/content` | member 以上 | `{"title","body"}` |
+| GET | `/:token/content` | 公開チームは不要 | 投稿一覧 |
+| GET | `/:token/content/:contentID` | 同上 | 投稿 1 件 |
+| DELETE | `/internal/users/:userId`（`/api/teams` の外） | `X-Internal-Key` | アカウント削除用。冪等、204 |
+
+- `PATCH /:token` は送られたフィールドだけを更新する（省略したフィールドは変えない）。
+
+### 9.8. sfsp-api（内部専用。Nginx からは到達できない）
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| POST | `/api/v1/files` | multipart `file`, `target_service` → 202 `{"file_id","job_id","status":"queued"}` |
+| GET | `/api/v1/jobs/:id` | ジョブの状態 |
+| GET | `/api/v1/results/:id` | スキャン結果 |
+| GET | `/health` | ヘルスチェック（`/api/v1` の外） |
+
+`/api/v1/*` にはヘッダー `X-SFSP-API-Key`（== `SFSP_API_KEY`）が必須（違えば 401）。`SFSP_API_KEY` が空なら sfsp-api は起動しない。アップロードは MultipartReader で MinIO にストリーミングし、`SFSP_MAX_UPLOAD_BYTES`（既定 2 GiB-1）超過は 413。
+
+### 9.9. 監視ダッシュボード（mon-backend、`http://127.0.0.1:8090`）
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| GET / HEAD | `/auth/check` | mon-nginx の `auth_request` 用（Basic 認証の確認だけ行う） |
+| GET | `/api/containers` | コンテナ一覧 |
+| GET | `/api/containers/stats` | CPU・メモリ |
+| POST | `/api/containers/restart/{name}` | 再起動 |
+| GET | `/api/connections/count` | `atmosidea-frontend` のログから直近 5 分のユニーク IP 数 |
+| GET | `/api/topology` | 構成図のデータ |
+| GET | `/api/volumes` | Docker ボリューム |
+| GET | `/api/minio/list/{containerName}?bucket=&prefix=` | MinIO の一覧 |
+| POST | `/api/minio/upload/{containerName}?bucket=&prefix=` | MinIO へアップロード（対象コンテナの root 資格情報を使う） |
+| DELETE | `/api/minio/delete/{containerName}?bucket=&key=` | MinIO から削除 |
+| GET (WS) | `/ws/logs?container=` または `/ws/logs/{id}` | ログのストリーミング |
+
+- `isTrustedRequest` が、Host が許可リスト（`localhost` / `127.0.0.1` / `::1` と `MONITORING_ALLOWED_HOSTS`）にあり、かつ Origin があれば同じホストであることを確認する。満たさなければ 403（WebSocket の `CheckOrigin` も同じ）。
+- CORS ヘッダーは返さない（フロントエンドは同じ nginx から配信される）。
+- 全ルート（`/api`、`/ws`）で HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`、定数時間比較）。未設定なら 503。mon-nginx は `auth_request` で UI も保護する。ループバック公開と同一オリジン制限も維持。
+
+---
+
+## 10. Nginx（API ゲートウェイ）
+
+設定ファイル: `frontend/nginx.conf`（compose が `/etc/nginx/nginx.conf` に読み取り専用でマウント）。**変更したら `nginx -t` で構文を確認し、`docker compose restart frontend` で反映する。**
+
+### 10.1. server ブロック
+
+| server | `server_name` | 役割 |
+|---|---|---|
+| サブドメイン用 | `"~^(?<subdomain>[a-z0-9]{10})\.localhost$"` | ゲーム・静的サイトの配信（アプリと別オリジン） |
+| メイン | `localhost 127.0.0.1`（`default_server`） | React・API・MinIO へのプロキシ |
+
+`server_name` の正規表現は引用符で囲む（バックスラッシュを含むため）。
+
+### 10.2. メインの location（評価順に注意）
+
+| location | 転送先 | 備考 |
+|---|---|---|
+| `/` | `/usr/share/nginx/html`（`try_files ... /index.html`） | SPA |
+| `^~ /api/profile/internal/`、`~ ^/api/.*/internal(/｜$)` | `return 404` | 内部 API を外部に出さない（表の都合で全角の `｜` と表記。実際の `nginx.conf` では半角のパイプ記号） |
+| `/api/auth`, `/api/profile`, `/api/my`, `/api/games`, `/api/static-sites`, `/api/teams` | 各サービス | プレフィックス一致 |
+| `/api/videos/upload` | video-upload-api | タイムアウト 300 秒、`client_max_body_size 1100m`、`proxy_request_buffering off` |
+| `/api/games/upload` / `/api/static-sites/upload` | game-upload-api / static-site-upload-api | `client_max_body_size` 1100m / 550m、`proxy_request_buffering off` |
+| `~ ^/api/videos/delete/(?<video_id>[a-zA-Z0-9]+)$` | video-upload-api | `/api/videos/$video_id` に rewrite（DELETE 専用の URL を用意して `if` を避けている） |
+| `~ ^/api/videos/[a-zA-Z0-9]+/thumbnail$` | video-upload-api | サムネイル削除。これが無いと下の `/api/videos` に吸われて video-worker で 404 になる |
+| `~ '^/api/videos/([a-z0-9]{10})/stream/(.*)$'` | MinIO（`/videos/$1/$2` に rewrite） | HLS |
+| `/api/videos` | video-worker | 上の正規表現に当たらなかった残り全部 |
+| `~ ^/videos/thumbnails/(.+)$` ほか `/games/thumbnails/`, `/static-sites/thumbnails/`, `/user-profiles/` | MinIO | thumbnails は `Cache-Control: no-cache, no-store, must-revalidate`（`/user-profiles/` は付けない） |
+| `~ '^/games/([a-z0-9]{10})/(.+)$'` | `return 404` | **ゲーム本体はメインオリジンで配信しない**（`thumbnails` も 10 文字なので、この location より前に thumbnails の location を置くこと） |
+
+正規表現の location は**書いた順**に評価され、最初に一致したものが使われる。プレフィックス location より正規表現が優先される。
+
+server の `client_max_body_size` は 12m（画像 10 MiB 用）。大きなアップロードは上の専用 location でだけ許可する。
+
+### 10.3. `proxy_pass` の規約（変更禁止）
 
 ```nginx
-# 正しい例 (Good)
 location /api/auth {
-    proxy_pass http://auth_service;
-}
-
-# 間違った例 (Bad)
-location /api/auth/ {
-    proxy_pass http://auth_service/;
+    proxy_pass http://auth_service;   # 末尾にスラッシュを付けない
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 
--   **理由**: 末尾にスラッシュを付けない場合、NginxはリクエストURIをそのままバックエンドに渡します。
-    -   リクエスト: `GET /api/auth/me`
-    -   転送先: `http://auth_service/api/auth/me`
--   これにより、各バックエンドサービス（Go/Gin）は自身の担当するパスプレフィックス（例: `/api/auth`）を含めてルーティングを定義でき、コードの可読性が向上します。
--   もし末尾にスラッシュを付けると (`proxy_pass http://auth_service/`)、`location`でマッチした部分が削られて転送されるため (`/me`だけが送られる)、バックエンドのルーティングが複雑化します。**現在の設計はこの規約に依存しているため、変更は禁止です。**
+- 末尾スラッシュなし → URI がそのまま渡る（`/api/auth/login` → `http://auth_service/api/auth/login`）。各 Go サービスは `/api/...` を含めてルーティングしている。
+- 末尾スラッシュを付けると `location` 部分が削られ、Go 側のルーティングが壊れる。
 
-### 7.3. ヘッダー転送の重要性
-すべての`proxy_pass`ブロックには、以下のヘッダー転送設定を含めます。
+### 10.4. ユーザーがアップロードしたファイルのヘッダー
+
+サムネイル・プロフィール画像・HLS の location には次を付ける。
 
 ```nginx
-proxy_set_header Host $http_host;
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
+add_header Content-Security-Policy "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox" always;
+add_header X-Content-Type-Options "nosniff" always;
 ```
 
--   **理由**: これにより、バックエンドサービスはロードバランサやプロキシの背後にいることを意識せず、クライアントの元のIPアドレスやプロトコル（http/https）を正しく認識できます。
+- location 内で `add_header` を 1 つでも書くと、server レベルの `add_header`（メインの CSP）は**継承されない**。ヘッダーを追加するときは必要なものをすべてその location に書く。
+- メインの CSP は `script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net`、`frame-src 'self' http://*.localhost http://*.localhost:3001`。
 
-### 7.4. `location`ブロックの評価順序と使い分け
-Nginxは最も具体的にマッチする`location`を優先します。このプロジェクトでは以下の優先順位で使い分けています。
-1.  **`=` (完全一致)**: `/api/videos/upload` のように、他のパスと絶対に競合しない特定のパスに使用します。最も高速に処理されます。
-2.  **`~` (正規表現)**: `/api/videos/([0-9]+)` のように、パス内に動的なIDが含まれる場合に使用します。
-3.  **プレフィックス (修飾子なし)**: `/api/auth` のように、特定のプレフィックスで始まるすべてのリクエストを捕捉するために使用します。
-
-### 7.5. `if`文の例外的使用（技術的負債）
-`nginx.conf`内には、`DELETE`メソッドを判定するための`if`文が存在します。
+### 10.5. サブドメイン（ゲーム・静的サイト）
 
 ```nginx
-location ~ ^/api/videos/([0-9]+)$ {
-    if ($request_method = DELETE) {
-        proxy_pass http://video_upload_service;
-        break;
-    }
-    proxy_pass http://video_worker_service;
-}
+rewrite ^(.*)/$ $1/index.html;                 # ディレクトリには index.html を補う（break を付けない）
+rewrite ^/(.*)$ /games/$subdomain/$1 break;     # まず games バケット
+error_page 404 = @fallback_static_site;        # 無ければ static-sites バケット
 ```
 
--   **背景**: Nginxの世界では**「if is evil」**として知られており、`if`の使用は予期せぬ挙動の原因となるため、原則として避けるべきです。
--   **現状の理由**: `GET /api/videos/:id`（動画詳細）は`video-worker`、`DELETE /api/videos/:id`（動画削除）は`video-upload-api`と、同じURLで担当サービスが異なるため、暫定的に`if`でメソッドを判定しています。
--   **将来の展望**: これは技術的負債として認識しており、将来的には`video-upload-api`に削除専用のエンドポイント（例: `/api/videos/delete/:id`）を設けるなど、`if`を使わないルーティングへのリファクタリングが望ましいです。
-
-## 8. APIエンドポイント一覧
-
-| メソッド | パス                     | 担当サービス              | 説明                               | 認証 |
-| -------- | ------------------------ | ------------------------- | ---------------------------------- | ---- |
-| `POST`   | `/api/auth/register`     | `auth-service`            | 管理者アカウントの登録             | 不要 |
-| `POST`   | `/api/auth/login`        | `auth-service`            | 管理者ログイン（デバッグ用）       | 不要 |
-| `GET`    | `/api/auth/google/login` | `auth-service`            | Google OAuth認証を開始             | 不要 |
-| `GET`    | `/api/profile/me`        | `profile-service`         | 自分のプロフィール情報を取得       | 要   |
-| `GET`    | `/api/profile/status`    | `profile-service`         | 自分のアカウント状態を取得         | 要   |
-| `PUT`    | `/api/profile`           | `profile-service`         | プロフィール情報（名前・自己紹介）を更新 | 要   |
-| `PUT`    | `/api/profile/icon`      | `profile-service`         | アイコン画像を更新                 | 要   |
-| `PUT`    | `/api/profile/background`| `profile-service`         | 背景画像を更新                     | 要   |
-| `GET`    | `/api/my/videos`         | `mypage-service`          | 自分の動画一覧を取得               | 要   |
-| `GET`    | `/api/my/games`          | `mypage-service`          | 自分のゲーム一覧を取得             | 要   |
-| `GET`    | `/api/my/static-sites`   | `mypage-service`          | 自分の静的サイト一覧を取得         | 要   |
-| `POST`   | `/api/videos/upload`     | `video-upload-api`          | 動画アップロード                   | 要   |
-| `PUT`    | `/api/videos/:id`        | `video-upload-api`          | 動画メタデータの更新               | 要   |
-| `DELETE` | `/api/videos/:id`        | `video-upload-api`          | 動画の削除                         | 要   |
-| `GET`    | `/api/videos`            | `video-worker`          | 動画一覧を取得                     | 不要 |
-| `GET`    | `/api/videos/:id`        | `video-worker`          | 動画詳細を取得                     | 不要 |
-| `GET`    | `/api/videos/:id/stream` | `video-worker`          | 動画ストリーミング                 | 不要 |
-| `POST`   | `/api/games/upload`      | `game-upload-api`         | ゲームアップロードと処理Jobの発行  | 要   |
-| `GET`    | `/api/games`             | `game-upload-api`         | ゲーム一覧を取得                   | 不要 |
-| `GET`    | `/api/games/:id`         | `game-upload-api`         | ゲーム詳細を取得                   | 不要 |
-| `PUT`    | `/api/games/:id`         | `game-upload-api`         | ゲームメタデータの更新             | 要   |
-| `PUT`    | `/api/games/adjust/:id`  | `game-upload-api`         | ゲームの表示調整値を保存           | 要   |
-| `DELETE` | `/api/games/:id`         | `game-upload-api`         | ゲームの削除                       | 要   |
-| `POST`   | `/api/static-sites/upload`| `static-site-upload-api` | 静的サイトアップロードと処理Jobの発行 | 要   |
-| `GET`    | `/api/static-sites`      | `static-site-upload-api` | 静的サイト一覧を取得               | 不要 |
-| `GET`    | `/api/static-sites/:id`  | `static-site-upload-api` | 静的サイト詳細を取得               | 不要 |
-| `DELETE` | `/api/static-sites/:id`  | `static-site-upload-api` | 静的サイトの削除                   | 要   |
-
-## 9. ディレクトリと主要ファイルの役割
-```
-/
-├── .idea/
-│   └── .name             # IDEの表示名を 'Atmosidea' に設定
-├── docker-compose.yml    # 全サービスの構成定義
-├── frontend/
-│   ├── src/
-│   │   ├── pages/        # 各ページのコンポーネント
-│   │   │   ├── GameDetailPage.tsx  # ゲーム表示ページ
-│   │   │   ├── AdjustGamePage.tsx  # ゲーム調整ページ
-│   │   │   ├── EditGamePage.tsx    # ゲーム編集ページ
-│   │   │   ├── EditVideoPage.tsx   # 動画編集ページ
-│   │   │   └── StaticSiteDetailPage.tsx # 静的サイト表示ページ (仮)
-│   │   └── context/
-│   │       └── AuthContext.tsx   # 認証状態のグローバル管理
-│   ├── nginx.conf        # Nginxリバースプロキシ設定
-│   └── Dockerfile
-│
-├── game-upload-api/      # ゲームメタデータAPI
-│   └── main.go
-│
-├── game-worker/          # ゲーム非同期処理ワーカー
-│   └── main.go
-│
-├── static-site-upload-api/ # 静的サイトメタデータAPI
-│   └── main.go
-│
-├── static-site-worker/   # 静的サイト非同期処理ワーカー
-│   └── main.go
-│
-├── postgres/
-│   └── init.sql          # DB初期化スキーマ
-│
-├── video-worker/       # 動画配信サービス
-│   └── main.go
-│
-├── video-upload-api/       # 動画アップロードサービス
-│   └── main.go
-│
-├── game_storage_db/      # MinIO (game-storage) の永続化ディレクトリ
-├── profile_storage_db/   # MinIO (profile-storage) の永続化ディレクトリ
-├── static_site_storage_db/ # MinIO (static-site-storage) の永続化ディレクトリ
-└── video_storage_db/     # 動画ファイルとサムネイルの永続化ディレクトリ
-```
-
-## 10. データベーススキーマ
-
-### 10.1. `users` テーブル
-| カラム名        | 型          | 説明                               |
-| --------------- | ----------- | ---------------------------------- |
-| `id`            | `SERIAL`    | 主キー                             |
-| `username`      | `VARCHAR`   | ユーザー名                         |
-| `email`         | `VARCHAR`   | メールアドレス（UNIQUE）           |
-| `password_hash` | `VARCHAR`   | ハッシュ化されたパスワード         |
-| `provider`      | `VARCHAR`   | 認証プロバイダ ('local', 'google') |
-| `provider_id`   | `VARCHAR`   | OAuthプロバイダのユーザーID        |
-| `is_admin`      | `BOOLEAN`   | 管理者フラグ                       |
-
-### 10.2. `games` テーブル
-| カラム名          | 型          | 説明                                         |
-| ----------------- | ----------- | -------------------------------------------- |
-| `id`              | `VARCHAR(10)`| 主キー                                       |
-| `user_id`         | `INTEGER`   | 投稿者のID                                   |
-| `title`           | `VARCHAR(255)`| ゲームのタイトル                             |
-| `description`     | `TEXT`      | ゲームの説明                                 |
-| `status`          | `VARCHAR(20)`| 処理状態 ('processing', 'public', 'error')   |
-| `game_url`        | `VARCHAR(255)`| ゲームの`index.html`へのURL                  |
-| `thumbnail_url`   | `VARCHAR(255)`| サムネイル画像のURL                          |
-| `scale`           | `REAL`      | ユーザーが調整した拡大率                     |
-| `offset_x`        | `INTEGER`   | ユーザーが調整したX軸オフセット              |
-| `offset_y`        | `INTEGER`   | ユーザーが調整したY軸オフセット              |
-| `native_width`    | `INTEGER`   | **抽出されたゲームのネイティブ解像度（幅）** |
-| `native_height`   | `INTEGER`   | **抽出されたゲームのネイティブ解像度（高さ）** |
-| `created_at`      | `TIMESTAMP WITH TIME ZONE`| 作成日時                                     |
-| `updated_at`      | `TIMESTAMP WITH TIME ZONE`| 更新日時                                     |
-
-### 10.3. `static_sites` テーブル
-| カラム名          | 型          | 説明                                         |
-| ----------------- | ----------- | -------------------------------------------- |
-| `id`              | `VARCHAR(10)`| 主キー                                       |
-| `user_id`         | `INTEGER`   | 投稿者のID                                   |
-| `title`           | `VARCHAR(255)`| 静的サイトのタイトル                         |
-| `description`     | `TEXT`      | 静的サイトの説明                             |
-| `minio_path`      | `VARCHAR(255)`| MinIO上のサイトのルートパス（例: `siteId/`）|
-| `status`          | `VARCHAR(20)`| 処理状態 ('processing', 'public', 'error')   |
-| `created_at`      | `TIMESTAMP WITH TIME ZONE`| 作成日時                                     |
-
-## 11. セットアップと開発フロー
-
-### 11.1. 環境設定 (`.env`)
-`.env.example`をコピーして`.env`を作成し、各値を設定してください。特に`JWT_SECRET`と`ADMIN_REGISTRATION_CODE`は必ず変更してください。
-新しいMinIOサービスのために、`STATIC_SITE_MINIO_ACCESS_KEY_ID`と`STATIC_SITE_MINIO_SECRET_ACCESS_KEY`も設定が必要です。
-
-### 11.2. 管理用スクリプト (`.bat`)
--   **`clean.bat`**: **環境を完全にクリーンアップします。** コンテナ、ネットワーク、名前付きボリューム、ビルドキャッシュをすべて削除します。
--   **`update.bat`**: コード変更を反映させるための最も一般的なスクリプト。
--   **`start.bat` / `stop.bat`**: 日常的なコンテナの起動・停止に。
-
-### 11.3. 日常の開発サイクル
-1.  最初に`clean.bat`を実行し、環境を完全に初期化します。
-2.  `update.bat`で全サービスをビルド・起動します。
-3.  ブラウザで `http://localhost:3001` にアクセスします。
-4.  コード変更後は、再度`update.bat`を実行して変更を反映させます。
-
-## 12. 将来の課題と改善点
--   **Nginxの`if`文**: 上記「7.5. `if`文の例外的使用」で述べた通り、リファクタリングが望ましいです。
--   **テスト**: 現状、自動テストがありません。ユニットテストやE2Eテストを導入することで、将来の機能追加やリファクタリングをより安全に行えるようになります。
--   **エラーハンドリング**: 各サービスのログ出力は強化されましたが、ユーザーに表示されるエラーメッセージはまだ汎用的なものが多いです。より具体的で分かりやすいエラーフィードバックの向上が期待されます。
-
-## 13. 最近の主な変更点 (2026/08/01)
-
-このセクションでは、最近行われた大規模なリファクタリングと機能追加について解説します。
-
-### 13.1. アーキテクチャの変更: DB分割と新サービスの追加
-
-システムの関心事をより明確に分離するため、データベースとサービス構成に以下の変更が加えられました。
-
--   **データベースの分割**:
-    -   従来単一だった`postgres`コンテナを、**認証・ユーザー情報**を専門に扱う`auth-db`と、**アプリケーションのコンテンツ（動画・ゲーム）**を専門に扱う`app-db`の2つに分割しました。
-    -   これにより、ユーザーデータとコンテンツデータの独立性が高まり、将来的なスケーリングやメンテナンスが容易になります。
-
--   **新サービスの追加**:
-    -   **`mypage-service`**: ユーザーが投稿した動画やゲームの一覧を取得するための専用サービスです。`/api/my/*` のエンドポイントを担当します。
-    -   **`profile-service`**: ユーザープロフィールの取得・更新（ユーザー名、自己紹介、アイコン、背景画像）を担当する専用サービスです。`/api/profile/*` のエンドポイントを担当します。
-
-#### 13.1.1. 更新後の概念図
-
-```
-[ユーザー] -> [ブラウザ] -> [Nginx (frontend:80)]
-                                |
-           /api/auth/**         +-> [auth-service:8080] ----> [auth-db:5432]
-           /api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO:9000] (for icons)
-           /api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
-                                |
-           /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
-                                |   [video-worker:8081] --> [app-db:5432]
-                                |
-           /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
-           /games/**            +-> [MinIO (game-storage:9000)]
-                                |
-           (非同期処理)         [game-worker] <- [Redis:6379] -> [MinIO:9000]
-                                                              -> [app-db:5432]
-```
-
-#### 13.1.2. 更新後のサービス詳細
-
-| サービス名          | 内部ポート | 技術          | 責務                                                                                                                                                             |
-| ------------------- | ---------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `frontend`          | `80`       | Nginx, React  | **UI/APIゲートウェイ**: Reactアプリを提供し、`/api`以下のリクエストを各バックエンドサービスに振り分ける。                                                              |
-| `auth-service`      | `8080`     | Go, Gin       | **認証**: ユーザー登録、Google OAuth、JWT発行を担当。**`auth-db`**に接続。                                                                                        |
-| `profile-service`   | `8084`     | Go, Gin       | **プロフィール管理**: ユーザー名、自己紹介、アイコン、背景画像の取得・更新を担当。**`auth-db`**と**`minio`**に接続。                                                 |
-| `mypage-service`    | `8083`     | Go, Gin       | **マイページ**: ログインユーザーの投稿コンテンツ一覧（動画・ゲーム）を取得。**`app-db`**に接続。                                                                   |
-| `video-upload-api`    | `8080`     | Go, Gin       | **動画アップロード**: 動画ファイルのアップロード、サムネイル生成、DBへのメタデータ保存を担当。**`app-db`**に接続。                                                     |
-| `video-worker`    | `8081`     | Go, Gin       | **動画配信**: 動画のストリーミング配信とメタデータ提供を担当。**`app-db`**に接続。                                                                                 |
-| `game-upload-api`   | `8082`     | Go, Gin       | **ゲームメタデータAPI**: ゲームのメタデータ管理と、`game-worker`への処理要求（Redis経由）を担当。**`app-db`**に接続。                                                 |
-| `game-worker`       | -          | Go            | **ゲーム非同期処理**: RedisからJobを受け取り、ZIP解凍、解像度抽出、MinIOへのファイルアップロード、DB更新といった時間のかかる処理を実行。**`app-db`**に接続。          |
-| `auth-db`           | `5432`     | PostgreSQL    | **認証・ユーザーDB**: ユーザー情報、プロフィール、アカウント状態を永続化。                                                                                       |
-| `app-db`            | `5432`     | PostgreSQL    | **アプリケーションDB**: 動画、ゲームのメタデータを永続化。                                                                                                       |
-| `redis`             | `6379`     | Redis         | **メッセージキュー**: `game-upload-api`と`game-worker`間の非同期タスクの受け渡し。                                                                               |
-| `minio`             | `9000`     | MinIO         | **オブジェクトストレージ**: ゲームアセット、プロフィール画像（アイコン、背景）をホスト。                                                                           |
+- MinIO はディレクトリのインデックスを返さないため、`index.html` を補っている。
+- 1 行目に `break` を付けると 2 行目が実行されず、`/index.html` がバケット名として MinIO に渡る（過去にあった不具合）。
 
 ---
 
-### 13.2. 認証・新規登録フローの変更
+## 11. 認証・認可
 
-ユーザー体験とセキュリティ向上のため、認証フローが大幅に変更されました。
+### 11.1. JWT
 
--   **Google OAuthへの一本化**:
-    -   一般ユーザーの新規登録およびログインは、**Googleアカウント認証のみ**になりました。これにより、パスワード管理の必要がなくなり、セキュリティが向上します。
-    -   管理者のみ、特別なログインフォームからデバッグ用の認証情報でログインできます。
+- 発行: auth-service の `generateJWT`。HS256、署名鍵は `JWT_SECRET`（全サービス共通）、有効期限 7 日。
+- クレーム: `sub` / `userID` / `user_id` / `id`（すべて同じユーザー ID）、`username`、`isAdmin`、`exp`、`jti`（UUID）。
+- 保存場所: フロントエンドの `localStorage['token']`（Cookie ではない）。
+- 検証: 各サービスの `authMiddleware`。auth / profile / mypage / team / video-* / game-upload-api / static-site-upload-api はすべて HS256 に固定し、`jti` の無いトークンは拒否する。
 
--   **プロフィール登録を必須化する新しいワークフロー**:
-    1.  ユーザーが初めてGoogleでログインすると、`auth-service`は`users`テーブルに新しいレコードを`status: 'pending'`で作成します。
-    2.  ログインが成功すると、フロントエンドはユーザーの`status`を`/api/profile/status`に問い合わせます。
-    3.  `status`が`pending`の場合、ユーザーは強制的に**プロフィール編集ページ (`/edit-profile`)**にリダイレクトされます。
-    4.  ユーザーがプロフィール（ユーザー名、自己紹介など）を更新すると、`profile-service`は`users`テーブルの`status`を`active`に変更します。
-    5.  `status`が`active`になると、ユーザーはマイページやその他の機能へアクセスできるようになります。
+### 11.2. ログアウト（ブロックリスト）
 
----
+- `POST /api/auth/logout` が `blocklist:<jti>` を Redis に保存（TTL = 残りの有効期限）。
+- auth-service の `authMiddleware` は、**署名を検証した後に** `blocklist:<jti>` を確認する（Redis エラー時は 500 で拒否）。
+- JWT を検証する全サービス（auth / profile / mypage / team / video-upload-api / video-worker / game-upload-api / static-site-upload-api）が同じ確認をする。Redis エラー時は拒否（fail closed）。認証が任意の公開 GET では、無効・失効済みのトークンは匿名として扱う。
+- auth-service は加えて、リクエストごとに auth-db の `status` を確認する。
 
-### 13.3. 更新後のAPIエンドポイント一覧
+### 11.3. 編集・削除の認可
 
-| メソッド | パス                     | 担当サービス        | 説明                               | 認証 |
-| -------- | ------------------------ | ------------------- | ---------------------------------- | ---- |
-| `POST`   | `/api/auth/register`     | `auth-service`      | 管理者アカウントの登録             | 不要 |
-| `POST`   | `/api/auth/login`        | `auth-service`      | 管理者ログイン（デバッグ用）       | 不要 |
-| `GET`    | `/api/auth/google/login` | `auth-service`      | Google OAuth認証を開始             | 不要 |
-| `GET`    | `/api/profile/me`        | `profile-service`   | 自分のプロフィール情報を取得       | 要   |
-| `GET`    | `/api/profile/status`    | `profile-service`   | 自分のアカウント状態を取得         | 要   |
-| `PUT`    | `/api/profile`           | `profile-service`   | プロフィール情報（名前・自己紹介）を更新 | 要   |
-| `PUT`    | `/api/profile/icon`      | `profile-service`   | アイコン画像を更新                 | 要   |
-| `PUT`    | `/api/profile/background`| `profile-service`   | 背景画像を更新                     | 要   |
-| `GET`    | `/api/my/videos`         | `mypage-service`    | 自分の動画一覧を取得               | 要   |
-| `GET`    | `/api/my/games`          | `mypage-service`    | 自分のゲーム一覧を取得             | 要   |
-| `POST`   | `/api/videos/upload`     | `video-upload-api`    | 動画アップロード                   | 要   |
-| `PUT`    | `/api/videos/:id`        | `video-upload-api`    | 動画メタデータの更新               | 要   |
-| `DELETE` | `/api/videos/:id`        | `video-upload-api`    | 動画の削除                         | 要   |
-| `GET`    | `/api/videos`            | `video-worker`    | 動画一覧を取得                     | 不要 |
-| `GET`    | `/api/videos/:id`        | `video-worker`    | 動画詳細を取得                     | 不要 |
-| `GET`    | `/api/videos/:id/stream` | `video-worker`    | 動画ストリーミング                 | 不要 |
-| `POST`   | `/api/games/upload`      | `game-upload-api`   | ゲームアップロードと処理Jobの発行  | 要   |
-| `GET`    | `/api/games`             | `game-upload-api`   | ゲーム一覧を取得                   | 不要 |
-| `GET`    | `/api/games/:id`         | `game-upload-api`   | ゲーム詳細を取得                   | 不要 |
-| `PUT`    | `/api/games/:id`         | `game-upload-api`   | ゲームメタデータの更新             | 要   |
-| `PUT`    | `/api/games/adjust/:id`  | `game-upload-api`   | ゲームの表示調整値を保存           | 要   |
-| `DELETE` | `/api/games/:id`         | `game-upload-api`   | ゲームの削除                       | 要   |
+- 各ハンドラが、コンテンツの投稿者（videos: `uploader_id`、games / static_sites: `user_id`）と JWT の `userID` を比較し、一致しないかつ `isAdmin` でなければ 403。ただし game-upload-api の `PUT /:id`・`PUT /adjust/:id`・`DELETE /:id/thumbnail` は投稿者本人のみで、管理者でも 403（`DELETE /:id` だけ管理者も可）。
+- `PUT /api/videos/:id`（video-worker）は authMiddleware と投稿者チェックあり。
+
+### 11.4. チームの認可
+
+- `requireTeamRole(c, "<role>")` が、呼び出し元のロールのランクを比較する。
+- ロールの付与・削除は「自分より弱いロールだけ」。例外として owner は owner を付与できる（オーナー移譲のため。厳密にするなら `canGrantRole` の該当行を消す）。最後の owner は退出・削除できない（409）。
+- 非公開チームの投稿は、メンバーがログインしている場合だけ閲覧できる。
 
 ---
 
-### 13.4. 更新後のデータベーススキーマ
+## 12. セキュリティモデル
 
-#### 13.4.1. `auth-db` の `users` テーブル
-| カラム名                 | 型          | 説明                               |
-| ------------------------ | ----------- | ---------------------------------- |
-| `id`                     | `SERIAL`    | 主キー                             |
-| `username`               | `VARCHAR`   | ユーザー名                         |
-| `email`                  | `VARCHAR`   | メールアドレス（UNIQUE）           |
-| `password_hash`          | `VARCHAR`   | ハッシュ化されたパスワード         |
-| `provider`               | `VARCHAR`   | 認証プロバイダ ('local', 'google') |
-| `provider_id`            | `VARCHAR`   | OAuthプロバイダのユーザーID        |
-| `is_admin`               | `BOOLEAN`   | 管理者フラグ                       |
-| `icon_url`               | `TEXT`      | アイコン画像のURL                  |
-| `bio`                    | `TEXT`      | 自己紹介文                         |
-| `background_image_url`   | `TEXT`      | プロフィール背景画像のURL          |
-| `status`                 | `VARCHAR`   | アカウント状態 ('pending', 'active') |
+詳細な設計意図は `SECURITY_EXPLANATION.md`。ここでは**実装の事実**を記す。
 
-#### 13.4.2. `app-db` のテーブル
-`videos`テーブルと`games`テーブルの`uploader_id`および`user_id`カラムは、`auth-db`への外部キー制約を持たない単なる`INTEGER`型として扱われます。
+### 12.1. スキャンの判定（`backend/security/sfsp/internal/`）
 
----
-### 13.5. HLS動画再生機能のトラブルシューティングと修正履歴 (2026/08/01)
+| 段階 | 実装 |
+|---|---|
+| zip の展開 | `worker.unzip`。Zip Slip・symlink・デバイス・重複エントリを拒否。上限: `SFSP_MAX_ZIP_ENTRIES` 20000、`SFSP_MAX_EXTRACTED_BYTES` 4 GiB、`SFSP_MAX_ZIP_ENTRY_BYTES` 2 GiB-1、`SFSP_MAX_ZIP_RATIO` 1000 倍、`SFSP_MAX_ZIP_DEPTH` 32。違反は `suspicious`、I/O エラーは `failed`、壊れた zip は `invalid` |
+| ルートの検出 | Unity（`index.html` + `Build/`）→ 静的サイト（`index.html`）の順。複数見つかったり、見つからなければ `invalid` |
+| スキャン対象 | **展開したディレクトリ全体**（検出したルートだけではない）。zip 以外はファイルそのもの |
+| ClamAV | `clamscan -r --no-summary --infected --alert-exceeds-max=yes --max-filesize --max-scansize --max-files --max-recursion --max-dir-recursion --max-scantime --pcre-max-filesize <path>`（値は `SFSP_CLAMAV_*`）。終了コード 0 = clean、1 / 2 で実際の検出あり = malicious、`Heuristics.Limits.Exceeded.*` = suspicious、それ以外 = error。**1 ファイルの検査上限は 2 GiB-1**（ClamAV 1.5 の制約） |
+| YARA | `yara -r -w -m <rules> <path>`。終了コード 0 で出力行あり = suspicious、出力なし = clean、0 以外 = error |
+| 総合判定 | `determineOverallStatus`: ClamAV malicious → `malicious`、ClamAV または YARA が suspicious → `suspicious`、どちらかが error → `failed`、**両方が clean のときだけ** `clean` |
+| 結果 | `clean` → `clean-files`、`malicious` / `suspicious` → `quarantine`。`raw-files` は「状態の記録 → イベント発行」の後に削除（途中で落ちても再処理できる） |
 
-HLS動画再生機能の実装において発生した問題と、その解決までの経緯を以下にまとめます。
+`RunInSandbox` は stdout と stderr を別々に返し、終了コードが 0 以外なら `*sandbox.ExitError{Code}` を返す（`sandbox.ExitCode(err)` で取り出す）。**判定は必ず終了コードで行い、「OK」などの文字列で判定しない。**
 
-#### 13.5.1. 問題の概要
-動画詳細ページでHLS動画が再生されず、「メディアを利用できません」というエラーが表示されました。DevToolsの確認では、`video`要素の`src`が空で、HLS関連のネットワークリクエストが一切発生していない状態でした。
+### 12.2. サンドボックス（`internal/sandbox/docker.go`）
 
-#### 13.5.2. トラブルシューティングと修正ステップ
+| 設定 | 値 |
+|---|---|
+| 起動方法 | スキャナーのコマンドを `Entrypoint` として直接実行（イメージの `/init` を通さない） |
+| ネットワーク | `NetworkMode: none` |
+| 権限 | `CapDrop: ALL`、`SecurityOpt: no-new-privileges` |
+| ルートファイルシステム | `ReadonlyRootfs: true`。書き込めるのは `/tmp` の tmpfs（`rw,noexec,nosuid,nodev,size=512m`）だけ。上限を超えるとスキャンはエラー終了し `failed`（clean にはならない） |
+| リソース | メモリ 1.5 GB、CPU 1、PID 256 |
+| タイムアウト | 30 分（`sandboxTimeout`） |
+| マウント | `sfsp_temp_scan` ボリュームを `/scan_target` に読み取り専用でマウント |
 
-1.  **フロントエンド (`VideoDetailPage.tsx`) の初期設定ミス**
-    *   **問題**: `hls.js`は導入されていたものの、`hls.loadSource()`に渡すURLが、APIゲートウェイ経由のパス (`/api/videos/:id/stream`) ではなく、バックエンドが返すMinIO上のファイルパス (`/storage/videos/...`) を直接参照していたため、ブラウザからアクセスできませんでした。
-    *   **修正**: `VideoDetailPage.tsx`の`streamUrl`を`/api/videos/${video.id}/stream`に変更し、APIゲートウェイ経由でリクエストするように修正しました。
+- `CapDrop: ALL` の下では clamav/clamav イメージの `/init`（chown を行う）が失敗する。Entrypoint を元に戻すとスキャン前に終了コード 1 で落ち、全ファイルが判定不能になる。
+- ウイルス定義は `sfsp-clamav-client` のビルド時に `freshclam` で更新する。サンドボックスはネットワークが無いので実行時には更新できない。定義を新しくするには `docker compose build --pull sfsp-clamav-client`。
+- sfsp-api と sfsp-worker は非 root（uid/gid 10001）で動く（`docker/api/Dockerfile`、`docker/worker/Dockerfile` の `USER 10001:10001`）。スキャン用ディレクトリ `/tmp/sfsp-scan` は 0755・10001 所有で、サンドボックスのスキャナー（`CapDrop: ALL`）が読めるようにしてある。既存の `sfsp_temp_scan` ボリュームは `sfsp-scan-volume-init` が毎回 chown する。
+- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy` 経由でサンドボックスを起動し、設定は compose の environment で明示的に渡す。
+- 使う Docker API: `_ping`、`GET /images/{name}/json`、`POST /containers/create`、`start`、`wait`、`logs`、`DELETE /containers/{name}`。イメージの pull はしない（ローカルに無ければ `failed`）。
+- プロキシはリクエスト本文（Privileged・Binds 等）を検査しないので、完全な隔離ではない（[15 章](#15-既知の問題未対応)）。
 
-2.  **Nginxルーティングの不備**
-    *   **問題**: `/api/videos/:id/stream`へのリクエストを処理する`location`ブロックが`nginx.conf`に存在せず、Nginxがリクエストを`video-worker`に転送できていませんでした。
-    *   **修正**: `nginx.conf`に`location ~ ^/api/videos/([0-9]+)/stream { proxy_pass http://video_worker_service; ... }`を追加し、HLSストリームリクエストを`video-worker`に転送するようにしました。
+### 12.3. ユーザーのコンテンツの配信
 
-3.  **TypeScriptコンパイルエラー**
-    *   **問題**: `VideoDetailPage.tsx`のHLSイベントリスナーで、`event`引数が宣言されているものの使用されていなかったため、`TS6133: 'event' is declared but its value is never read.`というコンパイルエラーが発生し、ビルドが失敗しました。
-    *   **修正**: `event`引数を`_event`に変更し、未使用であることを明示することでエラーを解消しました。
+| 対象 | 対策 |
+|---|---|
+| ゲーム・静的サイト | `<id>.localhost` のサブドメインでのみ配信（メインオリジンの `/games/<id>/` は 404） |
+| サムネイル・プロフィール画像 | ワーカーが `http.DetectContentType` で `image/jpeg` / `png` / `gif` / `webp` のときだけ保存。拡張子も判定した形式から付ける（ユーザーのファイル名を使わない） |
+| 上記と HLS の配信 | `CSP: sandbox` と `nosniff`（[10.4](#104-ユーザーがアップロードしたファイルのヘッダー)） |
 
-4.  **React `useEffect`の実行タイミング問題**
-    *   **問題**: `video`ステートが更新された直後でも`videoRef.current`が`null`のままで、HLSの初期化処理が実行されないタイミングの問題が発生しました。
-    *   **修正**: `useEffect`の依存配列を`[video]`から`[loading, video]`に変更し、`!loading && video && videoRef.current`という条件でHLSのセットアップを実行するようにしました。これにより、ローディングが完了し、`<video>`要素がDOMに描画された後に処理が実行されるようになりました。
+### 12.4. JWT を localStorage に置くことのトレードオフ
 
-5.  **NginxによるHLSマニフェストファイル名指定の不足**
-    *   **問題**: フロントエンドが`/api/videos/:id/stream`というディレクトリパスにリクエストを送信していたため、NginxがMinIOに転送しても`404 Not Found`エラーが発生していました。
-    *   **修正**: `VideoDetailPage.tsx`の`streamUrl`を`/api/videos/${video.id}/stream/playlist.m3u8`に変更し、HLSマニフェストファイル名（`playlist.m3u8`）を明示的に指定するようにしました。
+- 利点: Cookie を自動送信しないので CSRF が原理的に起きない。
+- 欠点: アプリのオリジン（`localhost:3001`）で XSS が 1 つでも成立すると、トークンを盗まれる。
+- そのため、**ユーザーがアップロードした HTML / JS をメインオリジンで実行させないこと**が最重要。新しい配信経路を追加するときは 12.3 の対策を必ず適用する。
+- 静的サイトは `sandbox` 付きの iframe で表示し、カメラ機能などのため `allow-same-origin` を許可している（サブドメイン分離で補っている）。
 
-6.  **MinIOバケットのアクセス権限 (`403 Forbidden`)**
-    *   **問題**: `minio-init`サービスが`videos`バケットに対して匿名ダウンロードポリシーを設定していなかったため、MinIOへのアクセスが`403 Forbidden`エラーで拒否されました。
-    *   **修正**: `docker-compose.yml`内の`minio-init`サービスの`entrypoint`を修正し、`games`バケットと`videos`バケットの両方を作成し、匿名ダウンロードポリシーを設定するようにしました。
+### 12.5. その他
 
-7.  **動画ファイルの保存場所の誤解とNginx設定の不一致**
-    *   **問題**: これまでのトラブルシューティングは「動画ファイルがMinIOに保存されている」という誤った前提で進められていました。実際には、`docker-compose.yml`の`volumes`設定から、動画ファイルはホストマシンの`./storage/videos`ディレクトリに保存されていることが判明しました。このため、NginxがMinIOにリクエストを転送しても`404 Not Found`エラーが発生していました。
-    *   **最終修正**:
-        *   **`docker-compose.yml`**: `frontend`サービスに`./storage/videos:/storage/videos:ro`のボリュームマウントを追加し、Nginxがローカルの動画ファイルにアクセスできるようにしました。
-        *   **`nginx.conf`**: `/api/videos/([0-9]+)/stream/(.*)$`へのリクエストを`proxy_pass`ではなく`alias /storage/videos/$1/$2;`で処理するように変更し、コンテナ内のローカルファイルパスに直接マッピングしました。また、HLSに必要なMIMEタイプとCORSヘッダーも設定しました。
-        *   **`nginx.conf`**: `Content-Security-Policy`に`media-src 'self' blob:;`を追加し、HLS.jsが内部で利用する`blob:` URLからのメディア読み込みを許可しました。
-
-これらの修正により、HLS動画が正常に再生されるようになりました。
-
-### 13.6. HLS動画再生の内部フロー
-
-`Atmosidea`におけるHLS (HTTP Live Streaming) 動画再生の内部的な流れは以下のようになります。
-
-1.  **ユーザーが動画詳細ページにアクセス**
-    *   ブラウザが `http://localhost:3001/videos/:id` にアクセスします。
-    *   `frontend`サービス (Nginx) がReactアプリケーションの `index.html` を返します。
-
-2.  **Reactコンポーネント (`VideoDetailPage.tsx`) の初期化**
-    *   `VideoDetailPage.tsx` がマウントされ、`useEffect` フックが実行されます。
-    *   `axios.get('/api/videos/:id')` を通じて、バックエンドの `video-worker` から動画のメタデータ（タイトル、説明、IDなど）を取得します。この際、動画のファイルパスは `filename` フィールドに含まれますが、これはHLSのルートディレクトリを示すもので、直接再生には使用しません。
-
-3.  **HLS.js のセットアップとストリームURLの構築**
-    *   動画メタデータの取得が完了し、`loading` ステートが `false` になると、HLSセットアップ用の `useEffect` が再実行されます。
-    *   `videoRef.current` が `<video>` 要素を指していることを確認後、HLSストリームのURLを構築します。
-    *   **構築されるURL**: `/api/videos/${video.id}/stream/playlist.m3u8`
-        *   ここで `playlist.m3u8` は、HLS変換によって生成されるマスタープレイリストファイルの名前です。
-
-4.  **HLS.js によるストリームのロード**
-    *   `Hls.isSupported()` でブラウザがHLSをサポートしているか確認します。
-    *   `hls = new Hls({ debug: true })` で `hls.js` インスタンスが生成されます。
-    *   `hls.loadSource(streamUrl)` が呼び出され、構築されたURL (`/api/videos/:id/stream/playlist.m3u8`) に対してHTTPリクエストが発行されます。
-    *   `hls.attachMedia(videoEl)` により、`hls.js` が `<video>` 要素にアタッチされ、メディアソース拡張 (MSE) を通じて動画データのバッファリングと再生を制御する準備が整います。
-
-5.  **Nginx による HLS ストリームのルーティング**
-    *   フロントエンドから発行された `/api/videos/:id/stream/playlist.m3u8` へ
-のリクエストは、`frontend` コンテナ内のNginxに到達します。
-    *   `nginx.conf` 内の以下の `location` ブロックがこのリクエストにマッチします。
-        ```nginx
-        location ~ ^/api/videos/([0-9]+)/stream/(.*)$ {
-            alias /storage/videos/$1/$2;
-            # ... (MIMEタイプ、CORSヘッダー設定)
-        }
-        ```
-    *   Nginxは `alias` ディレクティブに基づき、リクエストパスをコンテナ内のローカルファイルパス (`/storage/videos/:id/playlist.m3u8`) にマッピングします。
-    *   `frontend` コンテナには `docker-compose.yml` で `./storage/videos:/storage/videos:ro` がボリュームマウントされているため、NginxはこのローカルパスにあるHLSファイル（`playlist.m3u8`）にアクセスできます。
-
-6.  **HLSプレイリストの解析とセグメントの要求**
-    *   Nginxから返された `playlist.m3u8` ファイルを `hls.js` が受信し、解析します。
-    *   `playlist.m3u8` には、動画の異なる品質（解像度、ビットレート）のストリームへのリンク（サブプレイリスト）と、それぞれのストリームを構成する短い動画セグメント（`.ts` ファイル）へのURLが含まれています。
-    *   `hls.js` は、ネットワーク状況やバッファの状態に応じて最適な品質のサブプレイリストを選択し、その中の `.ts` セグメントファイルを順次リクエストします。
-    *   これらの `.ts` セグメントファイルへのリクエストも、同様に `/api/videos/:id/stream/segmentX.ts` の形式でNginxに送られ、Nginxはそれを `/storage/videos/:id/segmentX.ts` としてローカルファイルシステムから取得し、 `hls.js` に返します。
-
-7.  **動画の再生**
-    *   `hls.js` は受信した `.ts` セグメントをデコードし、`<video>` 要素のメディアバッファに供給します。
-    *   十分なデータがバッファされると、`hls.js` は `videoEl.play()` を呼び出し、動画の再生が開始されます。
-    *   `hls.js` は再生中に `MANIFEST_PARSED` や `ERROR` などのイベントを発行し、ログ出力やエラーハンドリングに利用されます。
-
-このフローにより、ユーザーはHLS形式でエンコードされた動画をスムーズに視聴することができます。
----
-## 14. 最近の主な変更点 (2026/08/05)
-
-このセクションでは、2026年8月5日に行われた大規模なリファクタリングと機能追加について解説します。
-
-### 14.1. アーキテクチャの変更: MinIOの物理的分離
-
-**課題**: 従来、ゲームのアセットとユーザーのプロフィール画像（アイコン、背景）は、単一のMinIOコンテナ内の同じバケットに保存されており、データの関心事が混在していました。
-
-**解決策**: MinIOコンテナを**用途別に3つに分割**し、それぞれがプロジェクトルートの独立した物理ディレクトリにデータを保存するように変更しました。
-
--   **`game-storage`**:
-    -   **責務**: ゲーム関連のアセットのみを管理します。
-    -   **バケット**: `games`
-    -   **物理ディレクトリ**: `./game_storage_db/`
--   **`profile-storage`**:
-    -   **責務**: ユーザーのプロフィール画像（アイコン、背景）のみを管理します。
-    -   **バケット**: `user-profiles`
-    -   **物理ディレクトリ**: `./profile_storage_db/`
--   **`static-site-storage`**:
-    -   **責務**: 静的サイトのHTML, CSS, JSなどのファイルを管理します。
-    -   **バケット**: `static-sites`
-    -   **物理ディレクトリ**: `./static_site_storage_db/`
--   **`video_storage_db`**:
-    -   **責務**: 動画ファイル（HLS形式）とサムネイルをローカルファイルシステムに保存します。
-    -   **物理ディレクトリ**: `./video_storage_db/`
-
-この変更により、以下のメリットがもたらされました。
--   **データ管理の明確化**: データの種類ごとに保存場所が物理的に分離され、バックアップや管理が容易になりました。
--   **セキュリティの向上**: コンテナごとに異なるアクセスキーを設定できるため、各サービスの権限を最小限に留めることができます。
-
-### 14.2. ID体系の刷新: ランダム文字列IDの導入
-
-**課題**: 従来、動画やゲームのIDはデータベースの連番（`SERIAL`）であり、URLから次のコンテンツが容易に推測可能でした。
-
-**解決策**: 全ての動画とゲームのIDを、**予測不可能な10文字のランダムな英数字**に変更しました。
-
--   **データベース**: `app-db`内の`videos`および`games`テーブルの`id`カラムの型を`SERIAL`から`VARCHAR(10)`に変更。
--   **バックエンド**:
-    -   `video-upload-api`と`game-upload-api`に、`crypto/rand`を利用した安全なランダムID生成関数を追加。
-    -   コンテンツ作成時に、連番ではなくこの関数で生成したIDを付与するように変更。
-    -   関連する全てのサービス（`video-worker`, `mypage-service`, `game-worker`など）で、IDを`string`として扱うように修正。
--   **フロントエンド**:
-    -   関連する全てのページコンポーネント（`HomePage`, `MyPage`, `VideoDetailPage`など）で、IDの型を`number`から`string`に修正。
-    -   Nginxの設定ファイル(`nginx.conf`)のルーティングも、新しい英数字ID形式に対応するように正規表現を修正。
-
-### 14.3. UI/UXの改善
-
-#### 14.3.1. プロフィールページのUI刷新
-
--   **Discord風レイアウトの採用**: ユーザーのプロフィールページ(`MyPage.tsx`)のUIを、上部にバナー画像、その境界線上にアイコンが重なるモダンなレイアウトに変更しました。
--   **アイコンへの縁取り**: プロフィールページ、ホームページ、ヘッダーに表示される全てのユーザーアイコンに、白と灰色の二重の縁取りを追加し、視認性とデザイン性を向上させました。
-
-#### 14.3.2. 画像アップロード機能の強化: 画像クロッパーの導入
-
-**課題**: 従来、アイコンや背景画像はアップロードされたファイルがそのまま使用されるため、ユーザーが意図しない部分が表示される可能性がありました。
-
-**解決策**: `react-image-crop`ライブラリを導入し、画像アップロード時に**切り抜き・拡縮・回転**を行えるポップアップモーダルを実装しました。
-
--   **`ImageCropperModal.tsx`**: 再利用可能な画像クロッパーコンポーネントを新規作成。
--   **`EditProfilePage.tsx`**:
-    -   ユーザーが画像ファイルを選択すると、このモーダルが起動します。
-    -   アイコンの場合はアスペクト比`1:1`（円形）、背景画像の場合は`679:160`の調整枠が表示されます。
-    -   ユーザーが「保存」を押すと、切り抜かれた画像がプレビューに即時反映され、最終的に「更新する」ボタンでサーバーにアップロードされます。
-
-#### 14.3.3. その他のUI改善
-
--   **コンテンツ種別アイコン**: ホームページの各コンテンツカードの右上に、それが「動画」か「ゲーム」かを示すアイコン（`VideocamIcon`または`SportsEsportsIcon`）を表示するようにし、一覧性を向上させました。
--   **マイページのコンテンツ一覧**: マイページにもジャンルごちゃまぜのコンテンツ一覧を追加し、各コンテンツカードに投稿者情報（アイコンと名前）と、動画/ゲームアイコン、編集・削除ボタンを表示するようにしました。カードサイズは`266x292`に統一し、カード間の隙間も調整しました。
--   **認証フローの改善**: Googleアカウントでの新規登録時に、Googleアカウント名を取得せず、`username`を`NULL`で登録するように変更。ユーザーはプロフィール編集ページで最初に自身のユーザー名を設定するフローを明確化しました。これに伴い、`auth-db`の`users`テーブルスキーマと、`auth-service`および`profile-service`のDBアクセス処理を修正しました。
--   **CSPの修正**: フロントエンド開発サーバーで`blob:` URLからの画像読み込みがブロックされる問題を解決するため、`index.html`に`<meta>`タグを追加し、適切な`Content-Security-Policy`を設定しました。
-
-### 14.4. 検索機能の導入
-
-**課題**: コンテンツ一覧ページで特定のコンテンツを探すのが困難でした。
-
-**解決策**: コンテンツ一覧ページに検索バーを導入し、タイトルによる検索機能を追加しました。
-
--   **バックエンド (`video-worker`, `game-upload-api`)**:
-    -   `listVideosHandler` および `listGamesHandler` に検索クエリパラメータ (`q`) を受け取るロジックを追加。
-    -   データベースクエリに `WHERE title ILIKE $1` を追加し、検索キーワードをプリペアドステートメントで安全にバインドすることで、SQLインジェクション攻撃を防止。
--   **フロントエンド (`HomePage.tsx`)**:
-    -   検索キーワードを保持する `searchTerm` ステートと、デバウンスされた検索値を保持する `debouncedSearchTerm` ステートを追加。
-    -   検索バー (`TextField`) をUIに実装。
-    -   入力のたびにAPIリクエストが走るのを防ぐため、**デバウンス処理**を導入。ユーザーが入力し終えるまで（500ms入力が停止するまで）APIリクエストを遅延させ、不要なリロードを抑制。
-    -   検索中のUIカクつきを軽減するため、`CircularProgress` の表示を `isSearching` ステートで制御し、入力中はコンテンツを表示したまま、検索完了後に結果を反映するように改善。
-
-### 14.5. アカウント管理機能の導入
-
-**課題**: ユーザーが自分のアカウントを削除する手段がありませんでした。特にGoogleアカウント連携ユーザーの場合、アプリ内のデータ削除とGoogle側の連携解除のフローが不明確でした。
-
-**解決策**: ヘッダーのユーザーメニューに「アカウント管理」を追加し、アカウント削除機能を提供しました。
-
--   **`AccountDeletionModal.tsx`**: アカウント削除確認用のモーダルコンポーネントを新規作成。
-    -   ユーザーのプロバイダ (`'local'` または `'google'`) に応じてメッセージを調整。
-    -   Googleアカウント連携ユーザーの場合でも、Atomosideaアプリケーション内のデータを削除できるようにしました。
--   **`auth-service` の拡張**:
-    -   `DELETE /api/auth/me` エンドポイントを拡張。
-    -   ユーザーIDに基づいて、`auth-db` からユーザーレコードを削除（ローカルアカウントの場合）。
-    -   Googleアカウント連携ユーザーの場合、`auth-db` のユーザーレコードは削除せず、`status` を `'deleted_data'` に更新し、プロフィール情報（ユーザー名、アイコンURL、背景画像URL、自己紹介）を `NULL` に設定。これにより、Googleアカウントそのものには影響を与えず、Atomosidea内のデータのみを削除。
-    -   **関連データの削除**:
-        -   `profile-storage` (MinIO) からユーザーのアイコンと背景画像を削除。
-        -   `game-storage` (MinIO) からユーザーが投稿したゲームアセットを削除。
-        -   `app-db` からユーザーが投稿したゲームのレコードを削除。
-        -   `video_storage_db` (ローカルファイルシステム) からユーザーが投稿した動画ファイル（HLS形式）とサムネイルを削除。
-        -   `app-db` からユーザーが投稿した動画のレコードを削除。
-    -   `GET /api/auth/user/:userId` エンドポイントを追加し、ユーザーのプロバイダ情報を取得できるようにしました。
--   **`Header.tsx` の修正**:
-    -   ユーザーメニューに「アカウント管理」の `MenuItem` を追加し、クリック時に `AccountDeletionModal` を開くように設定。
--   **`AuthContext.tsx` の修正**:
-    -   `User` インターフェースに `provider` と `status` プロパティを追加。
-    -   `loadUser` 関数内で `profile-service` および `auth-service` から `status` と `provider` を取得し、`User` オブジェクトに設定。
-    -   `currentUser.status === 'pending'` の場合、`navigate('/edit-profile', { replace: true })` でプロフィール編集ページに強制リダイレクトするロジックを実装。
-    -   `logout` 関数も `navigate('/login', { replace: true })` を使用するように修正。
+- SQL はすべてプレースホルダ（`$1`）を使う。
+- React の自動エスケープに頼り、`dangerouslySetInnerHTML` は使わない。
+- 秘密情報は `.env`（`.gitignore` 済み）。`.env.example` の値は公開済みなので本番では必ず変更する。
 
 ---
-## 15. 最近の主な変更点 (2026/08/06)
 
-このセクションでは、2026年8月6日に行われた大規模な機能追加について解説します。
+## 13. ビルドと依存関係の制約
 
-### 15.1. 静的サイト配信機能の導入
-
-**概要**: ユーザーがHTML、CSS、JavaScriptなどの静的ファイルをZIP形式でアップロードし、それをWebサイトとして公開できる機能が追加されました。GitHub Pagesのような体験をアプリケーション内で提供します。
-
-#### 15.1.1. アーキテクチャの変更点
-
--   **新しいMinIOインスタンス**:
-    -   `static-site-storage`コンテナが追加されました。これは静的サイトのファイルを保存するための専用MinIOインスタンスです。
-    -   物理ディレクトリとして`./static_site_storage_db/`を使用します。
-    -   `minio-init`サービスが`static-site-storage`の`static-sites`バケットを初期化し、匿名ダウンロードポリシーを設定します。
--   **新しいバックエンドサービス**:
-    -   **`static-site-upload-api`**:
-        -   静的サイトのZIPファイルアップロードを受け付けます。
-        -   `static-site-storage`にZIPファイルを一時保存します。
-        -   `app-db`の`static_sites`テーブルにメタデータ（タイトル、説明、ユーザーIDなど）を`processing`ステータスで登録します。
-        -   Redisキューに処理ジョブをプッシュします。
-        -   静的サイトの一覧、詳細、削除などのAPIエンドポイントを提供します。
-    -   **`static-site-worker`**:
-        -   Redisキューからジョブを取得します。
-        -   `static-site-storage`からZIPファイルをダウンロードし、解凍します。
-        -   解凍した全てのファイルを、サイトIDをプレフィックスとしたパス（例: `siteId/index.html`）で`static-site-storage`にアップロードします。
-        -   `app-db`の`static_sites`テーブルのステータスを`public`に更新します。
--   **Nginx設定の更新**:
-    -   `frontend`コンテナのNginx設定（`nginx.conf`）に、`static-site-upload-api`へのAPIリクエストをルーティングする`location /api/static-sites`ブロックが追加されました。
-    -   `static-site-storage`から静的ファイルを直接配信するための`location ~ ^/static-sites/([a-z0-9]{10})/(.*)$`ブロックが追加されました。これにより、`/static-sites/{siteId}/path/to/file.html`のようなURLでサイトコンテンツにアクセス可能になります。
--   **データベーススキーマの更新**:
-    -   `app-db`に`static_sites`テーブルが追加されました。このテーブルは、静的サイトのID、投稿者ID、タイトル、説明、MinIO上のパス、ステータス、作成日時を管理します。
-    -   `id`カラムは`VARCHAR(10)`型で、ランダムな英数字IDを使用します。
-
-#### 15.1.2. 主要なワークフロー
-
-1.  **アップロード**: ユーザーが`frontend`から静的サイトのZIPファイルをアップロードします。
-2.  **API受付**: `frontend`は`/api/static-sites/upload`にリクエストを送信し、Nginx経由で`static-site-upload-api`がこれを受け取ります。
-3.  **一次保存とJob発行**:
-    -   `static-site-upload-api`は受け取ったZIPファイルを`static-site-storage`に一時保存します。
-    -   `app-db`の`static_sites`テーブルに`status: 'processing'`でレコードを作成し、ランダムな`siteId`を取得します。
-    -   Redisキューに`{siteId, objectName}`を含むジョブをプッシュします。
-    -   `frontend`に`siteId`を返し、サイト詳細ページなどへリダイレクトさせます。
-4.  **非同期処理**:
-    -   `static-site-worker`がRedisキューからジョブを取得します。
-    -   `static-site-storage`からZIPファイルをダウンロードし、解凍します。
-    -   解凍した全てのファイルを、`/{siteId}/`というプレフィックスで`static-site-storage`に再アップロードします。この際、適切なMIMEタイプが自動的に設定されます。
-    -   `app-db`の該当サイトレコードを`status: 'public'`に更新し、`minio_path`を保存します。
-5.  **表示**:
-    -   ユーザーは`/static-sites/{siteId}/index.html`のようなURLで静的サイトにアクセスできます。
-    -   Nginxがこのリクエストを`static-site-storage`にプロキシし、MinIOから直接静的ファイルが配信されます。
-
-この機能により、ユーザーは手軽に自身のWebコンテンツを公開できるようになります。
----
-## 16. 最近の主な変更点 (2026/08/06) - 静的サイト機能の安定化と改善
-
-このセクションでは、2026年8月6日に行われた静的サイト配信機能の安定化と改善について解説します。
-
-### 16.1. 機能概要
-
-ユーザーがZIP形式で静的サイトをアップロードし、それをWebサイトとして公開できる機能を追加しました。GitHub Pagesのような体験をアプリケーション内で提供します。
-
-### 16.2. アーキテクチャの変更点
-
--   **3つの新サービス**:
-    -   **`static-site-storage`**: 静的サイトのファイルを保存するための専用MinIOコンテナ。
-    -   **`static-site-upload-api`**: ZIPファイルのアップロード受付、メタデータ管理、ワーカーへの処理要求を担当するAPI。
-    -   **`static-site-worker`**: アップロードされたZIPを解凍し、MinIOに展開する非同期処理ワーカー。
--   **`docker-compose.yml`の更新**:
-    -   上記3つのサービスを定義。
-    -   `minio-init`サービスを強化し、各MinIOコンテナが完全に起動するのを待ってから、バケット作成 (`mc mb`) と公開ポリシー設定 (`mc policy set download`) を確実に行うように`entrypoint`を修正。これにより、起動時の競合状態によるアクセス権限の問題を根本的に解決しました。
--   **データベーススキーマの更新**:
-    -   `app-db`の`postgres/init.sql`に`static_sites`テーブルを追加。
-    -   ZIPファイル内のサブディレクトリにある`index.html`に対応するため、`entry_point_path`カラムを追加。`static-site-worker`が`index.html`を探索し、その相対パスをこのカラムに保存します。
-
-### 16.3. 主要なワークフロー
-
-1.  **アップロード**: ユーザーが`frontend`から静的サイトのZIPファイルをアップロードします。
-2.  **API受付**: `static-site-upload-api`がリクエストを受け付け、ZIPファイルを`static-site-storage`に一時保存し、`static_sites`テーブルにレコードを作成後、Redisに処理ジョブを発行します。
-3.  **非同期処理**:
-    -   `static-site-worker`がジョブを取得し、ZIPファイルを解凍します。
-    -   **`index.html`の探索**: ZIPファイル内を再帰的に探索し、`index.html`のパス（例: `my-dist/index.html`）を特定します。
-    -   解凍した全ファイルを`/{siteId}/`プレフィックスで`static-site-storage`にアップロードします。
-    -   `static_sites`テーブルのステータスを`public`に更新し、特定した`index.html`のパスを`entry_point_path`に保存します。
-4.  **表示**:
-    -   フロントエンド (`StaticSiteDetailPage.tsx`) は、APIから取得した`entry_point_path`を使い、`/static-sites/{id}/{entry_point_path}`という正しいURLを構築して`iframe`で表示します。
-
-### 16.4. フロントエンドの変更点
-
--   **新規ページの作成**:
-    -   `UploadStaticSitePage.tsx`: 静的サイトのアップロード用UI。
-    -   `StaticSiteDetailPage.tsx`: アップロードされたサイトのプレビューと情報表示ページ。
--   **既存ページの更新**:
-    -   `HomePage.tsx`と`MyPage.tsx`に「静的サイト」タブを追加し、コンテンツ一覧に静的サイトが含まれるように修正。
--   **`iframe`の権限設定**:
-    -   `StaticSiteDetailPage.tsx`の`iframe`に`sandbox`属性と`allow`属性を適切に設定 (`sandbox="allow-scripts allow-popups allow-forms allow-modals allow-same-origin"`, `allow="camera"`)。これにより、`iframe`内のサイトがカメラアクセスなどの権限を要求した際に、ブラウザの権限要求ポップアップが正しく表示されるようになりました。
-
-### 16.5. トラブルシューティングとデバッグの経緯
-
-本機能の実装にあたり、複数のエラーが発生しましたが、以下の通り段階的に解決しました。
-
--   **ビルドエラー**:
-    -   **原因**: `go.sum`の不整合、`Dockerfile`の`COPY`コマンドの順序やパスの間違い。
-    -   **解決**: `Dockerfile`の記述をGoのベストプラクティスに沿った形（`go.mod`と`go.sum`を先にコピー → `go mod download` → `COPY . .` → `go mod tidy` → `go build`）に修正し、ビルドプロセスを安定化させました。
--   **実行時エラー**:
-    -   **`502 Bad Gateway`**: バックエンドサービスが起動時の競合状態（DBやMinIOより先に起動してしまう）でクラッシュしていたことが原因でした。各Goサービスの`main`関数に、依存サービスへの接続リトライ処理を追加して解決しました。
-    -   **`403 Forbidden`**: `minio-init`サービスがバケットの公開ポリシーを確実に設定できていなかったことが原因でした。`minio-init`の待機処理を`mc admin info`を使うより堅牢なものに変更し、ポリシー設定を確実に行うことで解決しました。
-    -   **`404 Not Found`**: `index.html`がZIPのサブディレクトリ内にある場合にパスを見つけられなかったことが原因でした。`static-site-worker`が`index.html`を探索し、そのパスをDBに保存するよう修正して解決しました。
--   **権限エラー**:
-    -   **`SecurityError: Invalid security origin`**: `iframe`の`sandbox`属性に`allow-same-origin`が不足していたことが原因でした。これを追加することで、カメラなどの高度なAPIへのアクセスが可能になりました。
-
-これらの修正により、静的サイト配信機能は安定して動作するようになりました。
----
-## 17. セキュリティモデルの設計思想と注意点
-
-このプロジェクトの認証・認可は、**JWT (JSON Web Token) を `localStorage` に保存する方式**を採用しています。これは、伝統的なCookieベースのセッション管理とは異なるトレードオフを持つ、モダンなWebアプリケーションで広く採用されている設計です。
-
-### 17.1. この設計の強み
-
-1.  **CSRF対策の根本解決**
-    -   Cookieはその性質上、ブラウザがリクエスト時に自動で送信してしまいます。これが、ユーザーの意図しないリクエストを強制的に実行させるCSRF（クロスサイト・リクエスト・フォージェリ）攻撃の温床となります。
-    -   本プロジェクトでは、認証トークン（JWT）を`localStorage`に保存し、APIリクエストの都度、JavaScriptが明示的に`Authorization: Bearer <token>`ヘッダーを付与しています。
-    -   これにより、**Cookieの自動送信機能に依存するCSRF攻撃は原理的に成立しません。** 複雑なCSRFトークンの管理が不要になるという大きなメリットがあります。
-
-2.  **`iframe sandbox` によるコンテキストの遮断**
-    -   ユーザーがアップロードした静的サイトは`iframe`内で表示されます。この`iframe`には`sandbox`属性が設定されており、`iframe`内のコンテンツが親ページ（Atmosidea本体）のリソース（`localStorage`やCookieなど）にアクセスすることを防ぎます。
-    -   これは、たとえアップロードされた静的サイトに悪意のあるスクリプト（XSS）が含まれていたとしても、**Atmosidea本体のJWTが盗まれるのを防ぐ**ための非常に重要なセキュリティ境界となっています。
-
-### 17.2. プロダクション運用で必ずチェックすべき「3つの注意点」
-
-このアプローチは非常に優秀ですが、`localStorage` 採用ゆえのトレードオフが存在します。以下の3点は実装・運用時に必ず確認しておく必要があります。
-
-#### 1. XSSが1箇所でも刺さると「JWTが一瞬で即死（完全盗難）」する
-
--   **リスク**: `HttpOnly`属性を持つCookieはJavaScriptから読み取れないため、XSS脆弱性があってもCookie自体を直接盗むことは困難です。しかし、`localStorage`に保存されたJWTは、**1箇所でもXSSが成功すると、`localStorage.getItem('token')`という簡単なコードで一瞬で盗まれてしまいます。**
--   **対策**:
-    -   **Reactの自動エスケープ**: Reactはデフォルトで文字列をエスケープするため、基本的なXSSは防がれます。
-    -   **厳格なCSP**: `Content-Security-Policy`ヘッダーで、信頼できないドメインからのスクリプト実行を禁止します。特に`script-src`ディレクティブで`unsafe-inline`や`unsafe-eval`を安易に許可しないことが重要です。
-    -   **依存関係の監査**: `npm audit`などを定期的に実行し、利用しているサードパーティライブラリに既知のXSS脆弱性がないかを確認します。
-
-#### 2. `iframe` の `sandbox` 属性の設定値（超重要）
-
-`iframe`の`sandbox`属性に指定するフラグの組み合わせには、セキュリティ上の有名な落とし穴があります。
-
--   **🚨 最も危険な組み合わせ**: `sandbox="allow-scripts allow-same-origin"`
--   **理由**: この2つを**同時**に付与すると、`iframe`内のJavaScriptがサンドボックス制限を（一部）解除し、親画面の`window.parent.localStorage`などへアクセスできてしまう可能性があります。
--   **本プロジェクトでの設定**: `sandbox="allow-scripts allow-popups allow-forms allow-modals allow-same-origin"`
-    -   本プロジェクトでは、`iframe`内のコンテンツ（静的サイト）がカメラAPIなど、同一オリジンであることを要求する機能を利用できるようにするため、意図的に`allow-same-origin`を許可しています。
-    -   これによりサンドボックスの強度は若干低下しますが、ユーザーが自身のコンテンツをアップロードするというサービスの性質上、このリスクは許容可能と判断しています。代替案として、静的サイトを全く別のドメイン（例: `*.atmosidea-usercontent.com`）で配信する方法もありますが、実装がより複雑になります。
-
-#### 3. JWTの「無効化（ログアウト・強制ログアウト）」の難しさ
-
--   **リスク**: JWTは自己完結型（ステートレス）であるため、一度発行すると有効期限が切れるまで有効です。そのため、万が一JWTが漏洩した場合や、管理者が特定のユーザーを強制的にログアウトさせたい場合に、サーバー側でそのトークンだけを即座に無効化することが困難です。
--   **対策**:
-    -   **短い有効期限**: アクセストークン（JWT）の有効期限を極めて短く（例: 15分〜1時間）設定し、頻繁に再発行する。
-    -   **リフレッシュトークン**: より安全なリフレッシュトークン（これは`HttpOnly` Cookieで保持することが多い）を導入し、アクセストークンの再発行を管理する。
-    -   **失効リスト（Blocklist）**: Redisなどの高速なインメモリデータベースに、無効化したいJWTのIDを保存し、APIリクエストの都度そのリストをチェックする。本プロジェクトでは、この方法はまだ実装されていません。
-
-### 17.3. まとめ
-
-このプロジェクトのセキュリティモデルは、「**CSRFのリスクをゼロにする代わりに、XSS防御（`localStorage` の保護）に全振りする**」という、非常に明確で理にかなった方針を取っています。
-
-`iframe`の`sandbox`属性のトレードオフを理解し、厳格なCSPを維持できている限り、個人開発から中規模サービスまで十分に耐えうる堅牢な設計と言えます。
+1. **`replace` ディレクティブ**: shared を使う Go サービスの `go.mod` には `replace github.com/atmosidea/shared => ../../shared` がある。新しいサービスを追加するときも必ず書く。無いと `exit status 128`（GitHub への認証エラー）でビルドが失敗する。
+2. **ビルドコンテキストはプロジェクトルート**: compose の `context: .`、Dockerfile は `COPY . .` → `WORKDIR /app/backend/<サービス>` の順。これで `../../shared` が解決される。この組み合わせを変えない。
+3. **`go mod tidy` の扱い**: 多くの Dockerfile は `go mod download` だけを行う。例外として、`profile-worker`・`game-upload-api`・`monitoring-service/backend` は Dockerfile 内で `go mod tidy` を実行し、SFSP の Dockerfile は `go.sum` が無いときだけ実行する。依存を追加したら、ローカルの `go.mod` / `go.sum` も更新すること（`video-worker` は `-mod=readonly` 相当でビルドされるため、`go.sum` が欠けると失敗する）。
+4. **最終イメージ**: `alpine:latest` に `ca-certificates` と `tzdata`。多くの Dockerfile がビルドステージで `.env` をイメージにコピーするため、**`.env` が無いとビルドが失敗する。**
+5. **ローカルに Go が無い場合**: `docker run --rm -v "<リポジトリ>:/src:ro" -v atomosidea-gomodcache:/go/pkg/mod golang:1.25-alpine sh -c 'cd /src/<モジュール> && go build ./... && go vet ./...'` でビルドと vet を確認できる。
+6. **改行コード**: リポジトリのソースは LF。Windows の Python などで書き換えると CRLF になることがあるので注意する。
 
 ---
-## 18. 最近の主な変更点 (2026/08/08) - 静的サイトのサブドメイン分離とセキュリティ強化
 
-このセクションでは、静的サイトの配信をメインアプリケーションと完全に分離し、セキュリティを大幅に強化するための変更点について解説します。
+## 14. よくある誤解（旧ドキュメントとの差分）
 
-### 18.1. アーキテクチャの変更: サブドメインによる静的サイト配信
+古いドキュメント（旧 EditAI.md・旧 README・AI_PROJECT_GUIDE.md・SECURITY_EXPLANATION.md）に書かれていたが、現在の実装とは異なる内容。
 
-**課題**: 従来のパスベース (`http://localhost:3001/static-sites/{siteId}/...`) での静icサイト配信は、メインアプリケーションと同一オリジンであるため、`iframe`の`sandbox`属性に`allow-same-origin`を許可せざるを得ず、セキュリティ上の懸念が残っていました。
-
-**解決策**: 静的サイトを専用のサブドメイン (`http://{siteId}.localhost:3001/`) で配信するように変更しました。これにより、ブラウザの**同一オリジンポリシー**が働き、メインアプリケーションと静的サイトが完全に分離され、セキュリティが大幅に向上します。
-
-#### 18.1.1. 概念図の更新
-
-[ユーザー] -> [ブラウザ] -> [Nginx (frontend:80)]
-/api/auth/**         +-> [auth-service:8080] ----> [auth-db:5432]
-/api/profile/**      +-> [profile-service:8084] -> [auth-db:5432] -> [MinIO (profile-storage:9000)] (for icons)
-/api/my/**           +-> [mypage-service:8083] --> [app-db:5432]
-
-       /api/videos/**       +-> [video-upload-api:8080] --> [app-db:5432]
-                            |   [video-worker:8081] --> [app-db:5432]
-
-       /api/games/**        +-> [game-upload-api:8082] -> [app-db:5432] -> [Redis:6379]
-       /games/**            +-> [MinIO (game-storage:9000)]
-
-       /api/static-sites/** +-> [static-site-upload-api:8085] -> [app-db:5432] -> [Redis:6379]
-       http://{siteId}.localhost:3001/... +-> [MinIO (static-site-storage:9000)]
-       http://localhost:3001/static-sites/{siteId}/... (プレビュー用) +-> [MinIO (static-site-storage:9000)]
-
-       (非同期処理)         [game-worker] <- [Redis:6379] -> [MinIO (game-storage:9000)]
-                                                          -> [app-db:5432]
-       (非同期処理)         [static-site-worker] <- [Redis:6379] -> [MinIO (static-site-storage:9000)]
-
-
-#### 18.1.2. サービス詳細の更新
-
-| サービス名              | 内部ポート | 技術          | 責務                                                                                                                                                             |
-| ----------------------- | ---------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `frontend`              | `80`       | Nginx, React  | **UI/APIゲートウェイ**: Reactアプリを提供し、`/api`以下のリクエストを各バックエンドサービスに振り分ける。**サブドメイン (`*.localhost`) からの静的サイトリクエストも処理する。** |
-| `static-site-worker`    | -          | Go            | **静的サイト非同期処理**: RedisからJobを受け取り、ZIP解凍、**ZIP内の多重ディレクトリ構造を考慮して**MinIOへのファイルアップロードを実行。**`app-db`**に接続。          |
-
-### 18.2. Nginx設定 (`nginx.conf`) の詳細
-
-*   **`server_name` の修正**:
-    *   サブドメイン配信用 `server` ブロックの `server_name` を `~^([a-z0-9]{10})\.localhost$;` に変更。正規表現を引用符で囲むことで、Nginxの構文エラーを解消しました。
-    *   `set $site_id $1;` を追加し、キャプチャしたサイトIDを変数に格納します。
-*   **`rewrite` ルールの調整**:
-    *   MinIOがディレクトリインデックスをサポートしないため、ディレクトリパスへのリクエスト (`/` や `/dir/`) に対して自動的に `index.html` を付加する `rewrite` ルールを追加しました。
-*   **`Permissions-Policy` の強化**:
-    *   サブドメイン用 `server` ブロックおよびパスベースの静的サイトアクセス用 `location` ブロックの `Permissions-Policy` を更新。
-    *   `payment`, `display-capture`, `clipboard-read`, `publickey-credentials-get` など、リスクの高い権限は明示的に禁止 (`()`)。
-    *   `camera`, `microphone`, `fullscreen`, `autoplay` など、機能に必要な権限は `(self)` で自己オリジンからのアクセスを許可。
-    *   `pointer-lock` は `allow` 属性ではなく `sandbox` 属性で制御されるべきであるため、`Permissions-Policy` から削除し、警告を解消しました。
-*   **`Content-Security-Policy` の強化**:
-    *   メインアプリケーション用 `server` ブロックの `Content-Security-Policy` の `frame-src` に `http://*.localhost` および `http://*.localhost:3001` を追加。これにより、メインアプリがサブドメインの静的サイトを `iframe` で埋め込むことを許可しました。
-    *   `frontend/index.html` からCSPの`<meta>`タグを削除し、CSPの一元管理をNginxで行うようにしました。
-
-### 18.3. フロントエンドの修正
-
-*   **`StaticSiteDetailPage.tsx`**:
-    *   `iframe`の`src`を**サブドメイン形式のURL (`http://{siteId}.localhost:3001/{entry_point_path}`) に一本化**しました。これにより、`iframe`内も完全に分離されたオリジンで動作し、セキュリティが大幅に向上します。
-    *   `iframe`の`sandbox`属性に`allow-same-origin`を追加しました。これは、サブドメイン分離環境下でもカメラなどの機能が正しく動作するために、`iframe`内に明確なオリジンを提供する必要があるためです。
-    *   `iframe`の`allow`属性から`pointer-lock`を削除し、`sandbox`属性に`allow-pointer-lock`を追加しました。
-    *   プレビューURLの表示を削除しました。
-*   **`HomePage.tsx` / `MyPage.tsx`**:
-    *   静的サイトのコンテンツカードのリンクを、`StaticSiteDetailPage`へのパスベースのURL (`/static-sites/{siteId}`) に戻しました。これにより、メインアプリケーション内で詳細ページに遷移し、そこでプレビューと公開URLの両方を確認できるようにします。
-
-### 18.4. `static-site-worker` の修正
-
-*   ZIPファイル内の多重ディレクトリ構造に対応するため、`processStaticSiteJob` 関数を修正しました。
-*   `index.html` がZIP内のどの階層にあっても、そのディレクトリを基準としてMinIOのサイトID直下にファイルを展開するようにしました。
-*   `entryPointPath` は常に `index.html` のファイル名のみをDBに保存するように変更しました。
-*   **【重要】JavaScriptファイルの自動改変ロジックは削除しました。** ユーザーがアップロードしたファイルを意図せず改変することはリスクが高いため、この機能は実装しない方針としました。カメラ機能を利用する静的サイトをアップロードする際は、ユーザー自身が`script.js`を「ボタンクリックでカメラが起動する」ように修正する必要があります。
-
-### 18.5. 開発用バッチスクリプトの追加
-
-*   **`open_ports.bat`**: Windowsファイアウォールでポート `3001` と `8080` を開放します。
-*   **`close_ports.bat`**: `open_ports.bat` で開いたポートを閉じます。
-*   **`check_ports_closed.bat`**: ポートが `localhost` のみにバインドされているかを確認し、意図せず外部に公開されていないかをチェックします。
-
-### 18.6. トラブルシューティングと解決策
-
-*   **Nginx構文エラー (`directive "server_name" is not terminated by ";"` など)**:
-    *   `server_name` の正規表現にバックスラッシュ (`\`) が含まれる場合、文字列全体を引用符 (`""` または `''`) で囲む必要があるというNginxの構文ルールに従い修正しました。
-    *   `set $site_id $1;` を `server_name` の直後に配置し、キャプチャグループを番号付き (`$1`) にすることで、より互換性の高い設定としました。
-*   **CSPエラー (`Framing '...' violates...`)**:
-    *   `frontend/index.html` に記述されていたCSPの`<meta>`タグを削除し、Nginxで設定したCSPが正しく適用されるようにしました。
-    *   Nginxのメインアプリケーション用 `server` ブロックの `Content-Security-Policy` ヘッダーに `frame-src 'self' http://*.localhost http://*.localhost:3001;` を追加し、クロスオリジンでの `iframe` 埋め込みを許可しました。
-*   **`Permissions-Policy` 警告 (`Unrecognized feature: 'pointer-lock'`)**:
-    *   `nginx.conf` の `Permissions-Policy` ヘッダーから `pointer-lock` を削除しました。`pointer-lock` は `allow` 属性ではなく `sandbox` 属性で制御されるべきであるためです。
-*   **カメラアクセスエラー (`SecurityError: Invalid security origin`)**:
-    *   `StaticSiteDetailPage.tsx` の `iframe` の `sandbox` 属性に `allow-same-origin` を追加しました。サブドメイン分離環境下でも、カメラなどの機能が正しく動作するために `iframe` 内に明確なオリジンを提供する必要があるためです。
-*   **カメラアクセスエラー (`NotAllowedError: Permission denied`)**:
-    *   これはブラウザのセキュリティ仕様による挙動であり、以下の手順でユーザー側での対応が必要です。
-        1.  **ブラウザの個別ドメイン設定を「許可」に変更する**: `http://{siteId}.localhost:3001` を直接開き、URLバーの設定アイコンからカメラ権限を「許可」に設定。
-        2.  **OS（Windows / Mac）のカメラプライバシー設定を確認する**: OSレベルでChromeのカメラ使用が許可されているか確認。
-        3.  **Chromeの安全扱いフラグ（`chrome://flags`）を適用する**: `chrome://flags/#unsafely-treat-insecure-origin-as-secure` をEnabledにし、`http://localhost:3001, http://*.localhost:3001, http://*.localhost` を追加して再起動。
-        4.  **ユーザー操作によるカメラ起動**: `script.js` 内で、ページ読み込み時に自動でカメラを起動するのではなく、**ユーザーがボタンをクリックするなどの操作をトリガーとしてカメラを起動する**ように実装する必要があります。
-
-これらの修正とトラブルシューティングにより、静的サイトのサブドメイン分離とセキュリティ強化が実現され、カメラ機能も正しく動作する環境が整いました。                                                                  -> [app-db:5432]
-
-### 18.7. Goマイクロサービス（モノリポ）における依存関係・Dockerビルドエラーと解決策
-
-*   **`go.mod` 初期状態における依存関係欠落と依存構造（直接/間接依存）の理解**:
-    *   **課題**: 一部のサービス（`video-upload-api` など）の `go.mod` が `module` 名と `go` バージョン宣言のみの初期状態（たった3行）であり、プログラムの動作に必要な外部ライブラリの記録（`require`）や、改ざん防止・バージョン固定用のチェックサムファイル（`go.sum`）が存在しませんでした。
-    *   **背景と構造**: Go言語では、コード内で直に呼び出している「直接依存（`import` しているライブラリ）」と、そのライブラリが内部で勝手に使っている「間接依存（`// indirect` コメントが付く孫ライブラリ）」の2種類が存在します。正常なサービス（`profile-service` など）の構成と比較・分析し、`go mod tidy` コマンドを実行してプロジェクト全体でこの依存関係を正確に記録・整理する必要性を明らかにしました。
-
-*   **モノリポ共通パッケージ（`shared`）の参照不可による GitHub 認証エラー (`exit status 128`)**:
-    *   **課題**: 各マイクロサービス（`video-upload-api`, `static-site-worker`, `game-worker` 等）から、チーム共有の共通モジュール（`github.com/atmosidea/shared`）を呼び出そうとした際、Go言語が「このプログラムはインターネット（GitHub）上にある非公開リポジトリ（プライベートリポジトリ）に取りに行かなければならない」と勘違いしてアクセスを試みました。その結果、Dockerビルドなどの画面が出ない自動処理（非対話型環境）の中でユーザー名やパスワード（SSHキー）を入力できず、`fatal: could not read Username for 'https://github.com': terminal prompts disabled` という認証エラー（exit status 128）で処理が停止していました。
-    *   **解決策**: 該当するすべてのサービスの `go.mod` ファイルの最末尾に `replace github.com/atmosidea/shared => ../shared` という「置換（replace）指示」を明示的に追記しました。これにより、インターネットへの通信を一切発生させず、同じパソコン内にある隣の `../shared` フォルダを直接読み込ませるように設定を修正しました。
-
-*   **Docker ビルドコンテキストの誤りと相対パス参照失敗 (`replacement directory ../shared does not exist`)**:
-    *   **課題**: 従来は `cd video-upload-api` のように各サービスフォルダの中に移動してから `docker build .` を実行したり、`Dockerfile` 内で該当サービス単体のフォルダだけをコンテナ内部にコピー（`COPY . .`）していました。この状態だと、コンテナの中から見ると「自分自身のフォルダ」しか見えず、親階層にある `../shared` フォルダが存在しないため、`go.mod` で設定した `replace` 指示が「指定された `../shared` ディレクトリが存在しない（does not exist）」というパス切れエラーを起こしていました。
-    *   **解決策**: Dockerのビルド対象範囲（ビルドコンテキスト）を、常にプロジェクト全体の最ルート階層（`Atomosidea` フォルダ直下）に指定（`docker build -f <サービス>/Dockerfile .`）するように変更しました。さらに `Dockerfile` の中で `COPY . .` を行なってプロジェクト全体（`shared` 含む）をコンテナ内に一度まるごとコピーした上で、`WORKDIR /app/<サービス名>` へ移動してビルドを行う安全な設計に一括改修しました。
-
-*   **Dockerfile 内での不適切な `RUN go mod tidy` 実行とビルド安定化の阻害**:
-    *   **課題**: 以前の `Dockerfile` の内部に `RUN go mod tidy`（コンテナの中でプログラムに必要なライブラリを都度検索・整理する命令）が書かれていました。コンテナの中にはGitHubのログイン情報（認証情報）がないため、ビルドのたびに外部通信が発生して処理が遅くなるばかりか、認証エラーや通信エラーを引き起こしてビルドが失敗する原因になっていました。
-    *   **解決策**: `Dockerfile` から `RUN go mod tidy` という命令を完全に削除しました。ライブラリの整理（`go.mod` / `go.sum` の完成）はあらかじめローカル開発環境（ホスト側）で事前に終わらせておき、コンテナ内では確定した構成ファイルを読み込んで高速にダウンロードする `RUN go mod download` だけを行う運用（マルチステージビルド構成）に統一しました。
-
-*   **全 Go サービスへの一括設定適用に伴う安全対策と `shared` 依存フィルタリング**:
-    *   **課題**: プロジェクト内には様々なサービス（Go言語以外のフロントエンド等含む）が存在するため、無差別に `Dockerfile` を書き換えると正常に動いている他のサービスを壊してしまうリスクがありました。
-    *   **解決策**: `go.mod` の中身を自動解析し、`shared` パッケージを参照している（または `replace` 設定を必要としている）Go言語のサービスだけを自動的に検出して上書きする条件分岐付きの PowerShell スクリプトを作成・適用しました。これにより、無関係な独立サービスやフロントエンドのコードには一切手を加えず、必要な部分だけを安全に一括標準化しました。
-
-*   **モグラ叩き的なエラー連鎖を防ぐ全自動修正・同期スクリプトの導入**:
-    *   **課題**: 1つのサービスのエラーを直しても、別のサービス（`static-site-worker` や `game-worker` など）で全く同じ設定漏れによるエラーが順番に発生し、手動修正では果てしないモグラ叩き状態になっていました。
-    *   **解決策**: 以下の3ステップを全自動で一括実行する統合処理 PowerShell スクリプトを作成し、プロジェクト全体に対して実行・完工しました。
-        1.  全Goサービスの `go.mod` ファイルを自動巡回し、`replace github.com/atmosidea/shared => ../shared` の記述が無ければ自動追記する。
-        2.  全Goサービスの `Dockerfile` を、`../shared` を正しく認識できる安全なマルチステージビルド構成へ一括書き換える。
-        3.  プロジェクトルート全体を一時的なDockerコンテナにマウント（接続）して起動し、全サービスフォルダ上で `go mod tidy` を一気に連続実行して `go.sum` を生成・完全同期させる。
-
-*   **`alpine:latest` 実行環境における SSL 通信・タイムゾーン対応**:
-    *   **課題**: Dockerビルドの最終段階で使用する超軽量な実行環境イメージ（`alpine:latest`）は、不要なファイルが徹底的に削られているため、標準では「インターネットの安全性を証明するルート証明書（ca-certificates）」が入っていません。このままだと、ビルド自体は成功しても、いざアプリを起動してデータベース（DB）やAmazon S3/MinIO、外部API等とHTTPS通信（暗号化通信）を行おうとした際に「証明書が検証できない」としてアプリが強制終了（クラッシュ）する潜在リスクがありました。
-    *   **解決策**: `Dockerfile` の最終ステージ（Final Stage）に `RUN apk --no-cache add ca-certificates tzdata` という命令を追加しました。これにより、SSL/TLS暗号化通信に必要なルート証明書と、日本時間などのタイムゾーン設定をコンテナ内に標準装備させました。
-
-*   **成果物の保存と今後の開発運用の手放し化（完全自動化の実現）**:
-    *   **成果と運用**: 一連の修正スクリプトと設定見直しにより、ローカル環境上の `go.mod` および `go.sum` が完璧に同期され、Dockerによるコンテナビルドの手順・パイプラインが完全に固定・自動化されました。
-    *   **手放し化**: これらの変更結果（更新された `go.mod`, `go.sum`, `Dockerfile`）を Git にバージョン管理として保存（`git add . && git commit`）しておくことで、次回以降や他の開発者の環境では、単に `.\first-setup.ps1` や `docker compose up --build` を1回実行するだけで、手動の修正や複雑なコマンドを一切叩くことなく、全マイクロサービスがエラーなしで自動ビルド・起動する完全手放しの開発環境を確立しました。
+| 旧ドキュメントの記述 | 現在の実装 |
+|---|---|
+| PostgreSQL は 4 基 | **5 基**（`team-db` がある） |
+| MinIO は 6 基（profile-storage / game-storage / static-site-storage / video-storage / sfsp-raw-minio / sfsp-clean-minio）。物理ディレクトリはサービスごと（`profile_storage_data` 等）、video-storage だけコンソールが 9003 | **MinIO は 1 基**（`minio:9000`）。データは `./backend/storage_data`。各サービスはバケットとユーザーで分離 |
+| `video-storage` に `thumbnails` バケットがある | サムネイルは `videos` バケットの `thumbnails/` プレフィックス |
+| `video-worker` が `sfsp:completed:stream` を受けて HLS 変換する | **HLS 変換は `video-upload-api` 内の goroutine**。video-worker は参照・更新 API と `video-thumbnail` キューを担当 |
+| HLS は Nginx の `alias /storage/videos/...` でローカルファイルから配信 | Nginx が **MinIO の `videos/<id>/...` にプロキシ**。`upload_workdir` は変換時の一時領域にすぎない |
+| 動画の削除は `if ($request_method = DELETE)` で振り分け | `if` は使っていない。`/api/videos/delete/:id` を rewrite して video-upload-api に転送 |
+| `auth-service` / `profile-service` は `backend/auth/auth-worker/auth-service/` と `.../profile-service/` の別ディレクトリ | auth-service は `backend/auth/auth-worker/`、profile-service は `backend/profile-service/profile-worker/`、mypage-service は `backend/profile-service/mypage-worker/` |
+| sfsp-api は SHA256 で重複を排除する | SHA256 は保存・索引付けするだけで、重複排除はしていない（`files.sha256` に UNIQUE も無い） |
+| サンドボックスは `ReadonlyRootfs: true`、`tmpfs`、メモリ 2 GB | [12.2](#122-サンドボックスinternalsandboxdockergo) の設定（ネットワーク無し・CapDrop ALL 等）。`deploy.resources.limits.memory: 2g` は sfsp-worker コンテナ自体の制限 |
+| `sfsp-isolated-net` は SFSP 専用で外部から遮断 | `internal: true` の bridge（外向き通信なし）だが SFSP 専用ではなく、アップロード API / ワーカー、Redis、MinIO、profile-service も参加している。サンドボックスのコンテナだけがネットワーク無し |
+| `Dockerfile` 内の `RUN go mod tidy` は全削除済み | 一部の Dockerfile に残っている（[13 章](#13-ビルドと依存関係の制約)） |
+| `minio-init` は各 MinIO の `service_started` を待つ | 単一 MinIO の `service_healthy` を待つ |
+| フロントエンドに `UploadPage` / `UploadGamePage` / `UploadStaticSitePage` がある | `UnifiedUploadPage`（`/upload?type=...`）に統合。`TeamListPage` / `TeamDetailPage` が追加 |
+| sfsp-api の `/health` は `/api/v1/health` | `/health`（`/api/v1` の外） |
+| `/api/auth/user/:userId` は JWT 必須 | 認証なし |
+| 管理者登録はコードだけで行い、既定値（`admin@internal.local` / 既定パスワード）で作成 | email・password・adminCode が必須。既定パスワードによる補完は廃止 |
+| 管理用スクリプトに `test.bat`、`update_run.log` がある | 存在しない。`cleanup_auth_db.bat`・`cleanup_profiles.bat`・`cleanup_storage.bat`・`cleanup_sfsp_minio_data.bat` がある |
+| profile-service のスキャン処理は `profile-worker` という別サービス | profile-service（ディレクトリ名は `profile-worker`）自身の goroutine が処理する。独立したコンテナは無い |
+| （2026-10-26 以前の EditAI.md）Redis にパスワードは無い、ネットワークは `internal: true` でない、sfsp-worker が docker.sock と `.env` をマウント | Redis は `requirepass`。`backend-db-network` / `sfsp-isolated-net` などは `internal: true`。sfsp-worker は `sfsp-docker-proxy` 経由 |
+| （同上）完了イベントは BRPOP で取り出す | `DequeueReliable`（BRPOPLPUSH）+ `Ack` + 起動時の `RecoverProcessing` |
+| （同上）Google ログイン後は `/login/success?token=` | `/login/success?code=` + `POST /api/auth/oauth/exchange` |
+| （同上）初期管理者 `admin@internal.local` が投入される | 投入しない |
+| （同上）ブロックリストを見るのは auth-service だけ | JWT を検証する全サービスが確認する |
+| （同上）`POST /api/profile/internal/create` は認証なし | `X-Internal-Key` 必須。正式なパスは `/internal/create` |
 
 ---
-## 19. 編集内容の概要 (EDIT_SUMMARY.md)
 
-このドキュメントは、Atmosideaプロジェクトの機能改善とバグ修正のために行われた、一連の編集作業をまとめたものです。
-主な目的は、ユーザーがアップロードするコンテンツ（ゲーム、静的サイト、動画）のセキュリティスキャンを導入し、その処理状況をフロントエンドで適切に表示すること、および関連するバグを修正することでした。
+## 15. 既知の問題（未対応）
 
-### 19.1. SFSP (Secure File Scanning Platform) の構築と統合
+コードレビューで見つかった問題の一覧。15.1〜15.3 の行は 2026-10-26 の対応で解消済み（取り消し線 + 「対応済み」。履歴として残す）で、未対応のものは [15.4](#154-残っている問題2026-10-26-の対応後に判明) に残っている。**関連する箇所を変更するときは、この表を確認し、直したら行を削除せずに「対応済み」と追記する。**
 
-ユーザーがアップロードするファイルのセキュリティを確保するため、新しいマイクロサービス群「SFSP」を導入し、既存のアップロードフローに統合しました。
+### 15.1. セキュリティ
 
-#### 19.1.1. SFSPアーキテクチャ
+| 重大度 | 問題 | 場所 |
+|---|---|---|
+| High | ~~`POST /api/profile/internal/create` に認証が無く、Nginx 経由で外部から呼べる（任意の UUID でプロフィールを作れる）~~ **対応済み（2026-10-26）**: `X-Internal-Key` 必須、正式パスは `/internal/create`、Nginx で `/api/profile/internal/` と `/api/*/internal` を 404 | `profile-worker/main.go`、`nginx.conf` の `/api/profile` |
+| High | ~~admin が owner を削除できる（対象のロールを確認していない）。owner が自分を削除するとチームに owner がいなくなる~~ **対応済み（2026-10-26）**: 自分より弱いロールだけ削除可、最後の owner は 409 | `team-worker/main.go` `removeMemberHandler` |
+| High | ~~`POST /:token/members` が `team_id` に URL のトークンを渡しており常に 500。`role` を検証していないため、直すだけだと admin が owner を付与できる~~ **対応済み（2026-10-26）**: トークンから ID を引く。付与は自分より弱いロールのみ（owner→owner は移譲用の例外） | `team-worker/main.go` `addMemberHandler` |
+| High | ~~`/:token/permission` が非公開チームでは JWT を見る前に `can_view:false` を返すため、メンバーでもチーム投稿できない~~ **対応済み（2026-10-26）**: JWT を先に評価し、メンバーは `can_view` / `can_post` を得る | `team-worker/main.go` `teamPermissionHandler` |
+| High | ~~動画・ゲーム・サイトの詳細 API が `team_id` と `status` を確認せず、チーム限定・隔離済みのコンテンツも ID が分かれば見える。一覧の `?team=` もメンバー確認なし~~ **対応済み（2026-10-26）**: 詳細は投稿者・管理者以外 `public` のみ、`team_id` があれば `can_view` を確認。一覧の `?team=` も `can_view` 必須。**ただし Nginx から MinIO への直接配信は未対応（下の「残っている問題」）** | 各 `GET /:id`、一覧ハンドラー |
+| High | ~~動画の公開一覧が `status = 'public'` で絞り込まれていない~~ **対応済み（2026-10-26）**: `status='public'` かつ（`?team=` 無しなら）`team_id IS NULL` | `video-worker/main.go` `listVideosHandler` |
+| High | ~~Redis にパスワードが無く、同じネットワークのコンテナが完了イベントを偽造できる~~ **対応済み（2026-10-26）**: `requirepass`（`REDIS_PASSWORD`）を設定 | `docker-compose.yml` |
+| High | ~~sfsp-worker が Docker ソケットと `.env` 全体をマウントしている~~ **対応済み（2026-10-26）**: `.env` マウントを廃止し、`sfsp-docker-proxy` 経由に変更（本文検査はしない点は残る） | `docker-compose.yml` |
+| High | ~~一部のネットワークが `internal: true` でなく、sfsp-db を全サービスから参照できる~~ **対応済み（2026-10-26）**: `backend-db-network` / `sfsp-isolated-net` を `internal: true`、sfsp-db は専用の `sfsp-db-network` | `docker-compose.yml` |
+| Medium | ~~ログアウトしたトークンは auth-service 以外では有効期限まで使える~~ **対応済み（2026-10-26）**: JWT を検証する全サービスがブロックリストを確認（fail closed） | 各サービスの `authMiddleware` |
+| Medium | ~~OAuth の state が「パラメータも Cookie も空」だと一致扱いになる。Cookie のドメインが `localhost` 固定、使用後に削除しない~~ **対応済み（2026-10-26）**: 空を拒否・定数時間比較・host-only Cookie・使用後に削除 | `auth-worker/main.go` `googleCallbackHandler` |
+| Medium | ~~Google の userinfo の HTTP ステータスを確認せず、`ID[:8]` で panic しうる~~ **対応済み（2026-10-26）**: ステータス・必須項目・`verified_email` を確認、切り出し前に長さ確認 | `auth-worker/main.go` `getGoogleUserData` |
+| Medium | ~~JWT をリダイレクト URL のクエリに載せている（ログ・履歴に残る）~~ **対応済み（2026-10-26）**: 60 秒・1 回限りのコード + `POST /api/auth/oauth/exchange` | `auth-worker/main.go`（`/login/success?token=`） |
+| Medium | ~~ログイン時に `status` を確認しない（`deleted_data` でもログインできる）~~ **対応済み（2026-10-26）**: パスワード・Google ログインと `authMiddleware` で拒否 | `auth-worker/main.go` `loginHandler` |
+| Medium | ~~初期管理者 `admin@internal.local` のパスワードが `init.sql` に書かれており公開済み~~ **対応済み（2026-10-26）**: `init.sql` から削除（既存ボリュームは 5.1 の SQL で削除） | `backend/auth/auth-datebase/auth-db/init.sql` |
+| Medium | ~~sfsp-api に認証が無い~~ **対応済み（2026-10-26）**: `X-SFSP-API-Key` 必須、キー未設定なら起動しない | `cmd/sfsp-api/main.go` |
+| Medium | ~~DB ロールのパスワード（`team_service_strong_password`、`sfsp_worker_password` など）が SQL に直書き~~ **対応済み（2026-10-26）**: SQL から削除し、`db-role-init` が `.env` の値で `ALTER ROLE` | 各 `init.sql`、`docker-compose.yml` の既定値 |
+| Low | ~~`APP_DATABASE_URL` を含むエラーログでパスワードが出る~~ **対応済み（2026-10-26）**: `RedactURL` / `RedactString` で伏せてから出力 | `cmd/sfsp-worker/main.go` |
+| Low | ~~監視ダッシュボードにログイン認証が無い（ループバック限定で運用）~~ **対応済み（2026-10-26）**: mon-backend と mon-nginx で HTTP Basic 認証 | `monitoring-service/` |
 
-*   **`sfsp-api`**: ファイルを受け取り、スキャンジョブを作成するAPIサービス。
-*   **`sfsp-worker`**: Redisキューからジョブを取得し、サンドボックス内でスキャンを実行するワーカーサービス。
-*   **`sfsp-db`**: スキャンジョブと結果を保存するPostgreSQLデータベース。
-*   **`sfsp-minio`**: スキャン対象ファイル（`raw-files`）とスキャン済みファイル（`clean-files`, `quarantine`）を保存するオブジェクトストレージ。
-*   **`sfsp-clamav-client`**: ClamAVを実行するためのDockerイメージ（サンドボックス内で動的に起動）。
-*   **`sfsp-yara-client`**: YARAを実行するためのDockerイメージ（サンドボックス内で動的に起動）。
-*   **`redis`**: スキャンジョブキュー (`sfsp:scan_queue`) と完了イベントキュー (`sfsp:completed_jobs`) を提供。
+### 15.2. 信頼性・データ整合性
 
-#### 19.1.2. 統合されたアップロードフロー
+| 問題 | 場所 |
+|---|---|
+| ~~BRPOP で取り出した後に処理が失敗・再起動するとイベントが失われ、`scanning` / `processing` / `running` のまま残る（再試行・回収の仕組みが無い）~~ **対応済み（2026-10-26）**: 全ワーカーと sfsp-worker を `DequeueReliable` / `Ack` / `RecoverProcessing` に変更 | 全ワーカー、sfsp-worker |
+| ~~サムネイルのイベントが DB の INSERT より先に届くと捨てられる（ゲーム・静的サイト）~~ **対応済み（2026-10-26）**: 行を先に INSERT し、ワーカーは見つからなければ待って再検索 | `game-upload-api`、`static-site-upload-api` |
+| ~~一時ファイル名にユーザーのファイル名を使うため、同名ファイルの同時アップロードで内容が混ざる~~ **対応済み（2026-10-26）**: ジョブごとの一時ディレクトリ / `os.CreateTemp` | `video-upload-api`（`UPLOAD_DIR/<filename>`）、`static-site-worker`（`os.TempDir()/<filename>`） |
+| ~~アップロードサイズの上限が無く、zip を丸ごとメモリに読む。zip bomb への対策も無い~~ **対応済み（2026-10-26）**: 各 API に `MaxBytesReader`（413）とストリーミング送信、各ワーカーと sfsp-worker の展開に上限 | 各アップロード API、`game-worker` / `sfsp-worker` の展開処理 |
+| ~~ffmpeg の同時実行数に上限が無く、タイムアウトも無い~~ **対応済み（2026-10-26）**: `FFMPEG_MAX_CONCURRENCY` / `FFMPEG_TIMEOUT` | `video-upload-api` |
+| ~~動画を処理中に削除すると、変換結果が MinIO に残る~~ **対応済み（2026-10-26）**: 削除時にジョブをキャンセルし、ジョブ側でも後始末 | `video-upload-api` |
+| ~~静的サイトのサムネイルを差し替えても古いオブジェクトが消えない~~ **対応済み（2026-10-26）**: 確定後に古いオブジェクトを削除 | `static-site-worker` |
+| ~~`profile-worker` のループ内で `defer` を使っており、ファイルディスクリプタと一時ファイルが溜まる~~ **対応済み（2026-10-26）**: 1 件ごとの関数に分離 | `profile-worker/main.go` の完了イベント処理 |
+| ~~アカウント削除が profile-db の行と team-db のメンバー情報を削除しない。動画はローカルパスで削除しようとしており MinIO の HLS が残る~~ **対応済み（2026-10-26）**: profile-service / team-service の内部 API を呼び、動画は MinIO の `videos/<id>/` を削除 | `auth-worker/main.go` `deleteAccountHandler` |
+| ~~チーム更新で `description` を省略すると NULL で上書きされる。一度却下・取り消しされたユーザーは `UNIQUE(team_id, user_id)` により再申請できない~~ **対応済み（2026-10-26）**: 送られたフィールドだけ更新、再申請は UPSERT で `pending` に戻す | `team-worker/main.go` |
+| ~~team-service が `app-db.users` を参照するが、そのテーブルは無い（`author_name` が常に空）~~ **対応済み（2026-10-26）**: profile-service から名前を取得 | `team-worker/main.go` |
+| ~~ClamAV の既定のファイルサイズ上限を超えるファイル（大きな動画など）は検査されない~~ **対応済み（2026-10-26）**: 上限を明示し `--alert-exceeds-max` で超過は `suspicious`（1 ファイル 2 GiB-1 が ClamAV の限界） | `scanner/clamav.go` |
+| ~~`video-upload-api` の予備の `CREATE TABLE` に `thumbnail_sfsp_job_id` / `updated_at` が無い~~ **対応済み（2026-10-26）**: `init.sql` と同じ定義 + `ADD COLUMN IF NOT EXISTS` | `video-upload-api/main.go` |
 
-1.  **各アップロードAPI (`game-upload-api`, `static-site-upload-api`, `video-upload-api`)**:
-    *   各アップロードAPIは、ファイルを受け取ると、まずSFSP (`sfsp-api`) にファイルを転送します。
-    *   SFSPからジョブIDと初期ステータスを受け取り、各コンテンツのDBテーブル（`games`, `static_sites`, `videos`）に `sfsp_job_id` を保存し、ステータスを `scanning` に設定します。
-    *   SFSPが重複ファイルを検知し、`clean` ステータスを返した場合、各アップロードAPIは `sfsp:completed_jobs` キューに完了イベントを再発行し、ワーカーを直接トリガーします。
+### 15.3. 機能の不具合
 
-2.  **`sfsp-worker`**:
-    *   Redisの`sfsp:scan_queue`からジョブIDを取得し、スキャンを実行します。
-    *   スキャン完了後、結果（`clean`, `malicious`など）を `sfsp:completed_jobs` キューに発行します。
-    *   **Unity WebGLビルドの検証ロジックを改善**: ZIP展開後、Unity WebGLルートと静的サイトルートの両方が見つかる場合に `invalid` と判定される問題を修正。Unity WebGLルートを優先的に探索するように変更しました。
+| 問題 | 場所 |
+|---|---|
+| ~~**動画のサムネイル削除（`DELETE /api/videos/:id/thumbnail`）が常に 404**。実装は video-upload-api にあるが、Nginx の `/api/videos` が video-worker に転送する~~ **対応済み（2026-10-26）**: `nginx.conf` に `~ ^/api/videos/[a-zA-Z0-9]+/thumbnail$` → video-upload-api の location を追加 | `frontend/nginx.conf`、`EditVideoPage.tsx` |
+| ~~`create_go_work.bat` が古いパス（`backend/auth/auth-worker/auth-service` など）を参照している~~ **対応済み（2026-10-26）**: 実在する 12 モジュールに修正 | `create_go_work.bat` |
 
-3.  **各ワーカーサービス (`game-worker`, `static-site-worker`, `video-upload-api`)**:
-    *   `sfsp:completed_jobs` キューをリッスンします。
-    *   対応するジョブの完了イベントを受け取ると、`final_status` が `clean` であることを確認し、それぞれのコンテンツ処理（HLS変換、ZIP展開など）を開始します。
-    *   処理の各段階でDBの `processing_details` フィールドを更新し、フロントエンドに詳細な進捗を伝えます。
-    *   `game-worker` が `sfsp_job_id` でゲームを検索する際に、`ORDER BY created_at DESC LIMIT 1` を追加し、常に最新のゲームレコードを処理するように修正しました。
+### 15.4. 残っている問題（2026-10-26 の対応後に判明）
 
-### 19.2. ゲームホスティングのセキュリティ強化とURL形式の変更
+| 重大度 | 問題 | 場所 |
+|---|---|---|
+| High | Nginx が MinIO に直接プロキシする経路（HLS `/api/videos/<id>/stream/*`、`/videos\|games\|static-sites/thumbnails/*`、サブドメイン `<id>.localhost`）に認可が無い。チーム限定・処理中のコンテンツも ID が分かれば取得できる（隔離済みファイルは公開バケットに置かれないので対象外）。`<img>`・hls.js・サブドメインには JWT が届かないため、署名付き URL か Cookie など別の仕組みが要る | `frontend/nginx.conf`、各バケットの匿名読み取りポリシー（game-worker の `ensureBucket` を含む） |
+| Medium | `sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる | `docker-compose.yml` |
+| Medium | 多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込み、アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取っている | 各 `Dockerfile`、`docker-compose.yml` |
+| Medium | `POSTGRES_PASSWORD` と MinIO の各キーは `.env.example` で公開済みの値のまま。変更するにはボリュームの作り直しが必要 | `.env` |
+| Low | Redis に job ID が無いまま `running` で止まった過去のスキャンジョブは回収されない | sfsp-worker |
+| Low | `docker compose` のプロジェクト名がフォルダ名から決まるため、フォルダ名が違うと別プロジェクトとして新しい空のボリュームが作られ、既存の DB が見えなくなる（稼働中のスタックは `atomosidea-claude`、このフォルダ `Atomosidea-work(claude)` から導出される名前は `atomosidea-workclaude`）。`.env` の `COMPOSE_PROJECT_NAME` か compose の `name:` で固定する | `docker-compose.yml`、各 `.bat` |
+| Low | 処理エラー時の status がサービスで違う（動画 `error`、ゲーム `failed`、静的サイト `error` / `failed`） | 各ワーカー |
+| Low | 削除済みの Google ユーザーは同じ Google アカウントで再登録できない。ログイン可能な status に `pending` も含めている | `auth-worker/main.go` |
 
-ゲームコンテンツをメインドメインから隔離し、Cookieなどのセッション情報を保護するため、ゲームのホスティング方法をサブドメイン形式に変更しました。
+---
 
-*   **URL形式の変更**:
-    *   **変更前**: `http://<メインドメイン>/games/<game_id>/index.html`
-    *   **変更後**: `http://<game_id>.<APP_URLのドメイン>:<APP_URLのポート>/index.html`
-*   **`game-worker`の修正**:
-    *   ゲーム公開時に、新しいサブドメイン形式のURLを生成し、`games`テーブルの`game_url`に保存するように修正しました。
-    *   `APP_URL`環境変数を読み込み、URL生成に使用するように変更しました。
-*   **Nginx (`frontend/nginx.conf`) の修正**:
-    *   `~^(?<subdomain>[a-z0-9]{10})\.localhost$` のようなワイルドカードサブドメインへのリクエストを受け付ける`server`ブロックを修正しました。
-    *   リクエストされたサブドメイン（＝`game_id`）を元に、リクエストを`game-storage` (MinIO) の適切なパスにプロキシするように設定しました。
-    *   ルート (`/`) へのアクセスを自動的に `/index.html` に書き換えるルールを追加し、`NoSuchKey`エラーを防ぎました。
+## 16. トラブルシューティング
 
-### 19.3. フロントエンドのUX改善
+| 症状 | 原因と対処 |
+|---|---|
+| サービスが起動しない | `docker compose logs <サービス>`。`.env` の不足、依存サービスの起動失敗が多い |
+| ビルドで `COPY .env` が失敗 | `.env` が無い。`cp .env.example .env` |
+| `exit status 128` | `go.mod` の `replace github.com/atmosidea/shared => ../../shared` が無い |
+| `replacement directory ../shared does not exist` | ビルドコンテキストがルートでない。`COPY . .` と `WORKDIR` を確認 |
+| `missing go.sum entry` / `updates to go.mod needed` | 依存を追加した後に `go.sum` を更新していない |
+| MinIO の `Access Denied` / `InvalidAccessKeyId` | `.env` のキーと `minio-init` のユーザーが一致しているか。`docker logs atmosidea-minio-init` を確認。一時的なエラーは video の HLS アップロードでは最大 5 回リトライされる |
+| アップロードが `scanning` のまま | sfsp-worker のログで `Finished processing job: <id>` まで進んだか。完了イベントのキュー名と `target_service` が一致しているか |
+| 正常なファイルが `malicious` / `failed` | `sfsp-db.scan_results.raw_output` を確認。サンドボックスの Entrypoint を変更していないか（[12.2](#122-サンドボックスinternalsandboxdockergo)） |
+| ClamAV の「virus database is older than 7 days」警告 | `docker compose build --pull sfsp-clamav-client` |
+| ログイン直後にログアウトされる | `/api/profile/me` の応答。401 以外ではログアウトしない実装になっているか |
+| サブドメインで `AccessDenied` | `nginx.conf` のサブドメイン用 rewrite に `break` が付いていないか（[10.5](#105-サブドメインゲーム静的サイト)） |
+| Nginx の構文エラー | `server_name` の正規表現を引用符で囲んでいるか。`docker run --rm --add-host <各upstream>:127.0.0.1 -v .../nginx.conf:/etc/nginx/nginx.conf:ro nginx:alpine nginx -t` で確認できる |
+| HLS が再生できない | URL が `/api/videos/<id>/stream/playlist.m3u8` か。MinIO の `videos/<id>/` にファイルがあるか |
+| `upload_workdir` が無い | 問題なし。バインドマウント時に自動作成される |
+| `network ... needs to be recreated` | ネットワーク定義が変わった。監視スタックを止めて `docker compose down` → `up -d --build` |
+| Redis の `NOAUTH` / sfsp-api が起動しない | `.env` の `REDIS_PASSWORD` / `SFSP_API_KEY` が空でないか。`.env.example` から作り直した場合は値を設定する |
+| サービス間呼び出しが 401 / 403 | `X-SFSP-API-Key`（sfsp-api）や `X-Internal-Key`（内部 API）の値が `.env` と一致しているか |
+| `db-role-init` がエラーで止まる | 古いボリュームに `sfsp_worker` などのロールが無い。init.sql の該当部分を手動で流すかボリュームを作り直す |
 
-ファイルのスキャンと処理中、ユーザーに進捗状況を明確に伝えるためのUI改善を行いました。
+---
 
-*   **対象ページ**: `GameDetailPage.tsx`, `StaticSiteDetailPage.tsx`, `VideoDetailPage.tsx`
-*   **実装内容**:
-    *   各詳細ページは、コンテンツの `status` が `public` になるまで、APIを5秒ごとにポーリングします。
-    *   ポーリング中、`loading` または `status` が `scanning` もしくは `processing` の間は、以下のメッセージとローディングインジケーターを表示します。
-        *   `status: 'scanning'`: 「セキュリティスキャンを実行中...」
-        *   `status: 'processing'`: 「ファイルを準備中...」（DBの`processing_details`があればそれを表示）
-    *   `status` が `public` になると、ポーリングを停止し、コンテンツ（ゲーム、サイト、動画）を表示します。
-    *   `status` が `error`, `rejected`, `invalid` などになった場合は、エラーメッセージを表示します。
-*   **アップロードページ (`UploadGamePage.tsx`, `UploadStaticSitePage.tsx`, `UploadVideoPage.tsx`) の修正**:
-    *   アップロード成功後、新しく作成されたコンテンツの詳細ページにリダイレクトする際に、初期ステータス (`initialStatus`) を渡すように修正しました。
+## 17. 変更時のチェックリスト
 
-### 19.4. 主なバグ修正とデバッグの過程
+1. **正のソース**は `docker-compose.yml` と `backend/` の実ファイル。ドキュメントと違えば実装を優先し、ドキュメントを直す。
+2. **パス・テーブル・カラム・キュー名・環境変数名**を変えたら、このドキュメントの該当箇所を同じ変更で更新する。
+3. **Go サービス**: `replace` ディレクティブ、ルートのビルドコンテキスト、`COPY . .` + `WORKDIR` を守る。依存を追加したら `go.mod` / `go.sum` も更新する。`go build ./...` と `go vet ./...` を通す。
+4. **キュー・イベント**: `backend/shared/queue` と `backend/security/sfsp/internal/queue`（・`model`）の両方を直す。`target_service` を追加したら sfsp-api の許可リストも直す。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` する（BRPOP を使わない）。
+5. **Nginx**: `proxy_pass` の末尾スラッシュ禁止。location の評価順。`/api/videos/...` に新しいエンドポイントを video-upload-api 側で追加したら、専用の location も追加する（追加しないと video-worker に転送される）。location 内の `add_header` は server のものを継承しない。`nginx -t` → `docker compose restart frontend`。
+6. **ユーザーのファイルを配信する経路を追加・変更**: メインオリジンで HTML / JS を実行させない（サブドメインで配信するか、`CSP: sandbox` + `nosniff` を付ける）。サムネイル等は画像形式のみ保存する。
+7. **スキャン**: 判定は終了コードで行う。スキャナーのエラーは公開しない側（`failed`）に倒す。zip は展開した全体をスキャンする。サンドボックスの制限を緩めない。
+8. **認可**: 編集・削除のエンドポイントには authMiddleware と投稿者チェックを付ける。チームはロールのランクで判定し、自分より強いロールの付与・削除を許さない。JWT の検証では HS256 固定と `blocklist:<jti>` の確認を必ず行う。サービス間の内部 API は `/api` の外に置き、`X-Internal-Key` で守る。sfsp-api の呼び出しには `X-SFSP-API-Key` を付ける。
+9. **MinIO のユーザー・ポリシー**: `minio-init`（environment / entrypoint / volumes）と `backend/minio-init/*.json` と `.env.example` を対で更新する。
+10. **DB スキーマ**: 該当 DB の `init.sql` を更新する（既存ボリュームには反映されないので、必要ならマイグレーション SQL を追加する）。
+11. **JWT・localStorage**: 12.4 のトレードオフを理解したうえで変更する。
+12. **大規模な削除**（ファイル・ドキュメントの節・データ）は必ずユーザーの許可を取る。
 
-*   **ビルドエラー**:
-    *   Goの`imported and not used`エラーを修正 (`video-upload-api/main.go`から`archive/zip`のimportを削除)。
-    *   TypeScriptの`Cannot find namespace 'NodeJS'`エラーを修正（`GameDetailPage.tsx`で`NodeJS.Timeout`を`number`に変更）。
-*   **実行時エラー**:
-    *   **DB/Redis接続エラー**: サービス起動時に接続をリトライするロジックを導入。
-    *   **ClamAVサンドボックスエラー**:
-        *   `No supported database files found`: `tmpfs`のマウントパスを修正し、ウイルス定義ファイルが読み込まれるようにしました。
-        *   `Read-only file system`: `chown`操作を許可するため、`ReadonlyRootfs`を`false`に設定しました。
-        *   `exitCode=137` (OOM Killer): サンドボックスのメモリ制限を512MBから2GBに増強しました。
-    *   **MinIO `AccessDenied` / `NoSuchKey`**:
-        *   `game-worker`とNginxに、バケットの存在確認と公開ポリシーを確実に設定する処理を追加しました。
-        *   Nginxのサブドメインプロキシで、ルートパス`/`を`/index.html`に書き換えるルールを追加し、`NoSuchKey`エラーを防ぎました。
-    *   **Content-Type/Encodingの問題**:
-        *   `game-worker`がMinIOにファイルをアップロードする際に、`.br`や`.wasm`などの拡張子に応じて適切な`Content-Type`と`Content-Encoding`を設定するように修正しました。
-    *   **iframeのURLポート番号問題**: `game-worker`が生成するURLに`APP_URL`環境変数から取得したポート番号を含めるように修正しました。
-*   **アプリケーションロジックのバグ**:
-    *   **SFSP APIのHTTPステータス判定**: `game-upload-api`がSFSPからの`200 OK`レスポンスをエラーとして扱う問題を修正し、2xx台のステータスコードを成功として扱うように変更しました。
-    *   **重複ファイルアップロード時の無限ロード**: `sfsp-api`が重複ファイルを検知した際に、`game-worker`に再処理イベントを投入するロジックを追加して解消しました。
-    *   **複数ゲームの`sfsp_job_id`重複**: `game-worker`がDBからゲームを検索する際に、`ORDER BY created_at DESC LIMIT 1`を追加し、常に最新のレコードを処理するように修正しました。
+---
 
-このドキュメントは、将来のメンテナンスや機能追加の際に、システムの全体像と重要な注意点を把握するための一助となることを目的としています。
+## 18. セットアップと管理用スクリプト
 
-## 20. DBマイグレーションに伴う `user_id` (`VARCHAR`) 型不整合の解消
+### 18.1. セットアップ
 
-データベースの `user_id` カラムを `INTEGER` から `VARCHAR(255)` (UUID v7 対応) へ移行したことに伴い、各マイクロサービスで発生していたランタイムエラーおよび型スキャン失敗（`Scan` エラー）を解消しました。
+1. `cp .env.example .env` を実行し、パスワード・`JWT_SECRET`・`ADMIN_REGISTRATION_CODE`・MinIO のキーを変更する（`.env.example` の値は公開済み）。Google ログインを使う場合は `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を設定する。
+2. `setup.bat`（初回）または `docker compose up -d --build`。
+3. `http://localhost:3001` を開く。
+4. 「新規登録」→「管理者として登録」で自分の管理者を作る（初期管理者 `admin@internal.local` は投入されない。古いボリュームに残っている場合は [5.1](#51-auth-db) の SQL で削除する）。
+5. 任意: `monitoring-service/scripts/start.bat`（または `docker compose --env-file ../.env -f docker-compose.monitoring.yml up -d --build`）→ `http://127.0.0.1:8090`。ログインは `.env` の `MONITOR_USERNAME` / `MONITOR_PASSWORD`。
 
-#### 20.1. 発生していた主な障害・エラー
-- **`game-upload-api` ビルドエラー:**  
-  `sfspResponse.Close` 呼び出し時の型不整合 (`bool is not a function`)。
-- **`video-worker` 404 (Not Found) エラー:**  
-  動画詳細取得 API (`/api/videos/:id`) 実行時、DB の `uploader_id` (VARCHAR) を Go 構造体の `int` 型フィールドへスキャンしようとして `can't scan into dest...` エラーが発生し、フォールバックで 404 を返却。
+### 18.2. スクリプト
 
-#### 20.2. 各サービスの修正内容
+| スクリプト | 内容 |
+|---|---|
+| `setup.bat` | 初回。`.env` を対話的に作り、ビルドして起動 |
+| `start.bat` | `.env` の有無を確認して `docker compose up -d`。公開されているのは `http://localhost:3001` だけ（MinIO コンソールは非公開）。監視ダッシュボードの起動手順も表示 |
+| `stop.bat` | `docker compose down`（DB と MinIO のデータは残る） |
+| `update.bat` | 全停止（ネットワーク定義の変更に備える）→ キャッシュなしで再ビルド → 起動 |
+| `clean.bat` | `docker compose down -v --remove-orphans --rmi local` とビルドキャッシュの削除。DB のボリュームは消えるが、MinIO のデータ（`backend/storage_data/`）は消えない |
+| `cleanup_games.bat` | `app_db.public.games` を TRUNCATE し、`games` バケットを空にする（稼働中の `atmosidea-app-db` と `atmosidea-minio` に対して実行） |
+| `cleanup_static_sites.bat` | `app_db.public.static_sites` を TRUNCATE し、`static-sites` バケットを空にする |
+| `cleanup_videos.bat` | `videos` バケットと `upload_workdir` を空にする（DB レコードは残る） |
+| `cleanup_profiles.bat` | `user-profiles` バケットを空にする（profile-db は触らない） |
+| `cleanup_storage.bat` | `videos` / `games` / `user-profiles` / `static-sites` バケットと `upload_workdir` を空にする（DB と SFSP 系バケットは触らない） |
+| `cleanup_sfsp_minio_data.bat` | `raw-files` / `clean-files` / `quarantine` バケットを空にする（スキャン実行中は使わない） |
+| `cleanup_auth_db.bat` | auth-db のボリューム（アカウント情報）を削除。ボリューム名は実行時に導出する |
+| `create_go_work.bat` | `go.work` の作成（実在する 12 モジュールのパスに修正済み。[15.3](#153-機能の不具合)） |
 
-##### ① `game-upload-api` (`main.go`)
-- **レスポンス破棄処理の修正:**  
-  `defer sfspResponse.Close()` を **`defer sfspResponse.Body.Close()`** に修正してコンパイルエラーを解消。
-- **型変更対応:**  
-  `Game` 構造体の `UploaderID` を `string` に統一。JWT ミドルウェアおよび各ハンドラー (`upload`, `update`, `adjust`, `delete`) 内の `userID` / `uploaderID` 変数を `string` 型へ変更。
+### 18.3. 関連ドキュメント
 
-##### ② `video-worker` (`main.go`)
-- **型変更対応:**  
-  `Video` 構造体の `UploaderID` フィールドを `int` から **`string`** へ変更。
-- **スキャン処理の修正:**  
-  `listVideosHandler` および `videoDetailsHandler` において、`uploader_id` カラムを `string` 型変数へ正常にスキャンできるよう修正。
-
-#### 20.3. 動作確認結果
-1. **コンテナ再ビルド＆起動:**  
-   `game-upload-api` および `video-worker` のビルドが正常完了。
-2. **API 正常性確認:**  
-   フロントエンドからの `/api/videos/:id` 呼び出しに対して DB スキャンエラーが解消され、`200 OK` で動画メタデータが正常返却されることを確認。
+- `README.md`: 人間向けの概要とクイックスタート
+- `AI_PROJECT_GUIDE.md`: AI 向けの入門（考え方・トラップ）
+- `SECURITY_EXPLANATION.md`: セキュリティ設計の説明（一部の記述は [14 章](#14-よくある誤解旧ドキュメントとの差分) のとおり古い）
+- `Docs/api_list.md`、`Docs/Nginx.md`、`Docs/MinIO_DB.md`: 補足資料
+- `backend/security/sfsp/docs/`: SFSP の ADR・Runbook・脅威モデル・インシデント対応

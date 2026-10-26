@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"fmt"
@@ -28,14 +28,25 @@ func main() {
 		sugar.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// 認証キーが無ければ起動しない（fail closed）
+	if cfg.API.Key == "" {
+		log.Fatal("SFSP_API_KEY is not set: sfsp-api refuses to start without an API key. " +
+			"Set SFSP_API_KEY (a long random value) for sfsp-api and send the same value in the X-SFSP-API-Key header from every client.")
+	}
+	if len(cfg.API.Key) < 32 {
+		sugar.Warn("SFSP_API_KEY is shorter than 32 characters; use a long random value")
+	}
+
 	// Shared用Config（Redis接続設定などを含む）
 	sharedCfg, err := sharedconfig.LoadConfig()
 	if err != nil {
 		sugar.Fatalf("Failed to load shared configuration: %v", err)
 	}
+	// REDIS_URL（redis://:<pw>@redis:6379）があればそれを使い、URL にパスワードが無ければ REDIS_PASSWORD を補う
+	sharedCfg.RedisAddr = config.ResolveRedisAddr(sharedCfg.RedisAddr, sharedCfg.RedisPassword)
 
 	if err := database.Connect(cfg); err != nil {
-		sugar.Fatalf("Failed to connect to database: %v", err)
+		sugar.Fatalf("Failed to connect to database: %s", config.RedactString(err.Error(), cfg.DatabaseURL))
 	}
 	defer database.Close()
 
@@ -46,19 +57,23 @@ func main() {
 
 	// shared/queue に sharedCfg を渡して Redis 接続を初期化
 	if err := queue.ConnectRedis(sharedCfg, sugar); err != nil {
-		sugar.Fatalf("Failed to connect to Redis: %v", err)
+		sugar.Fatalf("Failed to connect to Redis (%s): %s", config.RedactURL(sharedCfg.RedisAddr), config.RedactString(err.Error(), sharedCfg.RedisAddr))
 	}
 
 	router := gin.Default()
+	// アップロードは MultipartReader でストリーミングするため、フォーム全体をメモリに展開しない
+	router.MaxMultipartMemory = 1 << 20
 
 	// APIハンドラーの初期化
 	apiHandler := api.NewAPI(cfg, sugar)
 
+	// /health は認証なし（compose の healthcheck 等のため）
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
 	v1 := router.Group("/api/v1")
+	v1.Use(api.RequireAPIKey(cfg.API.Key))
 	{
 		v1.POST("/files", apiHandler.HandleFileUpload)
 		v1.GET("/jobs/:id", apiHandler.HandleGetJob)
@@ -70,7 +85,7 @@ func main() {
 		port = "8080"
 	}
 
-	sugar.Infof("Starting SFSP API server on port %s", port)
+	sugar.Infof("Starting SFSP API server on port %s (max upload %d bytes)", port, cfg.Limits.MaxUploadBytes)
 	if err := router.Run(fmt.Sprintf(":%s", port)); err != nil {
 		sugar.Fatalf("Failed to run server: %v", err)
 	}

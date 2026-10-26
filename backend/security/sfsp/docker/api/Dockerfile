@@ -32,6 +32,11 @@ WORKDIR /app
 # Copy the built binary from the builder stage
 COPY --from=builder /usr/local/bin/sfsp-api /usr/local/bin/sfsp-api
 
+# 非 root ユーザー（uid/gid 10001）で実行する。ポートは 8080（1024 以上）なので特権は不要
+RUN addgroup -S -g 10001 sfsp && adduser -S -D -H -u 10001 -G sfsp -s /sbin/nologin sfsp
+
+USER 10001:10001
+
 # Expose the port the API listens on
 EXPOSE 8080
 

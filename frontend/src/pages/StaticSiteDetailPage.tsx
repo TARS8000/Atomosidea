@@ -20,6 +20,9 @@ interface StaticSite {
   created_at: string;
 }
 
+// これらの status になったらポーリングを止める（スキャン・展開の終端状態）
+const TERMINAL_STATUSES = ['public', 'error', 'failed', 'invalid', 'quarantined'];
+
 const StaticSiteDetailPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
@@ -44,13 +47,18 @@ const StaticSiteDetailPage: React.FC = () => {
         setStaticSite(response.data);
         setCurrentStatus(response.data.status);
 
-        if (response.data.status === 'public' || response.data.status === 'error' || response.data.status === 'invalid') {
+        if (TERMINAL_STATUSES.includes(response.data.status)) {
           setLoading(false);
           clearInterval(pollingInterval);
         }
       } catch (err) {
         console.error('Failed to fetch static site:', err);
-        setError('静的サイトの読み込みに失敗しました。');
+        // 非公開・チーム限定で閲覧権限が無い場合も 404 が返る
+        if (axios.isAxiosError(err) && err.response?.status === 404) {
+          setError('静的サイトが見つからないか、閲覧する権限がありません。');
+        } else {
+          setError('静的サイトの読み込みに失敗しました。');
+        }
         setLoading(false);
         clearInterval(pollingInterval);
       }
@@ -58,7 +66,7 @@ const StaticSiteDetailPage: React.FC = () => {
 
     if (id) {
       fetchStaticSite();
-      if (currentStatus !== 'public' && currentStatus !== 'error' && currentStatus !== 'invalid') {
+      if (!TERMINAL_STATUSES.includes(currentStatus)) {
         pollingInterval = window.setInterval(fetchStaticSite, 5000);
       }
 
@@ -166,9 +174,15 @@ const StaticSiteDetailPage: React.FC = () => {
               </Stack>
           )}
 
-          {staticSite.status === 'error' && (
+          {(staticSite.status === 'error' || staticSite.status === 'failed' || staticSite.status === 'invalid') && (
               <Alert severity="error" sx={{ mt: 3 }}>
-                サイトの処理中にエラーが発生しました: {staticSite.processing_details}
+                サイトの処理中にエラーが発生しました{staticSite.processing_details ? `: ${staticSite.processing_details}` : '。'}
+              </Alert>
+          )}
+
+          {staticSite.status === 'quarantined' && (
+              <Alert severity="warning" sx={{ mt: 3 }}>
+                セキュリティスキャンで問題が検出されたため、このサイトは公開されていません。
               </Alert>
           )}
         </Paper>
