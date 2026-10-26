@@ -601,15 +601,18 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 - **Go**: `gofmt` と `goimports` で整形
 - **TypeScript / React**: Prettier と ESLint（コミット前に `npm run lint`）
 
-### CI/CD（想定）
 
-1. プッシュをトリガーにテストとリンターを実行
-2. `docker compose build <サービス名>` でイメージを作成（各 Dockerfile はマルチステージビルド）
-3. コンテナレジストリへプッシュし、本番で `docker compose pull` → `docker compose up -d <サービス名>`
+### CI/CD（想定）
+=======
+- **master:** 安定稼働版のメインブランチ。
+- **work:** 開発したベータ版のみを置くブランチ。
+- **oldest:** 動作完全保証のもっとも古いバージョンを置くブランチ。
+
 
 ---
 
 ## 関連ドキュメント
+
 
 | ファイル | 内容 |
 |---|---|
@@ -621,3 +624,6 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 | [`Docs/MinIO_DB.md`](Docs/MinIO_DB.md) | MinIO と DB の補足資料 |
 | [`monitoring-service/README.md`](monitoring-service/README.md) | 監視ダッシュボード |
 | `backend/security/sfsp/docs/` | SFSP の ADR・運用手順・脅威モデル・インシデント対応 |
+=======
+- **Go:** `gofmt` と `goimports` でフォーマットを統一してください。
+- **TypeScript/React:** PrettierとESLintを導入済みです。コミット前に`npm run lint`を実行してください。
