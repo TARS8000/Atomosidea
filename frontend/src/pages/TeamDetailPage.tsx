@@ -46,6 +46,9 @@ import {
   TeamMember,
   JoinRequest,
   TEAM_ROLE_RANK,
+  TEAM_ROLES,
+  canGrantTeamRole,
+  canManageTeamMember,
   contentApi,
   TeamContentItem,
   TeamContentType,
@@ -55,6 +58,19 @@ import { useAuth } from '../context/AuthContext';
 import axios from 'axios';
 
 const ROLE_LABEL: Record<string, string> = { owner: 'ホスト', admin: 'オペレーター', member: 'メンバー' };
+
+// メンバー操作（ロール変更・削除・退出）の失敗メッセージ
+const memberErrorMessage = (err: any, fallback: string): string => {
+  const status = err?.response?.status;
+  if (status === 409) {
+    return 'チームの最後のホストは退出できません。先に他のメンバーにホスト権限を付与するか、チームを削除してください。';
+  }
+  if (status === 403) {
+    return '権限が不足しています。自分より弱いロールのメンバーだけを変更・削除でき、付与できるのも自分より弱いロールだけです。';
+  }
+  if (status === 404) return '対象のメンバーが見つかりません。';
+  return fallback;
+};
 
 const TABS: { key: string; label: string }[] = [
   { key: 'all', label: 'すべて' },
@@ -240,24 +256,50 @@ const TeamDetailPage = () => {
     if (joinRequests.length > 0) void loadUsernames(joinRequests);
   }, [joinRequests]);
 
+  const [memberMessage, setMemberMessage] = useState('');
+
   const handleRoleChange = async (userId: string, role: string) => {
+    setMemberMessage('');
+    if (role === 'owner' && !window.confirm('このメンバーにホスト権限を付与しますか？付与した後は、あなたからこのメンバーのロールを変更・削除できなくなります。')) {
+      return;
+    }
     try {
       await teamApi.addMember(token!, userId, role);
       await load();
     } catch (err: any) {
-      setError(err.response?.data?.error || '権限変更に失敗しました。');
+      setMemberMessage(memberErrorMessage(err, '権限変更に失敗しました。'));
     }
   };
 
   const handleRemoveMember = async (userId: string) => {
     if (window.confirm('このメンバーを削除しますか？')) {
+      setMemberMessage('');
       try {
         await teamApi.removeMember(token!, userId);
         await load();
-      } catch (err) {
+      } catch (err: any) {
         console.error(err);
-        setError('メンバー削除に失敗しました。');
+        setMemberMessage(memberErrorMessage(err, 'メンバー削除に失敗しました。'));
       }
+    }
+  };
+
+  const ownerCount = members.filter((m) => m.role === 'owner').length;
+  const isLastOwner = myRole === 'owner' && ownerCount <= 1;
+
+  const handleLeaveTeam = async () => {
+    if (!user) return;
+    if (isLastOwner) {
+      setMemberMessage(memberErrorMessage({ response: { status: 409 } }, ''));
+      return;
+    }
+    if (!window.confirm('このチームから退出しますか？')) return;
+    setMemberMessage('');
+    try {
+      await teamApi.removeMember(token!, user.userID);
+      navigate('/teams');
+    } catch (err: any) {
+      setMemberMessage(memberErrorMessage(err, 'チームからの退出に失敗しました。'));
     }
   };
 
@@ -316,15 +358,42 @@ const TeamDetailPage = () => {
   };
 
   const handleJoin = async () => {
+    if (!isAuthenticated) {
+      navigate('/login');
+      return;
+    }
     setJoinMessage('参加リクエストを送信しています...');
     try {
-      await teamApi.join(token!);
-      setJoinMessage('チームに参加しました。');
+      const r = await teamApi.join(token!);
+      if (r.data?.status === 'pending') {
+        setJoinMessage('参加リクエストを送信しました。ホストまたはオペレーターの承認をお待ちください。');
+      } else if (r.data?.status === 'already_member') {
+        setJoinMessage('既にこのチームのメンバーです。');
+      } else {
+        setJoinMessage('チームに参加しました。');
+      }
       await load();
     } catch (err: any) {
-      setJoinMessage(err.response?.data?.error || '参加に失敗しました。');
+      const status = err.response?.status;
+      if (status === 409) {
+        setJoinMessage('既に参加リクエストを送信済みです。承認をお待ちください。');
+      } else if (status === 403) {
+        setJoinMessage('非公開チームには参加リクエストを送れません。');
+      } else if (status === 401) {
+        setJoinMessage('参加するにはログインが必要です。');
+      } else {
+        setJoinMessage('参加に失敗しました。');
+      }
     }
   };
+
+  // メンバータブを開いたら、admin 以上は参加リクエスト一覧を取得する
+  useEffect(() => {
+    if (activeTab === 'members' && canManageMembers) {
+      void loadJoinRequests();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, canManageMembers, token]);
 
   // コンテンツ削除
   const handleDeleteContent = async (type: TeamContentType, id: string) => {
@@ -476,6 +545,12 @@ const TeamDetailPage = () => {
             </Box>
           </Paper>
 
+          {joinMessage && (
+            <Alert severity="info" sx={{ mb: 2 }} onClose={() => setJoinMessage('')}>
+              {joinMessage}
+            </Alert>
+          )}
+
 <Paper sx={{ p: 1, mb: 2 }}>
             <Tabs
               value={activeTab}
@@ -624,15 +699,15 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
 {/* メンバー */}
 {activeTab === 'members' && (
               <>
-                {canManageTeam && (
+                {canManageMembers && (
                 <>
                   <Typography variant="h6" gutterBottom>参加リクエスト管理</Typography>
                   {joinRequestsLoading ? (
                     <CircularProgress size={20} />
-                  ) : joinRequests.length === 0 ? (
+                  ) : joinRequests.filter((r) => r.status === 'pending').length === 0 ? (
                     <Alert severity="info">参加リクエストはありません。</Alert>
                   ) : (
-                    joinRequests.map((r) => (
+                    joinRequests.filter((r) => r.status === 'pending').map((r) => (
                       <Box key={r.id} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1 }}>
                         <Box sx={{ display: 'flex', alignItems: 'center' }}>
                           <Avatar sx={{ width: 32, height: 32, mr: 1 }}>{(r.user_id || '?').charAt(0).toUpperCase()}</Avatar>
@@ -647,18 +722,34 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
                     ))
                   )}
 
-                  {joinMessage && <Alert severity="info" sx={{ mt: 1 }}>{joinMessage}</Alert>}
-
                   <Divider sx={{ my: 2 }} />
                 </>
               )}
               <Box sx={{ mb: 2 }}>
-                <Typography variant="h6" gutterBottom>メンバー管理</Typography>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Typography variant="h6" gutterBottom>メンバー管理</Typography>
+                  {myRole && (
+                    <Tooltip title={isLastOwner ? '最後のホストは退出できません。先にホスト権限を他のメンバーに付与するか、チームを削除してください。' : ''}>
+                      <span>
+                        <Button size="small" color="error" variant="outlined" onClick={handleLeaveTeam} disabled={isLastOwner}>
+                          チームを退出
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  )}
+                </Box>
+                {memberMessage && (
+                  <Alert severity="warning" sx={{ my: 1 }} onClose={() => setMemberMessage('')}>
+                    {memberMessage}
+                  </Alert>
+                )}
                 {members.length === 0 ? (
                   <Alert severity="info">メンバーがいません。</Alert>
                 ) : (
                   members.map((m) => {
                     const isSelf = m.user_id === user?.userID;
+                    // 自分より弱いロールのメンバーだけ変更・削除できる（team-service と同じ規則）
+                    const canManageThis = !isSelf && canManageTeamMember(myRole, m.role);
                     return (
                       <Box key={`${m.user_id}-${m.role}`} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1, gap: 1 }}>
                         <Box sx={{ display: 'flex', alignItems: 'center', flexGrow: 1, minWidth: 0 }}>
@@ -678,17 +769,19 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
                             select
                             size="small"
                             value={m.role}
-                            disabled={isSelf}
-                            onChange={(e) => handleRoleChange(m.user_id, e.target.value)}
+                            disabled={!canManageThis}
+                            onChange={(e) => {
+                              if (e.target.value !== m.role) handleRoleChange(m.user_id, e.target.value);
+                            }}
                             sx={{ minWidth: 150 }}
                             label="権限"
                           >
-                            <MenuItem value="owner">ホスト</MenuItem>
-                            <MenuItem value="admin">オペレーター</MenuItem>
-                            <MenuItem value="member">メンバー</MenuItem>
+                            {TEAM_ROLES.filter((r) => r === m.role || canGrantTeamRole(myRole, r)).map((r) => (
+                              <MenuItem key={r} value={r}>{ROLE_LABEL[r]}</MenuItem>
+                            ))}
                           </TextField>
                         )}
-                        {canManageTeam && m.role !== 'owner' && !isSelf && (
+                        {canManageThis && (
                           <Tooltip title="メンバーを削除">
                             <IconButton onClick={() => handleRemoveMember(m.user_id)} size="small">
                               <DeleteIcon fontSize="small" />

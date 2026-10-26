@@ -311,15 +311,8 @@ const LogViewerModal = ({ container, onClose, logs, logEndRef, activeTab, setAct
   );
 };
 
-// --- Monitoring topology configuration ---
-const MONITOR_LAYERS = {
-  'UI': { row: 0, title: '1. Frontend Layer' },
-  'API': { row: 1, title: '2. API Gateway & Services (Backend)' },
-  'Workers': { row: 2, title: '3. Security Scan & Processing Workers (Backend)' },
-  'DB': { row: 3, title: '4. Databases & Cache' },
-  'Storage': { row: 4, title: '5. Storage & Object Persistence' },
-  'Unknown': { row: 5, title: 'Uncategorized' },
-};
+// エラー検出後、赤い強調表示を保持してから状態をリセットするまでの時間（ms）
+const ERROR_HIGHLIGHT_MS = 10000;
 
 const getContainerGroup = (name) => {
   const n = name.toLowerCase();
@@ -440,6 +433,7 @@ export default function App() {
   const logEndRef = useRef(null);
   const wsMapRef = useRef({});
   const pulseTimeoutsRef = useRef({});
+  const errorClearTimeoutsRef = useRef({});
   const reconnectTimeoutsRef = useRef({});
   const fileInputRef = useRef(null);
 
@@ -583,19 +577,28 @@ export default function App() {
     return newErrorMap;
   }, [errorLoopState]);
 
+  // エラー検出後は ERROR_HIGHLIGHT_MS の間だけ赤表示を保持し、その後リセットして再検出可能にする。
+  // （検出直後に即リセットすると赤表示が一瞬で消えてしまうため、遅延させる）
   useEffect(() => {
     containers.forEach(c => {
-      if (errorLogsMap[c.name] && c.state === 'running' && !restartingContainers.has(c.name)) {
-        setErrorLoopState(prev => {
-          const newState = { ...prev };
-          delete newState[c.name];
-          return newState;
-        });
+      if (
+        errorLogsMap[c.name] && c.state === 'running' && !restartingContainers.has(c.name) &&
+        !errorClearTimeoutsRef.current[c.name]
+      ) {
+        errorClearTimeoutsRef.current[c.name] = setTimeout(() => {
+          delete errorClearTimeoutsRef.current[c.name];
+          setErrorLoopState(prev => {
+            const newState = { ...prev };
+            delete newState[c.name];
+            return newState;
+          });
+        }, ERROR_HIGHLIGHT_MS);
       }
     });
   }, [containers, errorLogsMap, restartingContainers]);
 
   useEffect(() => () => {
+    Object.values(errorClearTimeoutsRef.current).forEach(t => clearTimeout(t));
     Object.values(wsMapRef.current).forEach(ws => ws.close());
     Object.values(pulseTimeoutsRef.current).forEach(t => clearTimeout(t));
     Object.values(reconnectTimeoutsRef.current).forEach(t => clearTimeout(t));
@@ -606,6 +609,10 @@ export default function App() {
     if (!confirm(`コンテナ「${containerName}」を再起動しますか？`)) return;
 
     setRestartingContainers(prev => new Set(prev).add(containerName));
+    if (errorClearTimeoutsRef.current[containerName]) {
+      clearTimeout(errorClearTimeoutsRef.current[containerName]);
+      delete errorClearTimeoutsRef.current[containerName];
+    }
     setErrorLoopState(prev => {
       const newState = { ...prev };
       delete newState[containerName];
@@ -716,7 +723,7 @@ export default function App() {
       cardW
     };
   }, [containers, viewportWidth]);
-  // --- 接続ポロジー（ネットワーク共有から動的生成）---
+  // --- 接続トポロジー（ネットワーク共有から動的生成）---
   const connections = useMemo(() => {
     const netIndex = {};
     topology.forEach(n => { if (!isSystemContainer(n.name)) netIndex[n.name] = new Set(n.networks); });

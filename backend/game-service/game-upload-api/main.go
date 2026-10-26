@@ -9,12 +9,14 @@ import (
 	"database/sql" // <-- これを追加
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,51 +36,92 @@ import (
 )
 
 var (
-	db          *pgxpool.Pool
-	minioClient *minio.Client
-	jwtSecret   []byte
-	bucketName  string
-	sfspApiUrl  string
-	logger      *zap.SugaredLogger
+	db             *pgxpool.Pool
+	minioClient    *minio.Client
+	jwtSecret      []byte
+	bucketName     string
+	sfspApiUrl     string
+	sfspApiKey     string
+	logger         *zap.SugaredLogger
 	teamServiceURL string
+
+	// アップロードサイズの上限（環境変数で上書き可能）
+	maxGameUploadBytes  int64 = 1 << 30  // MAX_GAME_UPLOAD_BYTES（既定 1 GiB）
+	maxImageUploadBytes int64 = 10 << 20 // MAX_IMAGE_UPLOAD_BYTES（既定 10 MiB）
 )
 
-// teamAccessCheck calls the team-service permission endpoint to verify that the
-// caller is allowed to post to the given team. Returns true if posting is allowed.
-// A missing/empty team_id is treated as a public post (always allowed).
-func teamAccessCheck(c *gin.Context, teamToken string) bool {
-	if teamToken == "" {
-		return true
+// multipart のフィールドやヘッダーのための余裕分
+const multipartOverheadBytes int64 = 1 << 20
+
+// サムネイルとして受け付ける画像の Content-Type（http.DetectContentType の結果）
+var allowedImageTypes = map[string]bool{
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// チームトークンは base36 の 24 文字。URL パスにそのまま埋め込むので形式を検証する。
+var teamTokenPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,24}$`)
+
+// teamPermission は team-service の GET /api/teams/<token>/permission の応答。
+type teamPermission struct {
+	IsPublic bool   `json:"is_public"`
+	CanView  bool   `json:"can_view"`
+	CanPost  bool   `json:"can_post"`
+	Role     string `json:"role"`
+}
+
+// fetchTeamPermission は team-service に呼び出し元の権限を問い合わせる。
+// authHeader は検証済みのトークンのときだけ渡す（空なら匿名として問い合わせる）。
+// 通信エラー等は error を返すので、呼び出し側は拒否として扱う（fail closed）。
+func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*teamPermission, error) {
+	if !teamTokenPattern.MatchString(teamToken) {
+		return &teamPermission{}, nil
 	}
 	if teamServiceURL == "" {
 		teamServiceURL = "http://team-service:8080"
 	}
-	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", teamServiceURL+"/api/teams/"+teamToken+"/permission", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", teamServiceURL+"/api/teams/"+teamToken+"/permission", nil)
 	if err != nil {
-		logger.Errorf("teamAccessCheck: failed to create request: %v", err)
-		return false
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	if authHeader := c.GetHeader("Authorization"); authHeader != "" {
+	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		logger.Errorf("teamAccessCheck: request failed for team %s: %v", teamToken, err)
-		return false
+		return nil, fmt.Errorf("request failed for team %s: %w", teamToken, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return &teamPermission{}, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		logger.Errorf("teamAccessCheck: team service returned %d for team %s", resp.StatusCode, teamToken)
+		return nil, fmt.Errorf("team service returned %d for team %s", resp.StatusCode, teamToken)
+	}
+	var body teamPermission
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return &body, nil
+}
+
+// teamAccessCheck calls the team-service permission endpoint to verify that the
+// caller is allowed to post to the given team. Returns true if posting is allowed.
+// A missing/empty team_id is treated as a public post (always allowed).
+// authMiddleware を通過したリクエストでのみ呼ぶ（Authorization はそのまま転送する）。
+func teamAccessCheck(c *gin.Context, teamToken string) bool {
+	if teamToken == "" {
+		return true
+	}
+	perm, err := fetchTeamPermission(c.Request.Context(), teamToken, c.GetHeader("Authorization"))
+	if err != nil {
+		logger.Errorf("teamAccessCheck: %v", err)
 		return false
 	}
-	var body struct {
-		CanPost bool `json:"can_post"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		logger.Errorf("teamAccessCheck: failed to decode response: %v", err)
-		return false
-	}
-	return body.CanPost
+	return perm.CanPost
 }
 
 type Game struct {
@@ -89,15 +132,15 @@ type Game struct {
 	GameURL            string     `json:"game_url"`
 	ThumbnailURL       string     `json:"thumbnail_url"`
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
-	UploaderID         string      `json:"uploader_id"`
-	UploaderName       string      `json:"uploader_name"`
-	TeamID             string      `json:"team_id"`
-	Scale              float32     `json:"scale"`
-	OffsetX            int         `json:"offset_x"`
-	OffsetY            int         `json:"offset_y"`
-	NativeWidth        int         `json:"native_width"`
-	NativeHeight       int         `json:"native_height"`
-	CreatedAt          time.Time   `json:"created_at"`
+	UploaderID         string     `json:"uploader_id"`
+	UploaderName       string     `json:"uploader_name"`
+	TeamID             string     `json:"team_id"`
+	Scale              float32    `json:"scale"`
+	OffsetX            int        `json:"offset_x"`
+	OffsetY            int        `json:"offset_y"`
+	NativeWidth        int        `json:"native_width"`
+	NativeHeight       int        `json:"native_height"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 type AdjustPayload struct {
@@ -137,55 +180,163 @@ func generateRandomID() (string, error) {
 	}
 }
 
-func uploadToSFSP(ctx context.Context, tmpFile *os.File, header *multipart.FileHeader, targetService string, resp *SfspUploadResponse) error {
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	if err := writer.WriteField("target_service", targetService); err != nil {
-		return fmt.Errorf("failed to write target_service: %w", err)
+func envInt64(name string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
 	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		logger.Warnf("Invalid %s=%q; using default %d", name, v, def)
+		return def
+	}
+	return n
+}
 
-	part, err := writer.CreateFormFile("file", header.Filename)
+// safeFilename はパス区切りを取り除き、送信先で一時ファイル名に使われても安全な名前にする。
+func safeFilename(name, fallback string) string {
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return fallback
+	}
+	if len(name) > 200 {
+		name = name[len(name)-200:]
+	}
+	return name
+}
+
+// isBodyTooLarge は http.MaxBytesReader の上限超過によるエラーかを判定する。
+func isBodyTooLarge(err error) bool {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "request body too large")
+}
+
+// parseMultipartLimited はリクエストボディを limit バイトに制限して multipart を解析する。
+// 8 MiB を超えるファイル部分はディスク上の一時ファイルに置かれる（メモリに丸ごと載せない）。
+// 失敗時はレスポンスを書いて false を返す。
+func parseMultipartLimited(c *gin.Context, limit int64) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+	if err := c.Request.ParseMultipartForm(8 << 20); err != nil {
+		if isBodyTooLarge(err) {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "Request body too large"})
+			return false
+		}
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Invalid multipart form"})
+		return false
+	}
+	return true
+}
+
+// checkImageFile はサムネイルのサイズと形式（画像のみ）を確認し、先頭に巻き戻す。
+// 問題があれば HTTP ステータスとメッセージを返す（0 なら OK）。
+func checkImageFile(f multipart.File, header *multipart.FileHeader) (int, string) {
+	if header.Size > maxImageUploadBytes {
+		return http.StatusRequestEntityTooLarge, fmt.Sprintf("Thumbnail exceeds the maximum size of %d bytes", maxImageUploadBytes)
+	}
+	buf := make([]byte, 512)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return http.StatusBadRequest, "Failed to read thumbnail"
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return http.StatusInternalServerError, "Failed to process thumbnail"
+	}
+	if ct := http.DetectContentType(buf[:n]); !allowedImageTypes[ct] {
+		return http.StatusUnsupportedMediaType, "Thumbnail must be a JPEG, PNG, GIF or WebP image"
+	}
+	return 0, ""
+}
+
+// submitToSFSP は src を multipart で sfsp-api にストリーミング送信する（io.Pipe を使い、
+// 全体をメモリに溜めない）。すべての呼び出しに X-SFSP-API-Key を付ける。
+func submitToSFSP(ctx context.Context, src io.Reader, filename, targetService string, timeout time.Duration) (*SfspUploadResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := func() error {
+			if err := mw.WriteField("target_service", targetService); err != nil {
+				return fmt.Errorf("failed to write target_service: %w", err)
+			}
+			part, err := mw.CreateFormFile("file", filename)
+			if err != nil {
+				return fmt.Errorf("failed to create form file: %w", err)
+			}
+			if _, err := io.Copy(part, src); err != nil {
+				return fmt.Errorf("failed to stream file: %w", err)
+			}
+			return mw.Close()
+		}()
+		pw.CloseWithError(err)
+	}()
+	// 書き込み側の goroutine が src を読み終える（または中断する）まで待ってから戻る。
+	defer func() {
+		pr.Close()
+		<-done
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
-		return fmt.Errorf("failed to create form: %w", err)
+		return nil, fmt.Errorf("failed to create SFSP request: %w", err)
 	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-SFSP-API-Key", sfspApiKey)
 
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to reset file reader: %w", err)
-	}
-
-	if _, err := io.Copy(part, tmpFile); err != nil {
-		return fmt.Errorf("failed to copy file: %w", err)
-	}
-	writer.Close()
-
-	sfspRequest, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", body)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to create SFSP request: %w", err)
+		return nil, fmt.Errorf("SFSP request failed: %w", err)
 	}
-	sfspRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	defer resp.Body.Close()
 
-	client := &http.Client{Timeout: 10 * time.Minute}
-	sfspResponse, err := client.Do(sfspRequest)
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("SFSP request failed: %w", err)
+		return nil, fmt.Errorf("failed to read SFSP response: %w", err)
 	}
-	defer sfspResponse.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("SFSP returned non-2xx status %d: %s", resp.StatusCode, string(respBytes))
+	}
+	var out SfspUploadResponse
+	if err := json.Unmarshal(respBytes, &out); err != nil {
+		return nil, fmt.Errorf("failed to decode SFSP response: %w", err)
+	}
+	return &out, nil
+}
 
-	respBytes, err := io.ReadAll(sfspResponse.Body)
+// republishIfClean は sfsp-api が既にクリーンと判定済みのファイルを返した場合に、
+// 完了イベントを自前で発行する（現行の sfsp-api は常に "queued" を返すので通常は何もしない）。
+func republishIfClean(resp *SfspUploadResponse, jobID uuid.UUID, filename, targetService string) {
+	if !strings.EqualFold(resp.Status, "clean") {
+		return
+	}
+	fileID, err := uuid.Parse(resp.FileID)
 	if err != nil {
-		return fmt.Errorf("failed to read SFSP response: %w", err)
+		logger.Errorf("Invalid File ID from SFSP for clean %s file: %v", targetService, err)
+		return
 	}
-
-	if sfspResponse.StatusCode < 200 || sfspResponse.StatusCode >= 300 {
-		return fmt.Errorf("SFSP returned non-2xx status %d: %s", sfspResponse.StatusCode, string(respBytes))
+	ev := event.ScanCompletionEvent{
+		JobID:         jobID,
+		FileID:        fileID,
+		FinalStatus:   "clean",
+		ScannedAt:     time.Now().UTC(),
+		SHA256:        resp.SHA256,
+		Filename:      filename,
+		TargetService: targetService,
 	}
-
-	if err := json.Unmarshal(respBytes, resp); err != nil {
-		return fmt.Errorf("failed to decode SFSP response: %w", err)
+	if err := queue.EnqueueScanCompletionEvent(context.Background(), ev); err != nil {
+		logger.Errorf("CRITICAL: Failed to re-publish %s completion event for existing clean file: %v", targetService, err)
+	} else {
+		logger.Infof("Re-published %s completion event for existing clean file, job %s", targetService, jobID)
 	}
-
-	return nil
 }
 
 // ensureGameSchema は既存DBへの後方互換性のため、gamesテーブルを作成し、
@@ -246,9 +397,19 @@ func main() {
 	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 	bucketName = os.Getenv("MINIO_BUCKET_NAME")
 	sfspApiUrl = os.Getenv("SFSP_API_URL")
+	sfspApiKey = os.Getenv("SFSP_API_KEY")
+	teamServiceURL = os.Getenv("TEAM_SERVICE_URL")
+	maxGameUploadBytes = envInt64("MAX_GAME_UPLOAD_BYTES", maxGameUploadBytes)
+	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
 
 	if sfspApiUrl == "" {
 		logger.Fatalf("SFSP_API_URL environment variable is not set")
+	}
+	if sfspApiKey == "" {
+		logger.Warn("SFSP_API_KEY is not set; requests to sfsp-api will be rejected")
+	}
+	if len(jwtSecret) == 0 {
+		logger.Fatalf("JWT_SECRET environment variable is not set")
 	}
 
 	cfg, err := config.LoadConfig()
@@ -281,6 +442,8 @@ func main() {
 	}
 
 	r := gin.Default()
+	// multipart の解析で 8 MiB を超える部分はディスクへ（parseMultipartLimited と合わせる）
+	r.MaxMultipartMemory = 8 << 20
 	api := r.Group("/api/games")
 	{
 		api.GET("", listGamesHandler)
@@ -292,7 +455,7 @@ func main() {
 		api.PUT("/adjust/:id", authMiddleware(), adjustGameHandler)
 	}
 
-	logger.Info("Game API service (read/write) starting on port 8082")
+	logger.Infof("Game API service (read/write) starting on port 8082 (max game upload %d bytes, max image %d bytes)", maxGameUploadBytes, maxImageUploadBytes)
 	if err := r.Run(":8082"); err != nil {
 		logger.Fatalf("Failed to run server: %v", err)
 	}
@@ -309,6 +472,11 @@ func uploadGameHandler(c *gin.Context) {
 	if err != nil {
 		logger.Errorf("Invalid user ID format: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
+		return
+	}
+
+	// リクエスト全体を「ゲーム + サムネイル + 余裕分」に制限する（超過は 413）
+	if !parseMultipartLimited(c, maxGameUploadBytes+maxImageUploadBytes+multipartOverheadBytes) {
 		return
 	}
 
@@ -332,25 +500,31 @@ func uploadGameHandler(c *gin.Context) {
 	}
 	defer gameFile.Close()
 
+	if gameFileHeader.Size > maxGameUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("Game file exceeds the maximum size of %d bytes", maxGameUploadBytes)})
+		return
+	}
+	gameFilename := safeFilename(gameFileHeader.Filename, "game.zip")
+
 	// ファイル形式チェック (ZIP)
 	buffer := make([]byte, 512)
-	_, err = gameFile.Read(buffer)
-	if err != nil {
+	n, err := io.ReadFull(gameFile, buffer)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read file for type detection"})
 		return
 	}
-	if _, err := gameFile.Seek(0, 0); err != nil {
+	if _, err := gameFile.Seek(0, io.SeekStart); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset file reader"})
 		return
 	}
-	contentType := http.DetectContentType(buffer)
-	isZipExtension := strings.HasSuffix(strings.ToLower(gameFileHeader.Filename), ".zip")
+	contentType := http.DetectContentType(buffer[:n])
+	isZipExtension := strings.HasSuffix(strings.ToLower(gameFilename), ".zip")
 
 	if contentType != "application/zip" && !isZipExtension {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{
 			"error":                 "Unsupported file type. Only ZIP files are allowed.",
 			"detected_content_type": contentType,
-			"filename":              gameFileHeader.Filename,
+			"filename":              gameFilename,
 			"is_zip_extension":      isZipExtension,
 		})
 		return
@@ -359,152 +533,32 @@ func uploadGameHandler(c *gin.Context) {
 	// Unity WebGLビルドのZIPファイルかどうかの検証
 	verificationResult, err := verifyUnityWebGLZip(gameFile, gameFileHeader.Size)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to verify ZIP file: %v", err)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to verify ZIP file: %v", err)})
 		return
 	}
 	if !verificationResult.IsValid {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{
-			"error": "The uploaded ZIP file is not a valid Unity WebGL build.",
+			"error":      "The uploaded ZIP file is not a valid Unity WebGL build.",
 			"debug_info": verificationResult,
 		})
 		return
 	}
-	if _, err := gameFile.Seek(0, 0); err != nil {
+	if _, err := gameFile.Seek(0, io.SeekStart); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset file reader after verification"})
 		return
 	}
 
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	if err := writer.WriteField("target_service", "game"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write target_service field for SFSP"})
-		return
-	}
-
-	part, err := writer.CreateFormFile("file", gameFileHeader.Filename)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create form for SFSP"})
-		return
-	}
-
-	if _, err := gameFile.Seek(0, 0); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset file reader"})
-		return
-	}
-
-	_, err = io.Copy(part, gameFile)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to copy file for SFSP"})
-		return
-	}
-	writer.Close()
-
-	sfspRequest, err := http.NewRequest("POST", sfspApiUrl+"/api/v1/files", body)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create SFSP request"})
-		return
-	}
-	sfspRequest.Header.Set("Content-Type", writer.FormDataContentType())
-
-	client := &http.Client{Timeout: time.Second * 30}
-	sfspResponse, err := client.Do(sfspRequest)
-	if err != nil {
-		logger.Errorf("Error forwarding file to SFSP: %v", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "File scanning service is unavailable"})
-		return
-	}
-	defer sfspResponse.Body.Close()
-
-	respBytes, err := io.ReadAll(sfspResponse.Body)
-	if err != nil {
-		logger.Errorf("Failed to read SFSP response body: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read response from scanning service"})
-		return
-	}
-
-	if sfspResponse.StatusCode < 200 || sfspResponse.StatusCode >= 300 {
-		logger.Errorf("SFSP returned non-2xx status: %d, body: %s", sfspResponse.StatusCode, string(respBytes))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to submit file for scanning", "details": string(respBytes)})
-		return
-	}
-
-	var sfspRespData SfspUploadResponse
-	if err := json.Unmarshal(respBytes, &sfspRespData); err != nil {
-		logger.Errorf("Failed to decode SFSP response JSON: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode SFSP response"})
-		return
-	}
-
-	logger.Infof(
-		"SFSP response: code=%d file_id=%s job_id=%s status=%s",
-		sfspResponse.StatusCode,
-		sfspRespData.FileID,
-		sfspRespData.JobID,
-		sfspRespData.Status,
-	)
-
-	var thumbnailSFSPJobID *uuid.UUID
-	var thumbnailURL string
-	thumbnailFile, thumbnailHeader, err_thumb := c.Request.FormFile("thumbnail")
-	if err_thumb == nil {
+	// サムネイル（任意）: サイズと形式を SFSP に送る前に検証する
+	thumbnailFile, thumbnailHeader, errThumb := c.Request.FormFile("thumbnail")
+	hasThumbnail := false
+	if errThumb == nil {
 		defer thumbnailFile.Close()
-
-		tmpThumbFile, err := os.CreateTemp("", "sfsp-thumbnail-*.tmp")
-		if err != nil {
-			logger.Errorf("Failed to create temp file for thumbnail SFSP upload: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
+		if status, msg := checkImageFile(thumbnailFile, thumbnailHeader); status != 0 {
+			c.JSON(status, gin.H{"error": msg})
 			return
 		}
-		defer os.Remove(tmpThumbFile.Name())
-		defer tmpThumbFile.Close()
-
-		if _, err := io.Copy(tmpThumbFile, thumbnailFile); err != nil {
-			logger.Errorf("Failed to copy thumbnail to temp file: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
-			return
-		}
-		if _, err := tmpThumbFile.Seek(0, io.SeekStart); err != nil {
-			logger.Errorf("Failed to reset temp thumbnail file: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
-			return
-		}
-
-		var thumbSfspResp SfspUploadResponse
-if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "game-thumbnail", &thumbSfspResp); err != nil {
-			logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
-			return
-		}
-
-		parsedThumbJobID, err := uuid.Parse(thumbSfspResp.JobID)
-		if err != nil {
-			logger.Errorf("Invalid Thumbnail Job ID from SFSP: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid thumbnail job ID from SFSP"})
-			return
-		}
-		thumbnailSFSPJobID = &parsedThumbJobID
-
-		if sfspResponse.StatusCode == http.StatusOK && strings.ToLower(thumbSfspResp.Status) == "clean" {
-			thumbFileID, err := uuid.Parse(thumbSfspResp.FileID)
-			if err == nil {
-				event := event.ScanCompletionEvent{
-					JobID:         parsedThumbJobID,
-					FileID:        thumbFileID,
-					FinalStatus:   "clean",
-					ScannedAt:     time.Now().UTC(),
-					SHA256:        thumbSfspResp.SHA256,
-					Filename:      thumbnailHeader.Filename,
-					TargetService: "game-thumbnail",
-				}
-				if err := queue.EnqueueScanCompletionEvent(context.Background(), event); err != nil {
-					logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for duplicate clean file: %v", err)
-				} else {
-					logger.Infof("Re-published thumbnail completion event for existing clean file, job %s", thumbSfspResp.JobID)
-				}
-			}
-		}
-	} else if err_thumb != http.ErrMissingFile {
+		hasThumbnail = true
+	} else if errThumb != http.ErrMissingFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid thumbnail file"})
 		return
 	}
@@ -516,40 +570,23 @@ if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "game
 		return
 	}
 
-	sfspJobID, err := uuid.Parse(sfspRespData.JobID)
-	if err != nil {
-		logger.Errorf(
-			"Invalid Job ID from SFSP. file_id=%s job_id=%q status=%s",
-			sfspRespData.FileID,
-			sfspRespData.JobID,
-			sfspRespData.Status,
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid Job ID from SFSP"})
-		return
-	}
-
-	gameStatus := "scanning"
-	if sfspResponse.StatusCode == http.StatusOK && strings.ToLower(sfspRespData.Status) == "clean" {
-		gameStatus = "processing"
-	}
-
-teamIDVal := interface{}(teamID)
+	teamIDVal := interface{}(teamID)
 	if teamID == "" {
 		teamIDVal = nil
 	}
+
+	// スキャン完了イベントが INSERT より先に届いて捨てられないよう、
+	// SFSP に送る前に行を作っておき、ジョブ ID は応答を受け取った直後に UPDATE する。
+	// （UPDATE までの短い隙間は game-worker 側の再試行で吸収する）
 	_, err = db.Exec(
 		context.Background(),
 		`INSERT INTO games
-        (id, user_id, title, description, status, sfsp_job_id, thumbnail_sfsp_job_id, thumbnail_url, team_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        (id, user_id, title, description, status, team_id)
+        VALUES ($1, $2, $3, $4, 'scanning', $5)`,
 		gameID,
 		userUUID,
 		title,
 		description,
-		gameStatus,
-		sfspJobID,
-		thumbnailSFSPJobID,
-		thumbnailURL,
 		teamIDVal,
 	)
 	if err != nil {
@@ -558,29 +595,66 @@ teamIDVal := interface{}(teamID)
 		return
 	}
 
-	if gameStatus == "processing" {
-		fileID, err := uuid.Parse(sfspRespData.FileID)
+	// 途中で失敗したら作成した行を削除する（後から届くイベントは worker が「行なし」として破棄する）
+	abort := func(status int, msg string) {
+		if _, err := db.Exec(context.Background(), "DELETE FROM games WHERE id = $1", gameID); err != nil {
+			logger.Errorf("[GameID: %s] Failed to delete game record after upload error: %v", gameID, err)
+		}
+		c.JSON(status, gin.H{"error": msg})
+	}
+
+	sfspRespData, err := submitToSFSP(c.Request.Context(), gameFile, gameFilename, "game", 10*time.Minute)
+	if err != nil {
+		logger.Errorf("[GameID: %s] Error forwarding file to SFSP: %v", gameID, err)
+		abort(http.StatusServiceUnavailable, "File scanning service is unavailable")
+		return
+	}
+
+	logger.Infof("[GameID: %s] SFSP response: file_id=%s job_id=%s status=%s", gameID, sfspRespData.FileID, sfspRespData.JobID, sfspRespData.Status)
+
+	sfspJobID, err := uuid.Parse(sfspRespData.JobID)
+	if err != nil {
+		logger.Errorf("[GameID: %s] Invalid Job ID from SFSP. file_id=%s job_id=%q status=%s", gameID, sfspRespData.FileID, sfspRespData.JobID, sfspRespData.Status)
+		abort(http.StatusInternalServerError, "Invalid Job ID from SFSP")
+		return
+	}
+
+	gameStatus := "scanning"
+	if strings.EqualFold(sfspRespData.Status, "clean") {
+		gameStatus = "processing"
+	}
+	if _, err := db.Exec(context.Background(),
+		"UPDATE games SET sfsp_job_id = $1, status = $2, updated_at = NOW() WHERE id = $3",
+		sfspJobID, gameStatus, gameID); err != nil {
+		logger.Errorf("[GameID: %s] Error saving SFSP job ID: %v", gameID, err)
+		abort(http.StatusInternalServerError, "Failed to create game record")
+		return
+	}
+
+	if hasThumbnail {
+		thumbFilename := safeFilename(thumbnailHeader.Filename, "thumbnail")
+		thumbSfspResp, err := submitToSFSP(c.Request.Context(), thumbnailFile, thumbFilename, "game-thumbnail", 2*time.Minute)
 		if err != nil {
-			logger.Errorf("Invalid File ID from SFSP: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid File ID from SFSP"})
+			logger.Errorf("[GameID: %s] Error forwarding thumbnail to SFSP: %v", gameID, err)
+			abort(http.StatusServiceUnavailable, "Thumbnail scanning service is unavailable")
 			return
 		}
-
-		event := event.ScanCompletionEvent{
-			JobID:         sfspJobID,
-			FileID:        fileID,
-			FinalStatus:   "clean",
-			ScannedAt:     time.Now().UTC(),
-			SHA256:        sfspRespData.SHA256,
-			Filename:      gameFileHeader.Filename,
-			TargetService: "game",
+		thumbJobID, err := uuid.Parse(thumbSfspResp.JobID)
+		if err != nil {
+			logger.Errorf("[GameID: %s] Invalid Thumbnail Job ID from SFSP: %v", gameID, err)
+			abort(http.StatusInternalServerError, "Invalid thumbnail job ID from SFSP")
+			return
 		}
-		if err := queue.EnqueueScanCompletionEvent(context.Background(), event); err != nil {
-			logger.Errorf("CRITICAL: Failed to re-publish completion event for duplicate clean file: %v", err)
-		} else {
-			logger.Infof("Re-published completion event for existing clean file, job %s", sfspRespData.JobID)
+		if _, err := db.Exec(context.Background(),
+			"UPDATE games SET thumbnail_sfsp_job_id = $1 WHERE id = $2", thumbJobID, gameID); err != nil {
+			logger.Errorf("[GameID: %s] Error saving thumbnail SFSP job ID: %v", gameID, err)
+			abort(http.StatusInternalServerError, "Failed to create game record")
+			return
 		}
+		republishIfClean(thumbSfspResp, thumbJobID, thumbFilename, "game-thumbnail")
 	}
+
+	republishIfClean(sfspRespData, sfspJobID, gameFilename, "game")
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message": "Game upload accepted",
@@ -588,6 +662,9 @@ teamIDVal := interface{}(teamID)
 		"status":  gameStatus,
 	})
 }
+
+// wasm 内のキーワード探索で読む最大バイト数（展開後）。zip bomb 対策。
+const maxWasmScanBytes int64 = 512 << 20
 
 func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, error) {
 	result := &VerificationResult{}
@@ -602,43 +679,53 @@ func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, 
 		isBrotli := strings.HasSuffix(f.Name, ".wasm.br")
 		isGzip := strings.HasSuffix(f.Name, ".wasm.gz") // .gz も考慮
 
-		if isWasm || isBrotli || isGzip {
-			result.WasmFileFound = true
-			result.CheckedFile = f.Name
+		if !(isWasm || isBrotli || isGzip) {
+			continue
+		}
+		result.WasmFileFound = true
+		result.CheckedFile = f.Name
 
-			rc, err := f.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open wasm file in zip: %w", err)
-			}
-			defer rc.Close()
-
-			var reader io.Reader = rc
-			if isBrotli {
-				reader = brotli.NewReader(rc)
-			}
-			// ここで .gz の解凍ロジックも追加可能
-
-			scanner := bufio.NewScanner(reader)
-			buf := make([]byte, 0, 64*1024)
-			scanner.Buffer(buf, 1024*1024) // 1MBのバッファ
-
-			for scanner.Scan() {
-				if bytes.Contains(scanner.Bytes(), []byte("il2cpp")) || bytes.Contains(scanner.Bytes(), []byte("UnityEngine")) {
-					result.UnityKeywordFound = true
-					break
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				return nil, fmt.Errorf("error scanning wasm file: %w", err)
-			}
-			if result.UnityKeywordFound {
-				break
-			}
+		found, err := scanWasmForUnity(f, isBrotli)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			result.UnityKeywordFound = true
+			break
 		}
 	}
 
 	result.IsValid = result.WasmFileFound && result.UnityKeywordFound
 	return result, nil
+}
+
+func scanWasmForUnity(f *zip.File, isBrotli bool) (bool, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return false, fmt.Errorf("failed to open wasm file in zip: %w", err)
+	}
+	defer rc.Close()
+
+	var reader io.Reader = rc
+	if isBrotli {
+		reader = brotli.NewReader(rc)
+	}
+	// ここで .gz の解凍ロジックも追加可能
+	reader = io.LimitReader(reader, maxWasmScanBytes)
+
+	scanner := bufio.NewScanner(reader)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024) // 1MBのバッファ
+
+	for scanner.Scan() {
+		if bytes.Contains(scanner.Bytes(), []byte("il2cpp")) || bytes.Contains(scanner.Bytes(), []byte("UnityEngine")) {
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("error scanning wasm file: %w", err)
+	}
+	return false, nil
 }
 
 func listGamesHandler(c *gin.Context) {
@@ -651,6 +738,21 @@ func listGamesHandler(c *gin.Context) {
 	var args []interface{}
 	argIdx := 1
 	if teamToken != "" {
+		// チーム限定の一覧は閲覧権限（can_view）がある場合だけ返す
+		authHeader := ""
+		if optionalAuth(c) != nil {
+			authHeader = c.GetHeader("Authorization")
+		}
+		perm, err := fetchTeamPermission(c.Request.Context(), teamToken, authHeader)
+		if err != nil {
+			logger.Errorf("listGamesHandler: team permission check failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to verify team permission"})
+			return
+		}
+		if !perm.CanView {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You are not allowed to view this team's games"})
+			return
+		}
 		whereConds = append(whereConds, "team_id = $"+strconv.Itoa(argIdx))
 		args = append(args, teamToken)
 		argIdx++
@@ -686,18 +788,23 @@ func listGamesHandler(c *gin.Context) {
 			logger.Errorf("Error scanning game row: %v", err)
 			continue
 		}
+		g.TeamID = teamToken
 		games = append(games, g)
 	}
 	c.JSON(http.StatusOK, games)
 }
 
+// gameDetailsHandler の公開範囲:
+//   - 投稿者本人（と管理者）は status に関係なく自分のゲームを見られる
+//   - それ以外は status = 'public' のものだけ（それ以外は 404）
+//   - team_id があるゲームは、team-service が can_view を返した場合だけ（それ以外は 403）
 func gameDetailsHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	var g Game
 	err := db.QueryRow(context.Background(),
-		`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), thumbnail_sfsp_job_id, user_id, scale, offset_x, offset_y, native_width, native_height, created_at
+		`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), thumbnail_sfsp_job_id, user_id, COALESCE(team_id, ''), scale, offset_x, offset_y, native_width, native_height, created_at
         FROM games
-        WHERE id = $1`, gameID).Scan(&g.ID, &g.Title, &g.Description, &g.Status, &g.GameURL, &g.ThumbnailURL, &g.ThumbnailSfspJobID, &g.UploaderID, &g.Scale, &g.OffsetX, &g.OffsetY, &g.NativeWidth, &g.NativeHeight, &g.CreatedAt)
+        WHERE id = $1`, gameID).Scan(&g.ID, &g.Title, &g.Description, &g.Status, &g.GameURL, &g.ThumbnailURL, &g.ThumbnailSfspJobID, &g.UploaderID, &g.TeamID, &g.Scale, &g.OffsetX, &g.OffsetY, &g.NativeWidth, &g.NativeHeight, &g.CreatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Game not found"})
@@ -707,6 +814,35 @@ func gameDetailsHandler(c *gin.Context) {
 		}
 		return
 	}
+
+	viewer := optionalAuth(c)
+	if viewer != nil && (viewer.UserID == g.UploaderID || viewer.IsAdmin) {
+		c.JSON(http.StatusOK, g)
+		return
+	}
+
+	if g.Status != "public" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Game not found"})
+		return
+	}
+	if g.TeamID != "" {
+		authHeader := ""
+		if viewer != nil {
+			authHeader = c.GetHeader("Authorization")
+		}
+		perm, err := fetchTeamPermission(c.Request.Context(), g.TeamID, authHeader)
+		if err != nil {
+			logger.Errorf("gameDetailsHandler: team permission check failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to verify team permission"})
+			return
+		}
+		if !perm.CanView {
+			c.JSON(http.StatusForbidden, gin.H{"error": "You are not allowed to view this game"})
+			return
+		}
+	}
+	// 投稿者以外にはスキャンジョブの ID を見せない
+	g.ThumbnailSfspJobID = nil
 	c.JSON(http.StatusOK, g)
 }
 
@@ -729,6 +865,25 @@ func updateGameHandler(c *gin.Context) {
 		return
 	}
 
+	// サムネイル + テキスト項目のみなので画像の上限 + 余裕分に制限する
+	if !parseMultipartLimited(c, maxImageUploadBytes+multipartOverheadBytes) {
+		return
+	}
+
+	// サムネイルは DB を更新する前に検証する（不正な画像でタイトルだけ変わるのを防ぐ）
+	thumbnailFile, thumbnailHeader, errThumb := c.Request.FormFile("thumbnail")
+	if errThumb != nil && errThumb != http.ErrMissingFile {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid thumbnail file"})
+		return
+	}
+	if errThumb == nil {
+		defer thumbnailFile.Close()
+		if status, msg := checkImageFile(thumbnailFile, thumbnailHeader); status != 0 {
+			c.JSON(status, gin.H{"error": msg})
+			return
+		}
+	}
+
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 
@@ -741,39 +896,14 @@ func updateGameHandler(c *gin.Context) {
 		return
 	}
 
-	thumbnailFile, thumbnailHeader, err_thumb := c.Request.FormFile("thumbnail")
-	if err_thumb == http.ErrMissingFile {
+	if errThumb == http.ErrMissingFile {
 		c.JSON(http.StatusOK, gin.H{"message": "Game details updated successfully"})
 		return
 	}
-	if err_thumb != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid thumbnail file"})
-		return
-	}
-	defer thumbnailFile.Close()
 
-	tmpThumbFile, err := os.CreateTemp("", "sfsp-thumbnail-*.tmp")
+	thumbFilename := safeFilename(thumbnailHeader.Filename, "thumbnail")
+	thumbSfspResp, err := submitToSFSP(c.Request.Context(), thumbnailFile, thumbFilename, "game-thumbnail", 2*time.Minute)
 	if err != nil {
-		logger.Errorf("Failed to create temp file for thumbnail SFSP upload: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
-		return
-	}
-	defer os.Remove(tmpThumbFile.Name())
-	defer tmpThumbFile.Close()
-
-	if _, err := io.Copy(tmpThumbFile, thumbnailFile); err != nil {
-		logger.Errorf("Failed to copy thumbnail to temp file: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
-		return
-	}
-	if _, err := tmpThumbFile.Seek(0, io.SeekStart); err != nil {
-		logger.Errorf("Failed to reset temp thumbnail file: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process thumbnail"})
-		return
-	}
-
-	var thumbSfspResp SfspUploadResponse
-	if err := uploadToSFSP(c.Request.Context(), tmpThumbFile, thumbnailHeader, "game-thumbnail", &thumbSfspResp); err != nil {
 		logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Thumbnail scanning service is unavailable"})
 		return
@@ -795,24 +925,7 @@ func updateGameHandler(c *gin.Context) {
 		return
 	}
 
-	if strings.ToLower(thumbSfspResp.Status) == "clean" {
-		if thumbFileID, err := uuid.Parse(thumbSfspResp.FileID); err == nil {
-			event := event.ScanCompletionEvent{
-				JobID:         parsedThumbJobID,
-				FileID:        thumbFileID,
-				FinalStatus:   "clean",
-				ScannedAt:     time.Now().UTC(),
-				SHA256:        thumbSfspResp.SHA256,
-				Filename:      thumbnailHeader.Filename,
-				TargetService: "game-thumbnail",
-			}
-			if err := queue.EnqueueScanCompletionEvent(context.Background(), event); err != nil {
-				logger.Errorf("CRITICAL: Failed to re-publish thumbnail completion event for existing clean file: %v", err)
-			} else {
-				logger.Infof("Re-published thumbnail completion event for existing clean file, job %s", parsedThumbJobID)
-			}
-		}
-	}
+	republishIfClean(thumbSfspResp, parsedThumbJobID, thumbFilename, "game-thumbnail")
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message": "Thumbnail upload accepted for scanning",
@@ -969,43 +1082,83 @@ func deleteThumbnailHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Thumbnail deleted successfully"})
 }
 
+// authInfo は検証済み JWT から取り出した呼び出し元の情報。
+type authInfo struct {
+	UserID  string
+	IsAdmin bool
+}
+
+// validateToken は Authorization ヘッダーの JWT を検証する（HS256 固定）。
+// 署名検証の後に Redis の blocklist:<jti> を確認し、ログアウト済みのトークンを拒否する。
+// Redis のエラー時は 500 で拒否する（fail closed。auth-service と同じ挙動）。
+// 失敗時は HTTP ステータスとメッセージを返す。
+func validateToken(ctx context.Context, authHeader string) (*authInfo, int, string) {
+	if authHeader == "" {
+		return nil, http.StatusUnauthorized, "Authorization header is missing"
+	}
+	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil || !token.Valid {
+		return nil, http.StatusUnauthorized, "Invalid token"
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, http.StatusUnauthorized, "Invalid token"
+	}
+
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		return nil, http.StatusUnauthorized, "Invalid token"
+	}
+	exists, err := queue.RedisClient.Exists(ctx, "blocklist:"+jti).Result()
+	if err != nil {
+		logger.Errorf("Redis error checking token blocklist: %v", err)
+		return nil, http.StatusInternalServerError, "Failed to verify token"
+	}
+	if exists > 0 {
+		return nil, http.StatusUnauthorized, "Token has been invalidated"
+	}
+
+	var userID string
+	for _, key := range []string{"sub", "userID", "user_id", "id"} {
+		if val, ok := claims[key].(string); ok && val != "" {
+			userID = val
+			break
+		}
+	}
+	if userID == "" {
+		return nil, http.StatusUnauthorized, "Invalid user ID in token"
+	}
+	if _, err := uuid.Parse(userID); err != nil {
+		return nil, http.StatusUnauthorized, "Invalid user ID in token"
+	}
+
+	isAdmin, _ := claims["isAdmin"].(bool)
+	return &authInfo{UserID: userID, IsAdmin: isAdmin}, 0, ""
+}
+
+// optionalAuth は認証が任意のエンドポイント用。トークンが無い・無効・失効済み・
+// 確認できない（Redis エラー）場合はいずれも匿名（nil）として扱う。
+func optionalAuth(c *gin.Context) *authInfo {
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		return nil
+	}
+	info, _, _ := validateToken(c.Request.Context(), authHeader)
+	return info
+}
+
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
+		info, status, msg := validateToken(c.Request.Context(), c.GetHeader("Authorization"))
+		if info == nil {
+			c.AbortWithStatusJSON(status, gin.H{"error": msg})
 			return
 		}
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
-			return
-		}
-		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-			var userID string
-			if val, ok := claims["userID"].(string); ok {
-				userID = val
-			} else if val, ok := claims["user_id"].(string); ok {
-				userID = val
-			}
-
-			if userID == "" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID in token"})
-				return
-			}
-
-			isAdmin, ok := claims["isAdmin"].(bool)
-			if !ok {
-				isAdmin = false
-			}
-			c.Set("userID", userID)
-			c.Set("isAdmin", isAdmin)
-			c.Next()
-		} else {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
-		}
+		c.Set("userID", info.UserID)
+		c.Set("isAdmin", info.IsAdmin)
+		c.Next()
 	}
 }

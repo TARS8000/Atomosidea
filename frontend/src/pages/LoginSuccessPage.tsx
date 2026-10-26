@@ -1,21 +1,43 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import axios from 'axios';
 
+// Google ログイン後のコールバック画面。
+// auth-service は JWT を URL に載せず、60 秒・1 回限りのコード（?code=...）を渡す。
+// ここでコードを POST /api/auth/oauth/exchange でトークンに交換する。
 const LoginSuccessPage = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const { login } = useAuth();
+  // コードは 1 回しか使えないため、StrictMode などによる 2 回目の実行では交換しない
+  const handledRef = useRef(false);
 
   useEffect(() => {
+    if (handledRef.current) return;
+    handledRef.current = true;
+
     const handleLoginSuccess = async () => {
       const params = new URLSearchParams(location.search);
-      const token = params.get('token');
+      const code = params.get('code');
 
-      if (!token) {
-        console.warn("LoginSuccessPage: No token found in URL parameters.");
+      // コードを履歴・アドレスバーに残さない
+      window.history.replaceState(window.history.state, '', location.pathname);
+
+      if (!code) {
+        console.warn('LoginSuccessPage: No code found in URL parameters.');
         navigate('/login', { replace: true });
+        return;
+      }
+
+      let token: string;
+      try {
+        const exchangeRes = await axios.post('/api/auth/oauth/exchange', { code });
+        token = exchangeRes.data.token;
+        if (!token) throw new Error('No token in exchange response');
+      } catch (error) {
+        console.error('Failed to exchange login code:', error);
+        navigate('/login?error=code_exchange_failed', { replace: true });
         return;
       }
 
@@ -37,7 +59,7 @@ const LoginSuccessPage = () => {
           navigate('/mypage', { replace: true });
         }
       } catch (error) {
-        console.error("Failed to fetch user status:", error);
+        console.error('Failed to fetch user status:', error);
         // エラー発生時は安全のためログイン画面へ戻す
         navigate('/login', { replace: true });
       }

@@ -66,9 +66,14 @@ export const teamApi = {
   listMembers: (teamToken: string) => axios.get<TeamMember[]>(`/api/teams/${teamToken}/members`),
   addMember: (teamToken: string, userId: string, role: string) =>
     axios.post(`/api/teams/${teamToken}/members`, { user_id: userId, role }),
+  // 自分の userId を渡すとチームから退出する（最後の owner は 409）
   removeMember: (teamToken: string, userId: string) =>
     axios.delete(`/api/teams/${teamToken}/members/${userId}`),
-  join: (teamToken: string) => axios.post(`/api/teams/${teamToken}/join`),
+  // status: 'approved' | 'already_member' | 'pending'。保留中の申請が既にあれば 409。
+  join: (teamToken: string) =>
+    axios.post<{ status: 'approved' | 'already_member' | 'pending'; role?: string; request_id?: string }>(
+      `/api/teams/${teamToken}/join`
+    ),
   listJoinRequests: (teamToken: string) =>
     axios.get<JoinRequest[]>(`/api/teams/${teamToken}/join-requests`),
   reviewJoinRequest: (teamToken: string, requestId: string, action: 'approve' | 'reject') =>
@@ -78,6 +83,20 @@ export const teamApi = {
 };
 
 export const TEAM_ROLE_RANK: Record<string, number> = { owner: 3, admin: 2, member: 1 };
+
+export const TEAM_ROLES = ['owner', 'admin', 'member'] as const;
+
+// team-service の canGrantRole と同じ規則: 自分より弱いロールだけ付与できる。
+// 例外として owner は owner を付与できる（オーナー権限の移譲・共同オーナー化）。
+export const canGrantTeamRole = (myRole: string, role: string): boolean => {
+  if (myRole === 'owner' && role === 'owner') return true;
+  return (TEAM_ROLE_RANK[role] ?? 0) < (TEAM_ROLE_RANK[myRole] ?? 0);
+};
+
+// 自分より弱いロールのメンバーだけ、ロール変更・削除できる。
+export const canManageTeamMember = (myRole: string, targetRole: string): boolean =>
+  (TEAM_ROLE_RANK[myRole] ?? 0) >= TEAM_ROLE_RANK.admin &&
+  (TEAM_ROLE_RANK[targetRole] ?? 0) < (TEAM_ROLE_RANK[myRole] ?? 0);
 
 // ------------------------------------------------------------------
 // コンテンツ (動画 / ゲーム / 静的サイト) — チーム共有コンテンツ管理用

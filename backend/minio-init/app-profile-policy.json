@@ -4,21 +4,19 @@
         {
             "Effect": "Allow",
             "Action": [
-                "s3:GetObject",
-                "s3:DeleteObject"
+                "s3:ListAllMyBuckets",
+                "s3:GetBucketLocation"
             ],
-            "Resource": [
-                "arn:aws:s3:::raw-files/*"
-            ]
+            "Resource": "arn:aws:s3:::*"
         },
         {
             "Effect": "Allow",
             "Action": [
-                "s3:PutObject"
+                "s3:*"
             ],
             "Resource": [
-                "arn:aws:s3:::clean-files/*",
-                "arn:aws:s3:::quarantine/*"
+                "arn:aws:s3:::user-profiles",
+                "arn:aws:s3:::user-profiles/*"
             ]
         }
     ]

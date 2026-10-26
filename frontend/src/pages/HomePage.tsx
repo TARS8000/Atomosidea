@@ -59,7 +59,12 @@ const HomePage = () => {
         const uploaderIds = [...new Set(combinedContents.map(c => c.uploader_id || c.user_id).filter(id => id != null && id !== 0))];
 
         if (uploaderIds.length > 0) {
-          const profiles = await Promise.all(uploaderIds.map(id => axios.get(`/api/profile/${id}`).then(res => ({ id, ...res.data }))));
+          // プロフィールが無い投稿者がいても一覧全体を失敗させない（該当者は 'Unknown' 表示）
+          const profiles = await Promise.all(uploaderIds.map(id =>
+            axios.get(`/api/profile/${id}`)
+              .then(res => ({ id, ...res.data }))
+              .catch(() => ({ id }))
+          ));
           const profileMap = new Map(profiles.map(p => [p.id, p]));
 
           const enrich = (content: Content) => ({

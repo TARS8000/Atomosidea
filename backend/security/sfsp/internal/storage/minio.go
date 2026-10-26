@@ -2,7 +2,9 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"time"
 
@@ -74,6 +76,29 @@ func UploadFile(ctx context.Context, bucketName, objectName, filePath, contentTy
 	info, err := client.FPutObject(ctx, bucketName, objectName, filePath, minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
 		return minio.UploadInfo{}, fmt.Errorf("failed to upload file to MinIO: %w", err)
+	}
+	return info, nil
+}
+
+// streamPartSize bounds the memory used by PutObject when the size is unknown (-1).
+// Without it minio-go picks a part size of ~576 MiB for unknown-length uploads.
+const streamPartSize = 16 * 1024 * 1024
+
+// UploadStream streams r to MinIO without buffering the whole object.
+// Pass size = -1 when the length is unknown (memory use is bounded by streamPartSize).
+func UploadStream(ctx context.Context, bucketName, objectName string, r io.Reader, size int64, contentType string) (minio.UploadInfo, error) {
+	client := CleanMinIOClient
+	if bucketName == rawBucketName {
+		client = RawMinIOClient
+	}
+
+	opts := minio.PutObjectOptions{ContentType: contentType}
+	if size < 0 {
+		opts.PartSize = streamPartSize
+	}
+	info, err := client.PutObject(ctx, bucketName, objectName, r, size, opts)
+	if err != nil {
+		return minio.UploadInfo{}, fmt.Errorf("failed to stream object to MinIO: %w", err)
 	}
 	return info, nil
 }
@@ -172,4 +197,13 @@ func DeleteObject(ctx context.Context, bucketName, objectName string) error {
 		return fmt.Errorf("failed to delete object %s from bucket %s: %w", objectName, bucketName, err)
 	}
 	return nil
+}
+
+// IsNotFound reports whether err is a MinIO "object/bucket does not exist" error.
+func IsNotFound(err error) bool {
+	var resp minio.ErrorResponse
+	if errors.As(err, &resp) {
+		return resp.Code == "NoSuchKey" || resp.Code == "NoSuchBucket" || resp.StatusCode == 404
+	}
+	return false
 }

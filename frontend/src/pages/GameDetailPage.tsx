@@ -64,7 +64,7 @@ const GameDetailPage = () => {
             console.error("uploaderId is null or undefined in the game response data.");
           }
           clearInterval(pollingInterval);
-        } else if (fetchedGame.status === 'rejected' || fetchedGame.status === 'error' || fetchedGame.status === 'invalid') {
+        } else if (['rejected', 'error', 'invalid', 'failed', 'quarantined'].includes(fetchedGame.status)) {
           setError(`ゲームの処理中にエラーが発生しました: ${fetchedGame.status}`);
           clearInterval(pollingInterval);
         }
@@ -79,7 +79,7 @@ const GameDetailPage = () => {
 
     fetchGameStatus();
 
-    if (currentStatus !== 'public' && currentStatus !== 'rejected' && currentStatus !== 'error' && currentStatus !== 'invalid') {
+    if (!['public', 'rejected', 'error', 'invalid', 'failed', 'quarantined'].includes(currentStatus)) {
       pollingInterval = setInterval(fetchGameStatus, 5000);
     }
 

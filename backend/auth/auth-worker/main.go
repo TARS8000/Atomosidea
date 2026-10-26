@@ -3,15 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,19 +39,49 @@ var (
 	minioClientProfile    *minio.Client
 	minioClientGame       *minio.Client
 	minioClientStaticSite *minio.Client
+	minioClientVideo      *minio.Client // nil when VIDEO_MINIO_* credentials are not configured
 	jwtSecret             []byte
 	googleOauthConfig     *oauth2.Config
 	appURL                string
 	adminRegistrationCode string
+	internalAPIKey        string
+	profileServiceURL     string
+	teamServiceURL        string
+	cookieSecure          bool
 	profileBucketName     string = "user-profiles"
 	gameBucketName        string = "games"
 	staticSiteBucketName  string = "static-sites"
-	videoStoragePath      string
-	thumbnailDir          string
+	videoBucketName       string = "videos"
+
+	// internalHTTPClient is used for service-to-service calls (profile-service, team-service, Google).
+	internalHTTPClient = &http.Client{Timeout: 15 * time.Second}
 )
 
 const oauthStateCookieName = "oauthstate"
-const adminEmail = "admin@internal.local"
+const oauthStateCookiePath = "/api/auth/google"
+const oauthStateMaxAge = 10 * 60 // seconds
+const oauthCodeKeyPrefix = "oauth_code:"
+const oauthCodeTTL = 60 * time.Second
+const minAdminPasswordLength = 8
+
+// errAccountDisabled is returned when the user exists but its status does not allow login.
+var errAccountDisabled = errors.New("account is disabled")
+
+// isLoginAllowedStatus reports whether a users.status value may log in / use a token.
+// Values in auth-db: 'active' / 'pending' / 'deleted_data'. Only 'deleted_data' (and any
+// unknown value) is rejected; 'pending' is kept for rows created by older versions.
+func isLoginAllowedStatus(status string) bool {
+	return status == "active" || status == "pending"
+}
+
+// randomURLToken returns n random bytes encoded as base64url (no padding).
+func randomURLToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
 
 // User 構造体（ID を uuid.UUID に設定）
 type User struct {
@@ -71,26 +104,32 @@ func authMiddleware() gin.HandlerFunc {
 		}
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
-		// Check if the token is in the blocklist (Fail-Closed)
-		exists, err := redisClient.Exists(c.Request.Context(), fmt.Sprintf("blocklist:%s", tokenString)).Result()
-		if err != nil {
-			log.Printf("Redis error checking blocklist: %v", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify token"})
-			return
-		}
-		if exists > 0 {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token has been invalidated"})
-			return
-		}
-
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			return jwtSecret, nil
-		})
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			return
 		}
 		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			// Check if the token is in the blocklist (Fail-Closed)
+			// logoutHandler は "blocklist:<jti>" で登録するため、同じキーで照合する
+			jti, _ := claims["jti"].(string)
+			if jti == "" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+				return
+			}
+			exists, err := redisClient.Exists(c.Request.Context(), fmt.Sprintf("blocklist:%s", jti)).Result()
+			if err != nil {
+				log.Printf("Redis error checking blocklist: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify token"})
+				return
+			}
+			if exists > 0 {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token has been invalidated"})
+				return
+			}
+
 			// JWTからのID取得を文字列（UUID形式）として処理
 			var userIDStr string
 			if idStr, ok := claims["sub"].(string); ok {
@@ -107,6 +146,23 @@ func authMiddleware() gin.HandlerFunc {
 			parsedUUID, err := uuid.Parse(userIDStr)
 			if err != nil {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid UUID format in token"})
+				return
+			}
+
+			// Reject tokens of deleted / disabled accounts (fail-closed on DB errors)
+			var status string
+			err = dbAuth.QueryRow(c.Request.Context(), "SELECT status FROM users WHERE id = $1", parsedUUID).Scan(&status)
+			if err == pgx.ErrNoRows {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+				return
+			}
+			if err != nil {
+				log.Printf("Database error checking user status: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify token"})
+				return
+			}
+			if !isLoginAllowedStatus(status) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Account is disabled"})
 				return
 			}
 
@@ -133,11 +189,32 @@ func main() {
 	appURL = os.Getenv("APP_URL")
 	adminRegistrationCode = os.Getenv("ADMIN_REGISTRATION_CODE")
 	redisAddr := os.Getenv("REDIS_ADDR")
-	thumbnailDir = os.Getenv("THUMBNAIL_DIR")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	redisDB := 0
+	if v := os.Getenv("REDIS_DB"); v != "" {
+		if n, convErr := strconv.Atoi(v); convErr == nil {
+			redisDB = n
+		} else {
+			log.Printf("WARNING: invalid REDIS_DB %q, using 0", v)
+		}
+	}
+	internalAPIKey = os.Getenv("INTERNAL_API_KEY")
+	if internalAPIKey == "" {
+		log.Println("WARNING: INTERNAL_API_KEY is not set; internal calls to profile-service / team-service will be rejected.")
+	}
+	profileServiceURL = strings.TrimRight(os.Getenv("PROFILE_SERVICE_URL"), "/")
+	if profileServiceURL == "" {
+		profileServiceURL = "http://profile-service:8084"
+	}
+	teamServiceURL = strings.TrimRight(os.Getenv("TEAM_SERVICE_URL"), "/")
+	if teamServiceURL == "" {
+		teamServiceURL = "http://team-service:8080"
+	}
+	cookieSecure = strings.HasPrefix(strings.ToLower(appURL), "https://")
 
 	// Initialize Redis client
 	for i := 0; i < 5; i++ {
-		redisClient = redis.NewClient(&redis.Options{Addr: redisAddr})
+		redisClient = redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPassword, DB: redisDB})
 		_, err = redisClient.Ping(context.Background()).Result()
 		if err == nil {
 			break
@@ -160,8 +237,13 @@ func main() {
 	staticSiteMinioEndpoint := os.Getenv("STATIC_SITE_MINIO_ENDPOINT")
 	staticSiteMinioAccessKey := os.Getenv("STATIC_SITE_MINIO_ACCESS_KEY_ID")
 	staticSiteMinioSecretKey := os.Getenv("STATIC_SITE_MINIO_SECRET_ACCESS_KEY")
+	videoMinioEndpoint := os.Getenv("VIDEO_MINIO_ENDPOINT")
+	if videoMinioEndpoint == "" {
+		videoMinioEndpoint = minioEndpoint
+	}
+	videoMinioAccessKey := os.Getenv("VIDEO_MINIO_ACCESS_KEY_ID")
+	videoMinioSecretKey := os.Getenv("VIDEO_MINIO_SECRET_ACCESS_KEY")
 	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
-	videoStoragePath = os.Getenv("VIDEO_STORAGE_PATH")
 
 	// Initialize auth-db
 	for i := 0; i < 5; i++ {
@@ -226,6 +308,19 @@ func main() {
 		log.Fatalf("Unable to connect to static site MinIO: %v", err)
 	}
 
+	// Initialize MinIO client for video assets (HLS + thumbnails), used on account deletion
+	if videoMinioAccessKey != "" && videoMinioSecretKey != "" && videoMinioEndpoint != "" {
+		minioClientVideo, err = minio.New(videoMinioEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(videoMinioAccessKey, videoMinioSecretKey, ""),
+			Secure: minioUseSSL,
+		})
+		if err != nil {
+			log.Fatalf("Unable to connect to video MinIO: %v", err)
+		}
+	} else {
+		log.Println("WARNING: VIDEO_MINIO_ACCESS_KEY_ID / VIDEO_MINIO_SECRET_ACCESS_KEY not set; video objects will not be deleted on account deletion.")
+	}
+
 	r := gin.Default()
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{appURL}
@@ -238,6 +333,7 @@ func main() {
 		authRoutes.POST("/register", registerHandler)
 		authRoutes.POST("/login", loginHandler)
 		authRoutes.POST("/logout", authMiddleware(), logoutHandler)
+		authRoutes.POST("/oauth/exchange", oauthExchangeHandler)
 
 		googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
 		googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
@@ -329,34 +425,35 @@ func registerHandler(c *gin.Context) {
 	}
 
 	// ローカルアカウント登録は管理者コードを入力した場合（管理者アカウント）のみ許可
-	if adminRegistrationCode == "" || req.AdminCode != adminRegistrationCode {
-		log.Printf("DEBUG: Restricted registration attempt. Code received: '%s'", req.AdminCode)
+	// (入力されたコードはログに残さない)
+	if adminRegistrationCode == "" || subtle.ConstantTimeCompare([]byte(req.AdminCode), []byte(adminRegistrationCode)) != 1 {
+		log.Printf("WARN: Rejected admin registration attempt with invalid admin code")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid Admin Code."})
 		return
 	}
 
-	// 既に管理者（adminEmail: "admin@internal.local"）が存在するかチェック
-	var existingAdminID uuid.UUID
-	err := dbAuth.QueryRow(context.Background(), "SELECT id FROM users WHERE email = $1 AND provider = 'local'", adminEmail).Scan(&existingAdminID)
+	// メールアドレス・パスワードは必須（既定のパスワードは使わない）
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	password := req.Password
+	if !strings.Contains(email, "@") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A valid email is required."})
+		return
+	}
+	if len(password) < minAdminPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Password must be at least %d characters.", minAdminPasswordLength)})
+		return
+	}
+
+	var existingID uuid.UUID
+	err := dbAuth.QueryRow(context.Background(), "SELECT id FROM users WHERE email = $1 AND provider = 'local'", email).Scan(&existingID)
 	if err == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "Admin account already exists.", "userID": existingAdminID.String()})
+		c.JSON(http.StatusConflict, gin.H{"error": "An account with this email already exists."})
 		return
 	}
 	if err != pgx.ErrNoRows {
-		log.Printf("Database error while checking for admin: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while checking for admin."})
+		log.Printf("Database error while checking for existing account: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while checking for existing account."})
 		return
-	}
-
-	// メールアドレス・パスワードが送られてこない場合はデフォルト値を補填
-	email := req.Email
-	if email == "" {
-		email = adminEmail
-	}
-
-	password := req.Password
-	if password == "" {
-		password = "AdminPassword123!"
 	}
 
 	// パスワードのハッシュ化
@@ -374,7 +471,8 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	username := "admin"
+	// ユーザー名はメールアドレスのローカル部（プロフィール画面で変更可能）
+	username := strings.SplitN(email, "@", 2)[0]
 
 	var userID uuid.UUID
 	err = dbAuth.QueryRow(context.Background(),
@@ -387,29 +485,10 @@ func registerHandler(c *gin.Context) {
 	}
 
 	// profile-service へ管理者の初期プロフィール作成を同期で要求する（失敗時はログ出力）
-	profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
-	if profileServiceURL == "" {
-		profileServiceURL = "http://profile-service:8084"
-	}
-	payload, _ := json.Marshal(map[string]string{
-		"user_id":  userID.String(),
-		"username": username,
-	})
-	profileResp, profileErr := http.Post(
-		fmt.Sprintf("%s/api/profile/internal/create", profileServiceURL),
-		"application/json",
-		bytes.NewBuffer(payload),
-	)
-	if profileErr != nil {
-		log.Printf("ERROR: Failed to call profile-service creation endpoint: %v", profileErr)
+	if err := createProfile(c.Request.Context(), userID.String(), username); err != nil {
+		log.Printf("ERROR: Failed to create profile for admin %s: %v", userID.String(), err)
 	} else {
-		defer profileResp.Body.Close()
-		if profileResp.StatusCode != http.StatusOK && profileResp.StatusCode != http.StatusCreated {
-			body, _ := io.ReadAll(profileResp.Body)
-			log.Printf("ERROR: profile-service creation endpoint returned status %d: %s", profileResp.StatusCode, string(body))
-		} else {
-			log.Printf("INFO: Profile created for admin %s", userID.String())
-		}
+		log.Printf("INFO: Profile created for admin %s", userID.String())
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"message": "Admin user created successfully", "userID": userID.String()})
@@ -426,8 +505,11 @@ func loginHandler(c *gin.Context) {
 	}
 
 	var user User
+	var status string
+	var passwordHash sql.NullString
 	err := dbAuth.QueryRow(context.Background(),
-		"SELECT id, username, email, password_hash, is_admin FROM users WHERE email = $1 AND provider = 'local'", req.Email).Scan(&user.ID, &user.Username, &user.Email, &user.PasswordHash, &user.IsAdmin)
+		"SELECT id, username, email, password_hash, is_admin, status FROM users WHERE email = $1 AND provider = 'local'", req.Email).Scan(&user.ID, &user.Username, &user.Email, &passwordHash, &user.IsAdmin, &status)
+	user.PasswordHash = passwordHash.String
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -438,8 +520,14 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+	if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	// 削除済み・無効なアカウントはログインさせない（パスワード照合後に判定し、存在の有無を漏らさない）
+	if !isLoginAllowedStatus(status) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Account is disabled"})
 		return
 	}
 
@@ -452,36 +540,57 @@ func loginHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
+// googleUserInfo is the subset of https://www.googleapis.com/oauth2/v2/userinfo we use.
+type googleUserInfo struct {
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	VerifiedEmail *bool  `json:"verified_email"`
+	Name          string `json:"name"` // Google アカウントの設定名 (氏名)
+}
+
+func setOAuthStateCookie(c *gin.Context, value string, maxAge int) {
+	// Domain は指定しない（host-only Cookie）。Google からのトップレベル GET で送られるよう SameSite=Lax。
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    value,
+		Path:     oauthStateCookiePath,
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 func googleCallbackHandler(c *gin.Context) {
 	oauthState, _ := c.Cookie(oauthStateCookieName)
-	if c.Query("state") != oauthState {
-		log.Println("DEBUG: OAuth state mismatch")
+	// state は一度きり: 照合の成否にかかわらず Cookie を削除する
+	setOAuthStateCookie(c, "", -1)
+
+	queryState := c.Query("state")
+	if oauthState == "" || queryState == "" || subtle.ConstantTimeCompare([]byte(queryState), []byte(oauthState)) != 1 {
+		log.Println("WARN: OAuth state mismatch or missing")
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=state_mismatch")
 		return
 	}
 
-	data, err := getGoogleUserData(c.Query("code"))
-	if err != nil {
-		log.Printf("DEBUG: Failed to get Google user data: %v", err)
+	code := c.Query("code")
+	if code == "" {
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=google_error")
 		return
 	}
 
-	var googleUser struct {
-		ID    string `json:"id"`
-		Email string `json:"email"`
-		Name  string `json:"name"` // Google アカウントの設定名 (氏名)
-	}
-	if err := json.Unmarshal(data, &googleUser); err != nil {
-		log.Printf("DEBUG: Failed to unmarshal Google user data: %v", err)
-		c.Redirect(http.StatusTemporaryRedirect, "/login?error=json_error")
+	googleUser, err := getGoogleUserData(c.Request.Context(), code)
+	if err != nil {
+		log.Printf("WARN: Failed to get Google user data: %v", err)
+		c.Redirect(http.StatusTemporaryRedirect, "/login?error=google_error")
 		return
 	}
-	log.Printf("DEBUG: Google user data - ID: %s, Email: %s, Name: %s", googleUser.ID, googleUser.Email, googleUser.Name)
+	log.Printf("DEBUG: Google user data received - ID: %s", googleUser.ID)
 
 	var user User
+	var status string
 	err = dbAuth.QueryRow(context.Background(),
-		"SELECT id, username, is_admin FROM users WHERE provider = 'google' AND provider_id = $1", googleUser.ID).Scan(&user.ID, &user.Username, &user.IsAdmin)
+		"SELECT id, username, is_admin, status FROM users WHERE provider = 'google' AND provider_id = $1", googleUser.ID).Scan(&user.ID, &user.Username, &user.IsAdmin, &status)
 
 	if err == pgx.ErrNoRows {
 		log.Printf("DEBUG: User not found in DB, attempting to create new user for Google ID: %s", googleUser.ID)
@@ -494,7 +603,11 @@ func googleCallbackHandler(c *gin.Context) {
 			return
 		}
 
-		defaultUsername := fmt.Sprintf("user_%s", googleUser.ID[:8])
+		idPrefix := googleUser.ID
+		if len(idPrefix) > 8 {
+			idPrefix = idPrefix[:8]
+		}
+		defaultUsername := fmt.Sprintf("user_%s", idPrefix)
 		// google_name カラムに Googleの Name を INSERT
 		err = dbAuth.QueryRow(context.Background(),
 			"INSERT INTO users (id, email, provider, provider_id, username, google_name, status) VALUES ($1, $2, 'google', $3, $4, $5, 'active') RETURNING id, username, is_admin",
@@ -505,36 +618,17 @@ func googleCallbackHandler(c *gin.Context) {
 			c.Redirect(http.StatusTemporaryRedirect, "/login?error=creation_failed")
 			return
 		}
-		log.Printf("DEBUG: New Google user created with ID: %s, Username: %s, GoogleName: %s", user.ID.String(), user.Username.String, googleUser.Name)
+		log.Printf("DEBUG: New Google user created with ID: %s, Username: %s", user.ID.String(), user.Username.String)
 
 		// profile-service へ初期プロフィールの自動作成リクエストを送信
 		go func(userIDStr, username string) {
-			profileServiceURL := os.Getenv("PROFILE_SERVICE_URL")
-			if profileServiceURL == "" {
-				profileServiceURL = "http://profile-service:8084" // Docker Compose内のデフォルト
-			}
-
-			payload, _ := json.Marshal(map[string]string{
-				"user_id":  userIDStr,
-				"username": username,
-			})
-
-			resp, err := http.Post(
-				fmt.Sprintf("%s/api/profile/internal/create", profileServiceURL),
-				"application/json",
-				bytes.NewBuffer(payload),
-			)
-			if err != nil {
-				log.Printf("ERROR: Failed to call profile-service creation endpoint: %v", err)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := createProfile(ctx, userIDStr, username); err != nil {
+				log.Printf("ERROR: Failed to create profile for user %s: %v", userIDStr, err)
 				return
 			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-				log.Printf("WARNING: profile-service returned status code: %d", resp.StatusCode)
-			} else {
-				log.Printf("DEBUG: Successfully triggered profile creation for user %s", userIDStr)
-			}
+			log.Printf("DEBUG: Successfully triggered profile creation for user %s", userIDStr)
 		}(user.ID.String(), user.Username.String)
 
 	} else if err != nil {
@@ -542,10 +636,15 @@ func googleCallbackHandler(c *gin.Context) {
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=db_error")
 		return
 	} else {
+		if !isLoginAllowedStatus(status) {
+			log.Printf("WARN: Rejected Google login for disabled account %s (status=%s)", user.ID.String(), status)
+			c.Redirect(http.StatusTemporaryRedirect, "/login?error=account_disabled")
+			return
+		}
 		log.Printf("DEBUG: Existing Google user found with ID: %s, Username: %s", user.ID.String(), user.Username.String)
 		// 既存ユーザーの Google 名が変更されている可能性を考慮し更新
 		_, updateErr := dbAuth.Exec(context.Background(),
-			"UPDATE users SET google_name = $1, updated_at = NOW() WHERE id = $2", googleUser.Name, user.ID)
+			"UPDATE users SET google_name = $1 WHERE id = $2", googleUser.Name, user.ID)
 		if updateErr != nil {
 			log.Printf("WARNING: Failed to update google_name for user %s: %v", user.ID.String(), updateErr)
 		}
@@ -557,18 +656,132 @@ func googleCallbackHandler(c *gin.Context) {
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=jwt_failed")
 		return
 	}
-	log.Printf("DEBUG: JWT generated for user %s", user.ID.String())
 
-	// クエリパラメータで Google から取得した名前を返却・開示する（URLエンコード付き）
-	redirectURL := fmt.Sprintf("/login/success?token=%s&google_name=%s", token, url.QueryEscape(googleUser.Name))
-	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
+	// JWT を URL に載せず、60 秒・1 回限りのコードを Redis に保存してコードだけを渡す。
+	// フロントエンドは POST /api/auth/oauth/exchange でトークンに交換する。
+	oneTimeCode, err := randomURLToken(32)
+	if err != nil {
+		log.Printf("ERROR: Failed to generate one-time code: %v", err)
+		c.Redirect(http.StatusTemporaryRedirect, "/login?error=jwt_failed")
+		return
+	}
+	if err := redisClient.Set(c.Request.Context(), oauthCodeKeyPrefix+oneTimeCode, token, oauthCodeTTL).Err(); err != nil {
+		log.Printf("ERROR: Failed to store one-time code: %v", err)
+		c.Redirect(http.StatusTemporaryRedirect, "/login?error=jwt_failed")
+		return
+	}
+	log.Printf("DEBUG: One-time login code issued for user %s", user.ID.String())
+
+	c.Redirect(http.StatusTemporaryRedirect, "/login/success?code="+oneTimeCode)
+}
+
+// oauthExchangeHandler: POST /api/auth/oauth/exchange {"code"} → 200 {"token"}
+// コードは GETDEL で取り出すため 1 回しか使えない。
+func oauthExchangeHandler(c *gin.Context) {
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Code == "" || len(req.Code) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
+		return
+	}
+
+	token, err := redisClient.GetDel(c.Request.Context(), oauthCodeKeyPrefix+req.Code).Result()
+	if err == redis.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired code"})
+		return
+	}
+	if err != nil {
+		log.Printf("Redis error exchanging one-time code: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to exchange code"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
 func googleLoginHandler(c *gin.Context) {
-	state := uuid.New().String()
-	c.SetCookie(oauthStateCookieName, state, 3600, "/", "localhost", false, true)
-	url := googleOauthConfig.AuthCodeURL(state)
-	c.Redirect(http.StatusTemporaryRedirect, url)
+	state, err := randomURLToken(32)
+	if err != nil {
+		log.Printf("ERROR: Failed to generate OAuth state: %v", err)
+		c.Redirect(http.StatusTemporaryRedirect, "/login?error=google_error")
+		return
+	}
+	setOAuthStateCookie(c, state, oauthStateMaxAge)
+	c.Redirect(http.StatusTemporaryRedirect, googleOauthConfig.AuthCodeURL(state))
+}
+
+// callInternal sends a request to another internal service with X-Internal-Key.
+// Non-2xx responses are returned as errors.
+func callInternal(ctx context.Context, method, url string, body []byte) error {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if internalAPIKey != "" {
+		req.Header.Set("X-Internal-Key", internalAPIKey)
+	}
+	resp, err := internalHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("%s %s returned status %d: %s", method, url, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// createProfile asks profile-service to create the initial profile row (body format unchanged).
+func createProfile(ctx context.Context, userID, username string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":  userID,
+		"username": username,
+	})
+	return callInternal(ctx, http.MethodPost, profileServiceURL+"/internal/create", payload)
+}
+
+// removeObjectsWithPrefix deletes every object under prefix in bucket.
+func removeObjectsWithPrefix(ctx context.Context, client *minio.Client, bucket, prefix string) error {
+	var firstErr error
+	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			if firstErr == nil {
+				firstErr = object.Err
+			}
+			continue
+		}
+		if err := client.RemoveObject(ctx, bucket, object.Key, minio.RemoveObjectOptions{}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// queryIDs returns the id column of rows matching query (args...).
+func queryIDs(ctx context.Context, query string, args ...interface{}) ([]string, error) {
+	rows, err := dbApp.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func deleteAccountHandler(c *gin.Context) {
@@ -584,153 +797,157 @@ func deleteAccountHandler(c *gin.Context) {
 		return
 	}
 
+	// クライアントが切断しても後始末を途中で止めないよう、リクエストとは独立したコンテキストを使う
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	var provider string
-	var iconURL, backgroundURL sql.NullString
-	err = dbAuth.QueryRow(context.Background(), "SELECT provider, icon_url, background_image_url FROM users WHERE id = $1", userID).Scan(&provider, &iconURL, &backgroundURL)
+	err = dbAuth.QueryRow(ctx, "SELECT provider FROM users WHERE id = $1", userID).Scan(&provider)
 	if err != nil {
-		log.Printf("Error getting user provider/profile for deletion: %v", err)
+		log.Printf("Error getting user provider for deletion: %v", err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
-	// --- Delete profile assets from MinIO (profile-storage) ---
-	if iconURL.Valid && iconURL.String != "" {
-		objectName := strings.TrimPrefix(iconURL.String, "/user-profiles/")
-		if err := minioClientProfile.RemoveObject(context.Background(), profileBucketName, objectName, minio.RemoveObjectOptions{}); err != nil {
-			log.Printf("Warning: Failed to delete icon %s from MinIO: %v", objectName, err)
-		}
+	// 失敗した後始末の項目（レスポンスの cleanupErrors に入れる。詳細はログのみ）
+	cleanupErrors := []string{}
+	fail := func(step string, err error) {
+		log.Printf("Warning: account deletion step %q failed for user %s: %v", step, userID, err)
+		cleanupErrors = append(cleanupErrors, step)
 	}
-	if backgroundURL.Valid && backgroundURL.String != "" {
-		objectName := strings.TrimPrefix(backgroundURL.String, "/user-profiles/")
-		if err := minioClientProfile.RemoveObject(context.Background(), profileBucketName, objectName, minio.RemoveObjectOptions{}); err != nil {
-			log.Printf("Warning: Failed to delete background %s from MinIO: %v", objectName, err)
+
+	// --- profile-db (profile-service) ---
+	if err := callInternal(ctx, http.MethodDelete, fmt.Sprintf("%s/internal/users/%s", profileServiceURL, userID), nil); err != nil {
+		fail("profile-service", err)
+	}
+
+	// --- team-db (team-service) ---
+	if err := callInternal(ctx, http.MethodDelete, fmt.Sprintf("%s/internal/users/%s", teamServiceURL, userID), nil); err != nil {
+		fail("team-service", err)
+	}
+
+	// --- Profile images in MinIO (keys: icons/<userId>-<uuid>.<ext>, backgrounds/<userId>-<uuid>.<ext>) ---
+	for _, prefix := range []string{"icons/" + userID.String() + "-", "backgrounds/" + userID.String() + "-"} {
+		if err := removeObjectsWithPrefix(ctx, minioClientProfile, profileBucketName, prefix); err != nil {
+			fail("profile-images", err)
+			break
 		}
 	}
 
-	// --- Delete game assets and records from MinIO (game-storage) and app-db ---
-	gameIDs := []string{}
-	rows, err := dbApp.Query(context.Background(), "SELECT id FROM games WHERE user_id = $1", userID)
+	// --- Games: MinIO games/<id>/ + thumbnails/<id>, then app-db rows ---
+	gameIDs, err := queryIDs(ctx, "SELECT id::text FROM games WHERE user_id = $1", userID)
 	if err != nil {
-		log.Printf("Warning: Failed to get game IDs for user %s: %v", userID, err)
-	} else {
-		for rows.Next() {
-			var gameID string
-			if err := rows.Scan(&gameID); err != nil {
-				log.Printf("Warning: Failed to scan game ID: %v", err)
-				continue
-			}
-			gameIDs = append(gameIDs, gameID)
-		}
-		rows.Close()
+		fail("games", err)
 	}
-
 	for _, gameID := range gameIDs {
-		objectPrefix := fmt.Sprintf("%s/", gameID)
-		objectsCh := minioClientGame.ListObjects(context.Background(), gameBucketName, minio.ListObjectsOptions{
-			Prefix:    objectPrefix,
-			Recursive: true,
-		})
-		for object := range objectsCh {
-			if object.Err != nil {
-				log.Printf("Warning: Error listing objects for game %s: %v", gameID, object.Err)
-				continue
-			}
-			if err := minioClientGame.RemoveObject(context.Background(), gameBucketName, object.Key, minio.RemoveObjectOptions{}); err != nil {
-				log.Printf("Warning: Failed to delete game object %s from MinIO: %v", object.Key, err)
-			}
+		if err := removeObjectsWithPrefix(ctx, minioClientGame, gameBucketName, gameID+"/"); err != nil {
+			fail("game:"+gameID, err)
 		}
-		if _, err := dbApp.Exec(context.Background(), "DELETE FROM games WHERE id = $1", gameID); err != nil {
-			log.Printf("Warning: Failed to delete game record %s from app-db: %v", gameID, err)
+		if err := minioClientGame.RemoveObject(ctx, gameBucketName, "thumbnails/"+gameID, minio.RemoveObjectOptions{}); err != nil {
+			fail("game-thumbnail:"+gameID, err)
+		}
+		if _, err := dbApp.Exec(ctx, "DELETE FROM games WHERE id = $1", gameID); err != nil {
+			fail("game-record:"+gameID, err)
 		}
 	}
 
-	// --- Delete static site assets and records from MinIO (static-site-storage) and app-db ---
-	staticSiteIDs := []string{}
-	rows, err = dbApp.Query(context.Background(), "SELECT id FROM static_sites WHERE user_id = $1", userID)
-	if err != nil {
-		log.Printf("Warning: Failed to get static site IDs for user %s: %v", userID, err)
+	// --- Static sites: MinIO static-sites/<id>/ + thumbnail (from thumbnail_url), then app-db rows ---
+	type siteRow struct {
+		id        string
+		thumbnail sql.NullString
+	}
+	sites := []siteRow{}
+	if rows, err := dbApp.Query(ctx, "SELECT id::text, thumbnail_url FROM static_sites WHERE user_id = $1", userID); err != nil {
+		fail("static-sites", err)
 	} else {
 		for rows.Next() {
-			var siteID string
-			if err := rows.Scan(&siteID); err != nil {
-				log.Printf("Warning: Failed to scan static site ID: %v", err)
-				continue
+			var s siteRow
+			if err := rows.Scan(&s.id, &s.thumbnail); err != nil {
+				fail("static-sites", err)
+				break
 			}
-			staticSiteIDs = append(staticSiteIDs, siteID)
+			sites = append(sites, s)
 		}
 		rows.Close()
 	}
-
-	for _, siteID := range staticSiteIDs {
-		objectPrefix := fmt.Sprintf("%s/", siteID)
-		objectsCh := minioClientStaticSite.ListObjects(context.Background(), staticSiteBucketName, minio.ListObjectsOptions{
-			Prefix:    objectPrefix,
-			Recursive: true,
-		})
-		for object := range objectsCh {
-			if object.Err != nil {
-				log.Printf("Warning: Error listing objects for static site %s: %v", siteID, object.Err)
-				continue
-			}
-			if err := minioClientStaticSite.RemoveObject(context.Background(), staticSiteBucketName, object.Key, minio.RemoveObjectOptions{}); err != nil {
-				log.Printf("Warning: Failed to delete static site object %s from MinIO: %v", object.Key, err)
+	for _, site := range sites {
+		if err := removeObjectsWithPrefix(ctx, minioClientStaticSite, staticSiteBucketName, site.id+"/"); err != nil {
+			fail("static-site:"+site.id, err)
+		}
+		// "/static-sites/thumbnails/xxxx.ext" → "thumbnails/xxxx.ext"
+		if site.thumbnail.Valid {
+			if obj, ok := strings.CutPrefix(site.thumbnail.String, "/static-sites/"); ok && strings.HasPrefix(obj, "thumbnails/") && !strings.Contains(obj, "..") {
+				if err := minioClientStaticSite.RemoveObject(ctx, staticSiteBucketName, obj, minio.RemoveObjectOptions{}); err != nil {
+					fail("static-site-thumbnail:"+site.id, err)
+				}
 			}
 		}
-		if _, err := dbApp.Exec(context.Background(), "DELETE FROM static_sites WHERE id = $1", siteID); err != nil {
-			log.Printf("Warning: Failed to delete static site record %s from app-db: %v", siteID, err)
+		if _, err := dbApp.Exec(ctx, "DELETE FROM static_sites WHERE id = $1", site.id); err != nil {
+			fail("static-site-record:"+site.id, err)
 		}
 	}
 
-	// --- Delete video assets and records from local storage and app-db ---
-	videoIDs := []string{}
-	rows, err = dbApp.Query(context.Background(), "SELECT id, filename FROM videos WHERE uploader_id = $1", userID)
+	// --- Videos: MinIO videos/<id>/ (HLS) + thumbnails/<id>, then app-db rows ---
+	videoIDs, err := queryIDs(ctx, "SELECT id::text FROM videos WHERE uploader_id = $1", userID)
 	if err != nil {
-		log.Printf("Warning: Failed to get video IDs for user %s: %v", userID, err)
-	} else {
-		for rows.Next() {
-			var videoID, filename string
-			if err := rows.Scan(&videoID, &filename); err != nil {
-				log.Printf("Warning: Failed to scan video ID/filename: %v", err)
-				continue
-			}
-			hlsPath := filepath.Join(videoStoragePath, videoID)
-			if err := os.RemoveAll(hlsPath); err != nil {
-				log.Printf("Warning: Failed to delete HLS directory %s: %v", hlsPath, err)
-			}
-			thumbnailFilename := fmt.Sprintf("%s.jpg", videoID)
-			thumbnailPath := filepath.Join(thumbnailDir, thumbnailFilename)
-			if err := os.Remove(thumbnailPath); err != nil {
-				log.Printf("Warning: Failed to delete thumbnail file %s: %v", thumbnailPath, err)
-			}
-			videoIDs = append(videoIDs, videoID)
-		}
-		rows.Close()
+		fail("videos", err)
 	}
-
 	for _, videoID := range videoIDs {
-		if _, err := dbApp.Exec(context.Background(), "DELETE FROM videos WHERE id = $1", videoID); err != nil {
-			log.Printf("Warning: Failed to delete video record %s from app-db: %v", videoID, err)
+		if minioClientVideo == nil {
+			fail("video:"+videoID, errors.New("video MinIO credentials are not configured"))
+		} else {
+			if err := removeObjectsWithPrefix(ctx, minioClientVideo, videoBucketName, videoID+"/"); err != nil {
+				fail("video:"+videoID, err)
+			}
+			if err := minioClientVideo.RemoveObject(ctx, videoBucketName, "thumbnails/"+videoID, minio.RemoveObjectOptions{}); err != nil {
+				fail("video-thumbnail:"+videoID, err)
+			}
+		}
+		if _, err := dbApp.Exec(ctx, "DELETE FROM videos WHERE id = $1", videoID); err != nil {
+			fail("video-record:"+videoID, err)
 		}
 	}
 
 	// --- Finally, delete user record from auth-db ---
 	if provider == "local" {
-		_, err = dbAuth.Exec(context.Background(), "DELETE FROM users WHERE id = $1", userID)
+		_, err = dbAuth.Exec(ctx, "DELETE FROM users WHERE id = $1", userID)
 		if err != nil {
 			log.Printf("Error deleting local user account from auth-db: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "アカウントの削除に失敗しました。"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "アカウントの削除に失敗しました。", "cleanupErrors": cleanupErrors})
 			return
 		}
 	} else {
-		_, err = dbAuth.Exec(context.Background(), "UPDATE users SET status = 'deleted_data', username = NULL, google_name = NULL, icon_url = NULL, background_image_url = NULL, bio = NULL WHERE id = $1", userID)
+		_, err = dbAuth.Exec(ctx, "UPDATE users SET status = 'deleted_data', username = NULL, google_name = NULL WHERE id = $1", userID)
 		if err != nil {
 			log.Printf("Error updating Google user status after data deletion: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "アカウントデータの削除に失敗しました。"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "アカウントデータの削除に失敗しました。", "cleanupErrors": cleanupErrors})
 			return
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "アカウントデータが正常に削除されました。"})
+	// 使用中のトークンも無効化する（他サービスもブロックリストを参照する）
+	if tokenString := c.GetString("tokenString"); tokenString != "" {
+		if token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{}); err == nil {
+			if claims, ok := token.Claims.(jwt.MapClaims); ok {
+				jti, _ := claims["jti"].(string)
+				exp, _ := claims["exp"].(float64)
+				if ttl := time.Until(time.Unix(int64(exp), 0)); jti != "" && ttl > 0 {
+					if err := redisClient.Set(ctx, fmt.Sprintf("blocklist:%s", jti), true, ttl).Err(); err != nil {
+						log.Printf("Warning: Failed to blocklist token after account deletion: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	if len(cleanupErrors) > 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message":       "アカウントは削除されましたが、一部のデータの削除に失敗しました。",
+			"cleanupErrors": cleanupErrors,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "アカウントデータが正常に削除されました。", "cleanupErrors": cleanupErrors})
 }
 
 func getUserProviderHandler(c *gin.Context) {
@@ -774,19 +991,42 @@ func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error
 	return token.SignedString(jwtSecret)
 }
 
-func getGoogleUserData(code string) ([]byte, error) {
-	token, err := googleOauthConfig.Exchange(context.Background(), code)
+func getGoogleUserData(parent context.Context, code string) (*googleUserInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, internalHTTPClient)
+
+	token, err := googleOauthConfig.Exchange(ctx, code)
 	if err != nil {
-		return nil, fmt.Errorf("code exchange wrong: %s", err.Error())
+		return nil, fmt.Errorf("code exchange failed: %w", err)
 	}
-	response, err := http.Get("https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + token.AccessToken)
+
+	// アクセストークンは URL ではなく Authorization ヘッダーで送る
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v2/userinfo", nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed getting user info: %s", err.Error())
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	response, err := internalHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed getting user info: %w", err)
 	}
 	defer response.Body.Close()
-	contents, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed read user info: %s", err.Error())
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("userinfo returned status %d", response.StatusCode)
 	}
-	return contents, nil
+
+	var info googleUserInfo
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&info); err != nil {
+		return nil, fmt.Errorf("failed to decode user info: %w", err)
+	}
+	info.ID = strings.TrimSpace(info.ID)
+	info.Email = strings.TrimSpace(info.Email)
+	if info.ID == "" || info.Email == "" {
+		return nil, errors.New("user info is missing id or email")
+	}
+	if info.VerifiedEmail != nil && !*info.VerifiedEmail {
+		return nil, errors.New("google email is not verified")
+	}
+	return &info, nil
 }

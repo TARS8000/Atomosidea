@@ -17,6 +17,8 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
 const RegisterPage = () => {
   const [adminCode, setAdminCode] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const navigate = useNavigate();
@@ -30,8 +32,8 @@ const RegisterPage = () => {
     setError('');
     setSuccess('');
     try {
-      await axios.post('/api/auth/register', { adminCode });
-      setSuccess('管理者アカウントの登録リクエストが成功しました。ログインページにリダイレクトします...');
+      await axios.post('/api/auth/register', { email, password, adminCode });
+      setSuccess('管理者アカウントを作成しました。ログインページにリダイレクトします...');
       setTimeout(() => navigate('/login'), 2000);
     } catch (err) {
       if (axios.isAxiosError(err) && err.response) {
@@ -74,10 +76,36 @@ const RegisterPage = () => {
                 margin="normal"
                 required
                 fullWidth
+                id="email"
+                label="メールアドレス"
+                name="email"
+                type="email"
+                autoComplete="email"
+                autoFocus
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+              <TextField
+                margin="normal"
+                required
+                fullWidth
+                id="password"
+                label="パスワード（8文字以上）"
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                inputProps={{ minLength: 8 }}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+              <TextField
+                margin="normal"
+                required
+                fullWidth
                 id="adminCode"
                 label="管理者コード"
                 name="adminCode"
-                autoFocus
+                type="password"
                 value={adminCode}
                 onChange={(e) => setAdminCode(e.target.value)}
               />

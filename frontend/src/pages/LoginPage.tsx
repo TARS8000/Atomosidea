@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -16,9 +16,21 @@ import {
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
+// Google ログインのコールバックから ?error=<code> で戻ってきたときの表示文言
+const oauthErrorMessages: Record<string, string> = {
+  account_disabled: 'このアカウントは削除済みのため、ログインできません。',
+  state_mismatch: 'ログイン処理の有効期限が切れたか、不正なリクエストです。もう一度お試しください。',
+  code_exchange_failed: 'ログイン処理の有効期限が切れました。もう一度お試しください。',
+};
+
 const LoginPage = () => {
+  const [searchParams] = useSearchParams();
+  const oauthError = searchParams.get('error');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const oauthErrorMessage = oauthError
+    ? oauthErrorMessages[oauthError] || 'Google ログインに失敗しました。'
+    : '';
   const [error, setError] = useState('');
   const navigate = useNavigate();
   const { login } = useAuth();
@@ -35,7 +47,11 @@ const LoginPage = () => {
       login(response.data.token);
       navigate('/mypage'); // Redirect to MyPage
     } catch (err) {
-      setError('管理者ログインに失敗しました。');
+      if (axios.isAxiosError(err) && err.response?.status === 403) {
+        setError('このアカウントは無効化されているため、ログインできません。');
+      } else {
+        setError('管理者ログインに失敗しました。');
+      }
     }
   };
 
@@ -45,6 +61,10 @@ const LoginPage = () => {
         <Typography variant="h4" component="h1" gutterBottom>
           ログイン
         </Typography>
+
+        {oauthErrorMessage && (
+          <Alert severity="error" sx={{ width: '100%', mt: 2 }}>{oauthErrorMessage}</Alert>
+        )}
 
         <Button
           fullWidth

@@ -163,3 +163,40 @@ func EnqueueScanCompletionEvent(ctx context.Context, e event.ScanCompletionEvent
 	)
 	return nil
 }
+
+// ProcessingQueueName returns the name of the list that holds messages taken from
+// queueName but not yet acknowledged.
+func ProcessingQueueName(queueName string) string {
+	return queueName + ":processing"
+}
+
+// DequeueReliable blocks until a message is available on queueName and atomically
+// moves it to the processing list (BRPOPLPUSH). Call Ack after the message has been
+// handled (successfully or with a terminal failure recorded in the DB). Messages that
+// were never acknowledged are returned to queueName by RecoverProcessing.
+// A timeout of 0 blocks indefinitely.
+func DequeueReliable(ctx context.Context, queueName string, timeout time.Duration) (string, error) {
+	return RedisClient.BRPopLPush(ctx, queueName, ProcessingQueueName(queueName), timeout).Result()
+}
+
+// Ack removes a message previously returned by DequeueReliable from the processing list.
+func Ack(ctx context.Context, queueName, payload string) error {
+	return RedisClient.LRem(ctx, ProcessingQueueName(queueName), 1, payload).Err()
+}
+
+// RecoverProcessing moves every unacknowledged message from the processing list back
+// to queueName. Call it once at startup, before the consumer loop starts. It assumes a
+// single consumer per queue (the current deployment).
+func RecoverProcessing(ctx context.Context, queueName string) (int, error) {
+	n := 0
+	for {
+		_, err := RedisClient.RPopLPush(ctx, ProcessingQueueName(queueName), queueName).Result()
+		if err == redis.Nil {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
+}

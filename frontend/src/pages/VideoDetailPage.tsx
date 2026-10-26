@@ -61,6 +61,9 @@ interface Uploader {
   username: string;
 }
 
+// これ以上変化しない状態（ポーリングを止める）。'failed' / 'invalid' はスキャン結果がそのまま入る。
+const TERMINAL_STATUSES = ['public', 'error', 'failed', 'invalid', 'rejected', 'quarantined'];
+
 const formatTime = (timeInSeconds: number) => {
   const minutes = Math.floor(timeInSeconds / 60);
   const seconds = Math.floor(timeInSeconds % 60);
@@ -120,7 +123,7 @@ const VideoDetailPage = () => {
         setVideo(videoRes.data);
         setCurrentStatus(videoRes.data.status);
 
-        if (['public', 'error', 'invalid'].includes(videoRes.data.status)) {
+        if (TERMINAL_STATUSES.includes(videoRes.data.status)) {
           setLoading(false);
           stopPolling();
         } else {
@@ -140,7 +143,12 @@ const VideoDetailPage = () => {
 
       } catch (err) {
         console.error('Failed to fetch video details:', err);
-        setError('詳細の読み込みに失敗しました。');
+        // 非公開・チーム限定で閲覧権限が無い動画も 404 になる
+        if (axios.isAxiosError(err) && err.response?.status === 404) {
+          setError('動画が見つからないか、閲覧する権限がありません。');
+        } else {
+          setError('詳細の読み込みに失敗しました。');
+        }
         setLoading(false);
         stopPolling();
       }
@@ -149,7 +157,7 @@ const VideoDetailPage = () => {
     fetchDetails();
 
     pollingInterval = window.setInterval(() => {
-      if (currentStatus !== 'public' && currentStatus !== 'error' && currentStatus !== 'invalid') {
+      if (!TERMINAL_STATUSES.includes(currentStatus)) {
         fetchDetails();
       }
     }, 5000);
@@ -310,7 +318,7 @@ const VideoDetailPage = () => {
 
   if (error) return <Container><Alert severity="error">{error}</Alert></Container>;
   if (!video) return <Container><Alert severity="warning">動画が見つかりません。</Alert></Container>;
-  if (video.status === 'error' || video.status === 'invalid' || video.status === 'rejected' || video.status === 'quarantined') {
+  if (video.status !== 'public' && TERMINAL_STATUSES.includes(video.status)) {
     return <Container><Alert severity="error">動画の処理に失敗しました: {video.processing_details || video.status}</Alert></Container>;
   }
 

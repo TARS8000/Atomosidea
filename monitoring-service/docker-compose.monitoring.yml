@@ -6,7 +6,8 @@ services:
     container_name: mon-nginx
     restart: always
     ports:
-      - "8090:80"
+      # 運用ダッシュボード（コンテナ再起動・MinIO 操作が可能）のため、Basic 認証に加えてホストのループバックのみに公開する
+      - "127.0.0.1:8090:80"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./frontend/dist:/var/www/html:ro # mon-frontendによって生成されるホストのdistディレクトリをマウント
@@ -21,6 +22,13 @@ services:
       context: ./backend
     container_name: mon-backend
     restart: always
+    # ログイン（HTTP Basic）。値はプロジェクトルートの .env（scripts/start.bat が --env-file で渡す）。
+    # 未設定だと mon-backend は全リクエストを拒否する（fail closed）
+    environment:
+      MONITOR_USERNAME: ${MONITOR_USERNAME:-}
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
+      # 許可ホストの追加（カンマ区切り、任意）。localhost / 127.0.0.1 / ::1 は常に許可。空・未設定なら追加なし
+      MONITORING_ALLOWED_HOSTS: ${MONITORING_ALLOWED_HOSTS:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:

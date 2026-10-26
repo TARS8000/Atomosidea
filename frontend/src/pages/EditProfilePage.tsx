@@ -157,7 +157,14 @@ const EditProfilePage = () => {
       setTimeout(() => navigate('/mypage'), 1500);
     } catch (err) {
       if (!axios.isCancel(err)) {
-        setError('プロフィールの更新に失敗しました。');
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        if (status === 413) {
+          setError('画像のサイズが大きすぎます（10MB まで）。');
+        } else if (status === 415) {
+          setError('対応していない画像形式です（JPEG / PNG / GIF / WebP）。');
+        } else {
+          setError('プロフィールの更新に失敗しました。');
+        }
         setIsScanningIcon(false);
         setIsScanningBackground(false);
       }

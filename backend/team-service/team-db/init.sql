@@ -4,7 +4,8 @@
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'team_service_user') THEN
-    CREATE ROLE team_service_user WITH LOGIN PASSWORD 'team_service_strong_password';
+    -- パスワードは db-role-init（backend/db-init/sync-role-passwords.sh）が .env の TEAM_SERVICE_DB_PASSWORD から設定する
+    CREATE ROLE team_service_user WITH LOGIN;
   END IF;
 END
 $$;

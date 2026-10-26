@@ -3,12 +3,17 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -77,12 +82,94 @@ type MinioItem struct {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     isTrustedRequest,
+}
+
+// allowedHosts はダッシュボードへのアクセスを許可するホスト名。
+// DNS リバインディング対策として Host ヘッダーをこの一覧で検証する。
+// MONITORING_ALLOWED_HOSTS（カンマ区切り）で追加できる。
+var allowedHosts = func() map[string]bool {
+	hosts := map[string]bool{"localhost": true, "127.0.0.1": true, "::1": true}
+	for _, h := range strings.Split(os.Getenv("MONITORING_ALLOWED_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts[strings.ToLower(h)] = true
+		}
+	}
+	return hosts
+}()
+
+func hostnameOf(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return strings.ToLower(strings.Trim(h, "[]"))
+	}
+	return strings.ToLower(strings.Trim(hostport, "[]"))
+}
+
+// isTrustedRequest は Host が許可リストに含まれ、かつ Origin ヘッダーがある場合は
+// 同一ホストからのリクエストであることを確認する。
+// ダッシュボードはコンテナ再起動や MinIO の root 操作ができるため、他サイトのページからの
+// リクエスト（CSRF / クロスサイト WebSocket）を拒否する。
+func isTrustedRequest(r *http.Request) bool {
+	host := hostnameOf(r.Host)
+	if !allowedHosts[host] {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.ToLower(u.Hostname()) == host
 }
 
 var errorKeywords = []string{"ERROR", "FATAL", "panic", "Exception", "failed", "denied", "level=error"}
 
+// ダッシュボードのログイン（HTTP Basic 認証）。MONITOR_USERNAME / MONITOR_PASSWORD（環境変数）と照合する。
+// どちらかが未設定なら全リクエストを拒否する（fail closed）。
+// ブラウザは同一オリジンの fetch と WebSocket のハンドシェイクにも Basic 認証の資格情報を自動で付けるため、
+// フロントエンド側の変更は不要。
+const authRealm = `Basic realm="Atomosidea Monitoring", charset="UTF-8"`
+
+var (
+	monitorUserHash [sha256.Size]byte
+	monitorPassHash [sha256.Size]byte
+	monitorAuthSet  bool
+)
+
+func initMonitorAuth() {
+	user := os.Getenv("MONITOR_USERNAME")
+	pass := os.Getenv("MONITOR_PASSWORD")
+	if user == "" || pass == "" {
+		log.Println("WARNING: MONITOR_USERNAME / MONITOR_PASSWORD is not set. All requests will be rejected.")
+		return
+	}
+	monitorUserHash = sha256.Sum256([]byte(user))
+	monitorPassHash = sha256.Sum256([]byte(pass))
+	monitorAuthSet = true
+}
+
+// isAuthorized は Basic 認証の資格情報を定数時間で比較する（長さの違いも漏らさないようハッシュ同士を比較）。
+func isAuthorized(r *http.Request) bool {
+	if !monitorAuthSet {
+		return false
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	uh := sha256.Sum256([]byte(user))
+	ph := sha256.Sum256([]byte(pass))
+	userOK := subtle.ConstantTimeCompare(uh[:], monitorUserHash[:])
+	passOK := subtle.ConstantTimeCompare(ph[:], monitorPassHash[:])
+	return userOK&passOK == 1
+}
+
 func main() {
+	initMonitorAuth()
+
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Fatalf("Failed to create Docker client: %v", err)
@@ -90,19 +177,35 @@ func main() {
 
 	router := mux.NewRouter()
 
-	// CORSミドルウェア
+	// 同一オリジン以外からのアクセスを拒否し、Basic 認証を必須にするミドルウェア
+	// (フロントエンドは同じ nginx から配信されるため CORS ヘッダーは不要)
 	router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if !isTrustedRequest(r) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			if !monitorAuthSet {
+				http.Error(w, "Monitoring login is not configured (set MONITOR_USERNAME / MONITOR_PASSWORD)", http.StatusServiceUnavailable)
+				return
+			}
+			if !isAuthorized(r) {
+				w.Header().Set("WWW-Authenticate", authRealm)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
 			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	})
+
+	// nginx の auth_request 用（UI の静的ファイルも同じ資格情報で保護する）。認証はミドルウェアで済んでいる
+	router.HandleFunc("/auth/check", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}).Methods("GET", "HEAD")
 
 	router.HandleFunc("/api/containers", getContainers(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/stats", getContainerStats(cli)).Methods("GET")

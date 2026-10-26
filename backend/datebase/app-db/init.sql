@@ -118,8 +118,8 @@ CREATE TRIGGER trg_static_sites_updated_at
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'sfsp_worker') THEN
-        -- ※パスワードは適宜本番環境の設定に変更してください
-CREATE ROLE sfsp_worker WITH LOGIN PASSWORD 'sfsp_worker_password';
+        -- パスワードは db-role-init（backend/db-init/sync-role-passwords.sh）が .env の SFSP_WORKER_DB_PASSWORD から設定する
+CREATE ROLE sfsp_worker WITH LOGIN;
 END IF;
 END
 $$;

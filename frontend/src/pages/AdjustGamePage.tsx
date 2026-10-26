@@ -58,7 +58,7 @@ const AdjustGamePage = () => {
           setOffsetY(fetchedGame.offset_y);
           setLoading(false);
           stopPolling();
-        } else if (fetchedGame.status === 'error') {
+        } else if (['error', 'failed', 'invalid', 'quarantined'].includes(fetchedGame.status)) {
           setError(`ゲーム処理に失敗しました: ${fetchedGame.description}`);
           setLoading(false);
           stopPolling();
