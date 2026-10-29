@@ -1,13 +1,20 @@
 # ==========================================
 # 共通の環境変数（YAML アンカー。各サービスの environment に `<<:` で取り込む）
 # ==========================================
+# 各サービスは .env 全体（env_file）を受け取らない。コードが読む変数だけを environment に明示する
 # Redis はパスワード必須（requirepass）。REDIS_PASSWORD が .env に無いと compose がエラーにする
-x-redis-env: &redis-env
+# REDIS_DB を読まないサービス（team-service, mypage-service）用
+x-redis-base-env: &redis-base-env
   REDIS_ADDR: redis:6379
-  REDIS_HOST: redis
-  REDIS_PORT: 6379
-  REDIS_DB: 0
   REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
+
+# REDIS_DB も読むサービス（auth-service と backend/shared/config を使うサービス）用
+x-redis-env: &redis-env
+  <<: *redis-base-env
+  REDIS_DB: 0
+
+# REDIS_URL は sfsp-api / sfsp-worker だけが読む（internal/config.ResolveRedisAddr）
+x-redis-url-env: &redis-url-env
   REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379
 
 # サービス間の内部 API（ヘッダー X-Internal-Key）
@@ -31,7 +38,7 @@ x-postgres-healthcheck: &postgres-healthcheck
 services:
   # ==========================================
   # Database Services (内部接続のみ)
-  # DB は .env 全体を受け取らない（必要な変数だけを environment で渡す）
+  # DB も .env 全体を受け取らない（必要な変数だけを environment で渡す）
   # ==========================================
   auth-db:
     image: postgres:16
@@ -123,7 +130,6 @@ services:
       PGUSER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       AUTH_SERVICE_DB_PASSWORD: ${AUTH_SERVICE_DB_PASSWORD:?AUTH_SERVICE_DB_PASSWORD must be set in .env}
-      MYPAGE_SERVICE_DB_PASSWORD: ${MYPAGE_SERVICE_DB_PASSWORD:?MYPAGE_SERVICE_DB_PASSWORD must be set in .env}
       TEAM_SERVICE_DB_PASSWORD: ${TEAM_SERVICE_DB_PASSWORD:?TEAM_SERVICE_DB_PASSWORD must be set in .env}
       SFSP_WORKER_DB_PASSWORD: ${SFSP_WORKER_DB_PASSWORD:?SFSP_WORKER_DB_PASSWORD must be set in .env}
     volumes:
@@ -191,8 +197,6 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      SFSP_UPLOAD_ACCESS_KEY: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_UPLOAD_SECRET_KEY: ${SFSP_UPLOAD_SECRET_KEY}
       SFSP_API_ACCESS_KEY: ${SFSP_API_ACCESS_KEY}
       SFSP_API_SECRET_KEY: ${SFSP_API_SECRET_KEY}
       SFSP_GAME_WORKER_ACCESS_KEY: ${SFSP_GAME_WORKER_ACCESS_KEY}
@@ -240,7 +244,6 @@ services:
       mc mb --ignore-existing myminio/quarantine;
 
       echo 'Creating and updating policies...';
-      mc admin policy create myminio sfsp-upload-policy /tmp/sfsp-upload-policy.json;
       mc admin policy create myminio sfsp-api-policy /tmp/sfsp-api-policy.json;
       mc admin policy create myminio sfsp-game-worker-policy /tmp/sfsp-game-worker-policy.json;
       mc admin policy create myminio sfsp-static-site-worker-policy /tmp/sfsp-static-site-worker-policy.json;
@@ -254,9 +257,6 @@ services:
       mc admin policy create myminio app-video-policy /tmp/app-video-policy.json;
 
       echo 'Creating users and attaching policies...';
-      mc admin user add myminio \"$SFSP_UPLOAD_ACCESS_KEY\" \"$SFSP_UPLOAD_SECRET_KEY\" || true;
-      mc admin policy attach myminio sfsp-upload-policy --user=\"$SFSP_UPLOAD_ACCESS_KEY\" || true;
-
       mc admin user add myminio \"$SFSP_API_ACCESS_KEY\" \"$SFSP_API_SECRET_KEY\" || true;
       mc admin policy attach myminio sfsp-api-policy --user=\"$SFSP_API_ACCESS_KEY\" || true;
 
@@ -294,7 +294,6 @@ services:
       echo 'All MinIO buckets and SFSP policies/users initialized successfully!';
       "
     volumes:
-      - ./backend/minio-init/sfsp-upload-policy.json:/tmp/sfsp-upload-policy.json:ro
       - ./backend/minio-init/sfsp-api-policy.json:/tmp/sfsp-api-policy.json:ro
       - ./backend/minio-init/sfsp-game-worker-policy.json:/tmp/sfsp-game-worker-policy.json:ro
       - ./backend/minio-init/sfsp-static-site-worker-policy.json:/tmp/sfsp-static-site-worker-policy.json:ro
@@ -354,8 +353,6 @@ services:
       dockerfile: backend/auth/auth-worker/Dockerfile
     container_name: atmosidea-auth-service
     restart: always
-    env_file:
-      - .env
     depends_on:
       auth-db:
         condition: service_started
@@ -389,6 +386,9 @@ services:
       STATIC_SITE_MINIO_ENDPOINT: minio:9000
       STATIC_SITE_MINIO_ACCESS_KEY_ID: ${STATIC_SITE_MINIO_ACCESS_KEY_ID}
       STATIC_SITE_MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
+      # VIDEO_MINIO_ENDPOINT は未指定なら MINIO_ENDPOINT を使う
+      VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID}
+      VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY}
       MINIO_USE_SSL: ${MINIO_USE_SSL}
       <<: [*redis-env, *internal-api-env]
       TEAM_SERVICE_URL: http://team-service:8080
@@ -402,8 +402,6 @@ services:
       dockerfile: backend/profile-service/profile-worker/Dockerfile
     container_name: atmosidea-profile-service
     restart: always
-    env_file:
-      - .env
     depends_on:
       profile-db:
         condition: service_started
@@ -423,16 +421,10 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${PROFILE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: user-profiles
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      SFSP_MINIO_ENDPOINT: minio:9000
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
       SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
-      SFSP_MINIO_USE_SSL: "false"
+      SFSP_CLEAN_MINIO_USE_SSL: "false"
       <<: [*redis-env, *internal-api-env, *sfsp-client-env]
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
     networks:
@@ -446,12 +438,8 @@ services:
       dockerfile: backend/team-service/team-worker/Dockerfile
     container_name: atmosidea-team-service
     restart: always
-    env_file:
-      - .env
     depends_on:
       team-db:
-        condition: service_started
-      app-db:
         condition: service_started
       redis:
         condition: service_started
@@ -459,9 +447,8 @@ services:
         condition: service_completed_successfully
     environment:
       TEAM_DATABASE_URL: "postgres://team_service_user:${TEAM_SERVICE_DB_PASSWORD}@team-db:5432/team_db?sslmode=disable"
-      APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
-      <<: [*redis-env, *internal-api-env]
+      <<: [*redis-base-env, *internal-api-env]
     networks:
       - atmosidea-network
       - backend-db-network
@@ -472,8 +459,6 @@ services:
       dockerfile: backend/video-service/video-upload-api/Dockerfile
     container_name: atmosidea-video-upload-api
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -489,24 +474,16 @@ services:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
       UPLOAD_DIR: /storage/videos
-      THUMBNAIL_DIR: /storage/thumbnails
       VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY}
-      SFSP_MINIO_ENDPOINT: minio:9000
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
       SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
-      SFSP_MINIO_USE_SSL: "false"
-      <<: [*redis-env, *internal-api-env, *sfsp-client-env]
+      SFSP_CLEAN_MINIO_USE_SSL: "false"
+      <<: [*redis-env, *sfsp-client-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_VIDEO_UPLOAD_BYTES: ${MAX_VIDEO_UPLOAD_BYTES:-1073741824}
-      MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
     volumes:
       - ./backend/video-service/upload_workdir:/storage
     networks:
@@ -520,8 +497,6 @@ services:
       dockerfile: backend/video-service/video-worker/Dockerfile
     container_name: atmosidea-video-worker
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -533,28 +508,17 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
-      UPLOAD_DIR: /storage/videos
-      THUMBNAIL_DIR: /storage/thumbnails
+      JWT_SECRET: ${JWT_SECRET}
       VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY}
-      <<: [*redis-env, *internal-api-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
-      SFSP_MINIO_ENDPOINT: minio:9000
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
       SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_VIDEO_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_VIDEO_WORKER_SECRET_KEY}
       SFSP_CLEAN_MINIO_USE_SSL: "false"
-      SFSP_MINIO_USE_SSL: "false"
-      APP_URL: ${APP_URL}
-    volumes:
-      - ./backend/video-service/upload_workdir:/storage:ro
     networks:
       - atmosidea-network
       - backend-db-network
@@ -566,8 +530,6 @@ services:
       dockerfile: backend/game-service/game-upload-api/Dockerfile
     container_name: atmosidea-game-upload-api
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -587,17 +549,7 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: games
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      SFSP_MINIO_ENDPOINT: minio:9000
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
-      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
-      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
-      SFSP_MINIO_USE_SSL: "false"
-      <<: [*redis-env, *internal-api-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_GAME_UPLOAD_BYTES: ${MAX_GAME_UPLOAD_BYTES:-1073741824}
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
@@ -612,8 +564,6 @@ services:
       dockerfile: backend/game-service/game-worker/Dockerfile
     container_name: atmosidea-game-worker
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -634,14 +584,9 @@ services:
       SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
-      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_GAME_WORKER_ACCESS_KEY}
-      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_GAME_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
       APP_URL: ${APP_URL}
+      MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
     networks:
       - atmosidea-network
       - backend-db-network
@@ -653,8 +598,6 @@ services:
       dockerfile: backend/static-site-service/static-site-upload-api/Dockerfile
     container_name: atmosidea-static-site-upload-api
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -674,17 +617,7 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: static-sites
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      SFSP_MINIO_ENDPOINT: minio:9000
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
-      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
-      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
-      SFSP_MINIO_USE_SSL: "false"
-      <<: [*redis-env, *internal-api-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_SITE_UPLOAD_BYTES: ${MAX_SITE_UPLOAD_BYTES:-524288000}
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
@@ -699,8 +632,6 @@ services:
       dockerfile: backend/static-site-service/static-site-worker/Dockerfile
     container_name: atmosidea-static-site-worker
     restart: always
-    env_file:
-      - .env
     depends_on:
       app-db:
         condition: service_started
@@ -721,14 +652,9 @@ services:
       SFSP_MINIO_ENDPOINT: minio:9000
       SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
       SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
-      SFSP_RAW_MINIO_ENDPOINT: minio:9000
-      SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_UPLOAD_ACCESS_KEY}
-      SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_UPLOAD_SECRET_KEY}
-      SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
-      SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_STATIC_SITE_WORKER_ACCESS_KEY}
-      SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_STATIC_SITE_WORKER_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
-      APP_URL: ${APP_URL}
+      MAX_SITE_UPLOAD_BYTES: ${MAX_SITE_UPLOAD_BYTES:-524288000}
+      MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
     networks:
       - atmosidea-network
       - backend-db-network
@@ -740,23 +666,16 @@ services:
       dockerfile: backend/profile-service/mypage-worker/Dockerfile
     container_name: atmosidea-mypage-service
     restart: always
-    env_file:
-      - .env
     depends_on:
-      auth-db:
-        condition: service_started
+      # 以前は db-role-init（app-db の healthy を待つ）経由で待っていたので、app-db の healthy を直接待つ
       app-db:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_started
-      db-role-init:
-        condition: service_completed_successfully
     environment:
-      AUTH_DATABASE_URL: "postgres://mypage_service_user:${MYPAGE_SERVICE_DB_PASSWORD}@auth-db:5432/auth_db?sslmode=disable"
       APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
       JWT_SECRET: ${JWT_SECRET}
-      <<: [*redis-env, *internal-api-env]
-      TEAM_SERVICE_URL: http://team-service:8080
+      <<: *redis-base-env
     networks:
       - atmosidea-network
       - backend-db-network
@@ -770,8 +689,6 @@ services:
       dockerfile: backend/security/sfsp/docker/api/Dockerfile
     container_name: sfsp-api
     restart: always
-    env_file:
-      - .env
     depends_on:
       sfsp-db:
         condition: service_started
@@ -785,9 +702,6 @@ services:
       SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
 
       # RAW MinIO 設定 (sfsp-api-policy: raw-files のみ操作可能な専用ユーザー)
-      SFSP_MINIO_ENDPOINT: "minio:9000"
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_API_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_API_SECRET_KEY}
       SFSP_RAW_MINIO_ENDPOINT: "minio:9000"
       SFSP_RAW_MINIO_ACCESS_KEY_ID: ${SFSP_API_ACCESS_KEY}
       SFSP_RAW_MINIO_SECRET_ACCESS_KEY: ${SFSP_API_SECRET_KEY}
@@ -798,8 +712,10 @@ services:
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_API_SECRET_KEY}
 
       SFSP_MINIO_USE_SSL: "false"
-      <<: *redis-env
+      <<: [*redis-env, *redis-url-env]
       SFSP_API_KEY: ${SFSP_API_KEY:?SFSP_API_KEY must be set in .env}
+      # 1 ファイルのアップロード上限（既定値は internal/config/config.go と同じ）
+      SFSP_MAX_UPLOAD_BYTES: ${SFSP_MAX_UPLOAD_BYTES:-2147483647}
       SFSP_MINIO_BUCKET_RAW_FILES: raw-files
       SFSP_MINIO_BUCKET_CLEAN_FILES: clean-files
       SFSP_MINIO_BUCKET_QUARANTINE: quarantine
@@ -893,11 +809,6 @@ services:
       SFSP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@sfsp-db:5432/sfsp_db?sslmode=disable"
       APP_DATABASE_URL: "postgres://sfsp_worker:${SFSP_WORKER_DB_PASSWORD:?SFSP_WORKER_DB_PASSWORD must be set in .env}@app-db:5432/app_db?sslmode=disable"
 
-      # デフォルトエンドポイントを minio:9000 に指定
-      SFSP_MINIO_ENDPOINT: "minio:9000"
-      SFSP_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_RAW_ACCESS_KEY}
-      SFSP_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_RAW_SECRET_KEY}
-
       # Explicit source (raw) and destination (clean) endpoints
       SFSP_RAW_MINIO_ENDPOINT: "minio:9000"
       SFSP_CLEAN_MINIO_ENDPOINT: "minio:9000"
@@ -907,7 +818,7 @@ services:
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
       SFSP_MINIO_USE_SSL: "false"
 
-      <<: *redis-env
+      <<: [*redis-env, *redis-url-env]
       # Docker API は sfsp-docker-proxy 経由（sandbox/docker.go は client.FromEnv で DOCKER_HOST を読む）
       DOCKER_HOST: tcp://sfsp-docker-proxy:2375
       SFSP_SCANNER_CLAMAV_IMAGE: "${SFSP_SCANNER_CLAMAV_IMAGE:-sfsp-clamav-client:latest}"
@@ -917,8 +828,21 @@ services:
       SFSP_MINIO_BUCKET_RAW_FILES: raw-files
       SFSP_MINIO_BUCKET_CLEAN_FILES: clean-files
       SFSP_MINIO_BUCKET_QUARANTINE: quarantine
+      # ClamAV の上限と zip 展開の上限。既定値は internal/config/config.go の既定値と同じ（.env で上書き可）
+      SFSP_CLAMAV_MAX_FILESIZE: ${SFSP_CLAMAV_MAX_FILESIZE:-2147483647}
+      SFSP_CLAMAV_MAX_SCANSIZE: ${SFSP_CLAMAV_MAX_SCANSIZE:-4194304000}
+      SFSP_CLAMAV_MAX_FILES: ${SFSP_CLAMAV_MAX_FILES:-100000}
+      SFSP_CLAMAV_MAX_RECURSION: ${SFSP_CLAMAV_MAX_RECURSION:-64}
+      SFSP_CLAMAV_MAX_DIR_RECURSION: ${SFSP_CLAMAV_MAX_DIR_RECURSION:-64}
+      SFSP_CLAMAV_MAX_SCANTIME_MS: ${SFSP_CLAMAV_MAX_SCANTIME_MS:-1500000}
+      SFSP_CLAMAV_PCRE_MAX_FILESIZE: ${SFSP_CLAMAV_PCRE_MAX_FILESIZE:-2147483647}
+      SFSP_MAX_EXTRACTED_BYTES: ${SFSP_MAX_EXTRACTED_BYTES:-4294967296}
+      SFSP_MAX_ZIP_ENTRIES: ${SFSP_MAX_ZIP_ENTRIES:-20000}
+      SFSP_MAX_ZIP_ENTRY_BYTES: ${SFSP_MAX_ZIP_ENTRY_BYTES:-2147483647}
+      SFSP_MAX_ZIP_RATIO: ${SFSP_MAX_ZIP_RATIO:-1000}
+      SFSP_MAX_ZIP_DEPTH: ${SFSP_MAX_ZIP_DEPTH:-32}
     volumes:
-      - ./backend/security/sfsp/yara-rules:/etc/yara-rules:ro
+      # YARA ルールはサンドボックス側（sfsp-yara-client イメージの /etc/yara-rules）に焼き込まれており、worker 自身は読まない。
       # サンドボックスにも同じ名前付きボリューム（SFSP_SCAN_VOLUME_NAME）を /scan_target に読み取り専用でマウントする。
       # プロキシ経由でも同じ Docker デーモンなので、ボリューム名はそのまま解決される
       - sfsp_temp_scan:/tmp/sfsp-scan
@@ -962,6 +886,8 @@ services:
     image: sfsp-clamav-client:latest
     container_name: sfsp-clamav-client-builder
     restart: "no"
+    # イメージをビルドするためだけのサービス（echo して終了）。<project>_default ネットワークを作らないようネットワーク無しにする
+    network_mode: none
     command: ["echo", "ClamAV client image built"]
 
   sfsp-yara-client:
@@ -971,6 +897,7 @@ services:
     image: sfsp-yara-client:latest
     container_name: sfsp-yara-client-builder
     restart: "no"
+    network_mode: none
     command: ["echo", "YARA client image built"]
 
 # ==========================================

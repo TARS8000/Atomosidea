@@ -87,11 +87,8 @@ func randomURLToken(n int) (string, error) {
 type User struct {
 	ID           uuid.UUID      `json:"id"`
 	Username     sql.NullString `json:"username"`
-	GoogleName   sql.NullString `json:"google_name"`
 	Email        string         `json:"email"`
 	PasswordHash string         `json:"-"`
-	Provider     string         `json:"provider"`
-	ProviderID   sql.NullString `json:"-"`
 	IsAdmin      bool           `json:"is_admin"`
 }
 
@@ -354,8 +351,8 @@ func main() {
 		} else {
 			log.Println("WARNING: Google OAuth2 is disabled.")
 		}
+		authRoutes.GET("/me", authMiddleware(), getMeHandler)
 		authRoutes.DELETE("/me", authMiddleware(), deleteAccountHandler)
-		authRoutes.GET("/user/:userId", getUserProviderHandler)
 	}
 
 	log.Println("INFO: Auth service starting on port 8080")
@@ -950,23 +947,47 @@ func deleteAccountHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "アカウントデータが正常に削除されました。", "cleanupErrors": cleanupErrors})
 }
 
-func getUserProviderHandler(c *gin.Context) {
-	// URLパラメータからの UUID パース
-	userID, err := uuid.Parse(c.Param("userId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user UUID format"})
+// getMeHandler returns the auth-db account information of the JWT user
+// (provider is needed by the frontend, e.g. for the account deletion dialog).
+func getMeHandler(c *gin.Context) {
+	userID, ok := c.Get("userUUID")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user session"})
 		return
 	}
 
-	var provider string
-	err = dbAuth.QueryRow(context.Background(), "SELECT provider FROM users WHERE id = $1", userID).Scan(&provider)
-	if err != nil {
-		log.Printf("Error getting user provider: %v", err)
+	var (
+		email    string
+		username sql.NullString
+		provider string
+		isAdmin  bool
+		status   string
+	)
+	err := dbAuth.QueryRow(c.Request.Context(),
+		"SELECT email, username, provider, COALESCE(is_admin, FALSE), status FROM users WHERE id = $1", userID).
+		Scan(&email, &username, &provider, &isAdmin, &status)
+	if err == pgx.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
+	if err != nil {
+		log.Printf("Error getting auth user info: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user info"})
+		return
+	}
 
-	c.JSON(http.StatusOK, gin.H{"provider": provider})
+	var usernameValue interface{}
+	if username.Valid {
+		usernameValue = username.String
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id":       userID.(uuid.UUID).String(),
+		"email":    email,
+		"username": usernameValue,
+		"provider": provider,
+		"isAdmin":  isAdmin,
+		"status":   status,
+	})
 }
 
 // JWT 生成処理で userID (uuid.UUID) を文字列としてセット

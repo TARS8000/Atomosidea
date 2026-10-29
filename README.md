@@ -75,6 +75,9 @@ cp .env.example .env
 | `MAX_VIDEO_UPLOAD_BYTES`、`MAX_GAME_UPLOAD_BYTES`、`MAX_SITE_UPLOAD_BYTES`、`MAX_IMAGE_UPLOAD_BYTES` | アップロードサイズの上限（バイト）。超えると 413 |
 | `MONITOR_USERNAME` / `MONITOR_PASSWORD` | 監視ダッシュボードのログイン（HTTP Basic）。未設定だとダッシュボードは全リクエストを拒否します |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google ログインを使う場合のみ。未設定なら Google ログインの API は無効になります |
+| （任意）`SFSP_MAX_UPLOAD_BYTES`、`SFSP_CLAMAV_*`、`SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` | SFSP のスキャン・zip 展開の上限。`.env.example` にコメントアウトで既定値を載せています（書かなければ既定値） |
+
+`.env` の内容がそのままコンテナに渡るわけではありません。`docker-compose.yml` が各サービスの `environment:` に、そのサービスが使う変数だけを `${変数名}` で展開して渡します（`env_file` は使っていません）。また `.env` はイメージには入りません（`.dockerignore` で除外）。Redis の接続先（`redis:6379`）や sfsp-api の URL など、環境で変わらない値は compose に直接書いてあります。
 
 ### 2. 起動する
 
@@ -113,7 +116,7 @@ cd monitoring-service
 docker compose --env-file ../.env -f docker-compose.monitoring.yml up -d --build
 ```
 
-<http://localhost:8090> で開き、`.env` の `MONITOR_USERNAME` / `MONITOR_PASSWORD` でログインします（HTTP Basic 認証。`--env-file ../.env` を付けないと資格情報が渡らず 503 になります。Windows では `monitoring-service\scripts\start.bat` が自動で付けます）。コンテナの再起動や MinIO の操作ができる強い権限を持つため、Basic 認証に加えて**ホストのループバック（127.0.0.1）にのみ公開**しています。
+<http://localhost:8090> で開き、`.env` の `MONITOR_USERNAME` / `MONITOR_PASSWORD` でログインします（HTTP Basic 認証。`--env-file ../.env` を付けないと資格情報が渡らず 503 になります。Windows では `monitoring-service\scripts\start.bat` が自動で付けます）。Docker ソケットを読み、MinIO の操作（アップロード・削除）ができる強い権限を持つため、Basic 認証に加えて**ホストのループバック（127.0.0.1）にのみ公開**しています。
 
 ---
 
@@ -219,7 +222,7 @@ graph LR
 | `sfsp-api` | 8080 | スキャン対象ファイルの受付とジョブ登録（`X-SFSP-API-Key` 必須） | `backend/security/sfsp/` |
 | `sfsp-worker` | — | ClamAV / YARA をサンドボックスで実行し、結果を各サービスへ通知（Docker 操作は `sfsp-docker-proxy` 経由） | `backend/security/sfsp/` |
 | `sfsp-docker-proxy` | 2375 | sfsp-worker 専用の Docker API プロキシ（コンテナの作成・起動・削除など必要な API だけ許可） | `tecnativa/docker-socket-proxy`（compose で定義） |
-| `sfsp-clamav-client` / `sfsp-yara-client` | — | スキャナーのイメージをビルドするだけのサービス | `backend/security/sfsp/docker/` |
+| `sfsp-clamav-client` / `sfsp-yara-client` | — | スキャナーのイメージをビルドするだけのサービス（ネットワーク無し。YARA ルールは `sfsp-yara-client` のイメージに焼き込まれる） | `backend/security/sfsp/docker/` |
 | `auth-db` / `app-db` / `profile-db` / `team-db` / `sfsp-db` | 5432 | PostgreSQL | 各 `init.sql` |
 | `db-role-init` | — | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを設定 | `backend/db-init/sync-role-passwords.sh` |
 | `redis` | 6379 | ジョブキュー、JWT ブロックリスト、OAuth ワンタイムコード（パスワード必須） | — |
@@ -295,11 +298,11 @@ sequenceDiagram
 |---|---|---|
 | `auth-db` | `users`（ログイン情報・プロバイダー・管理者フラグ） | `backend/auth/auth-datebase/auth-db/init.sql` |
 | `profile-db` | `users`（ユーザー名・自己紹介・画像 URL） | `backend/profile-service/profile-db/init.sql` |
-| `app-db` | `videos`、`games`、`static_sites` | `backend/datebase/app-db/*.sql` |
-| `team-db` | `teams`、`team_members`、`team_join_requests`、`team_content`、`team_posts` | `backend/team-service/team-db/init.sql` |
+| `app-db` | `videos`、`games`、`static_sites` | `backend/datebase/app-db/init.sql` |
+| `team-db` | `teams`、`team_members`、`team_join_requests`、`team_posts` | `backend/team-service/team-db/init.sql` |
 | `sfsp-db` | `files`、`scan_jobs`、`scan_results` | `backend/security/sfsp-db/*.sql` |
 
-> `datebase` はタイプミスではなく実際のディレクトリ名です。
+> `datebase` はタイプミスではなく実際のディレクトリ名です。`init.sql` が実行されるのはボリュームが空の初回起動時だけです。以前のバージョンで作ったボリュームには、今は使っていない `mypage_service_user` ロール（auth-db）・`team_content` テーブル（team-db）・デモユーザー `user_atomos`（profile-db）が残っていることがあります（害はありません。消す SQL は [`EditAI.md` 5 章](EditAI.md#5-データベース)）。
 
 各テーブルのカラム定義は [`EditAI.md` のデータベース節](EditAI.md#5-データベース) を参照してください。
 
@@ -346,8 +349,8 @@ Redis は `REDIS_PASSWORD` によるパスワード必須の設定で、ホス�
 | GET | `/google/callback` | — | Google からのコールバック。成功すると `/login/success?code=...` にリダイレクト（コードは 60 秒・1 回限り。JWT は URL に載せない） |
 | POST | `/oauth/exchange` | — | ワンタイムコードを JWT に交換。`{"code"}` → `{"token"}`（無効・期限切れは 401） |
 | POST | `/logout` | JWT | トークンを無効化 |
+| GET | `/me` | JWT | 自分のアカウント情報 `{"id", "email", "username", "provider", "isAdmin", "status"}`（`provider` は `local` / `google`） |
 | DELETE | `/me` | JWT | アカウントと投稿コンテンツを削除 |
-| GET | `/user/:userId` | — | ユーザーの認証プロバイダー（`local` / `google`） |
 
 ### プロフィール — `/api/profile`（profile-service）
 
@@ -359,9 +362,8 @@ Redis は `REDIS_PASSWORD` によるパスワード必須の設定で、ホス�
 | PUT | （ベースパス） | JWT | ユーザー名・自己紹介の更新。`{"username", "bio"}` |
 | PUT | `/icon` | JWT | アイコン更新（multipart `icon`、スキャン後に反映） |
 | PUT | `/background` | JWT | 背景画像更新（multipart `background`、スキャン後に反映） |
-| POST | `/internal/create`（旧パス） | `X-Internal-Key` | 移行用。Nginx は `/api/profile/internal/` を 404 にするため外部からは届かない |
 
-内部専用の API は `/api/profile` の外にあり、Nginx からは届きません（`X-Internal-Key` が `INTERNAL_API_KEY` と一致しない場合は 403）。
+内部専用の API は `/api/profile` の外にあり、Nginx からは届きません（Nginx は `/api/profile/internal/` も 404 にします。`X-Internal-Key` が `INTERNAL_API_KEY` と一致しない場合は 403）。
 
 | メソッド | パス | 説明 |
 |---|---|---|
@@ -386,7 +388,7 @@ Redis は `REDIS_PASSWORD` によるパスワード必須の設定で、ホス�
 |---|---|---|---|
 | POST | `/upload` | JWT | ゲームアップロード（multipart `game`、`thumbnail`、`title`、`description`） |
 | GET | （ベースパス） | — | 一覧（`?q=` で検索、`?team=` でチーム限定） |
-| GET | `/:id` | — | 詳細（投稿者・管理者以外は公開済みのみ。チーム限定は閲覧権限が必要） |
+| GET | `/:id` | — | 詳細（投稿者・管理者以外は公開済みのみ。チーム限定は閲覧権限が必要。投稿者・管理者には処理の詳細 `processing_details` も返す） |
 | PUT | `/:id` | JWT | タイトル・説明・サムネイルの更新 |
 | PUT | `/adjust/:id` | JWT | 表示調整。`{"scale", "offset_x", "offset_y"}` |
 | DELETE | `/:id` | JWT | ゲーム削除 |
@@ -452,14 +454,13 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 |---|---|---|
 | GET | `/api/containers` | コンテナ一覧 |
 | GET | `/api/containers/stats` | CPU・メモリ使用率 |
-| POST | `/api/containers/restart/{name}` | コンテナの再起動 |
 | GET | `/api/connections/count` | 直近 5 分のアクセス元 IP 数（アクティブユーザーの推定） |
 | GET | `/api/topology` | サービス構成図のデータ |
 | GET | `/api/volumes` | Docker ボリューム一覧 |
 | GET / POST / DELETE | `/api/minio/{list,upload,delete}/{containerName}` | MinIO のバケット・オブジェクト操作 |
 | GET (WebSocket) | `/ws/logs?container=<名前>` | コンテナログのリアルタイム表示 |
 
-全ルートで HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`）が必要です（未設定だと 503）。加えて、許可されたホスト（`localhost` / `127.0.0.1`）以外からのリクエストや、Origin が異なるリクエストは 403 で拒否されます。
+ダッシュボードは参照用で、コンテナの再起動などの操作はできません（MinIO のオブジェクトの操作だけ可能）。全ルートで HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`）が必要です（未設定だと 503）。加えて、許可されたホスト（`localhost` / `127.0.0.1`）以外からのリクエストや、Origin が異なるリクエストは 403 で拒否されます。
 
 ---
 
@@ -491,18 +492,18 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 │   ├── security/
 │   │   ├── sfsp/                     # SFSP（cmd/、internal/、docker/、yara-rules/、docs/）
 │   │   └── sfsp-db/                  # sfsp-db のスキーマ
-│   ├── datebase/app-db/              # app-db の init.sql とマイグレーション
+│   ├── datebase/app-db/              # app-db の init.sql
 │   ├── db-init/                      # db-role-init が使う DB ロールのパスワード同期スクリプト
 │   ├── minio-init/                   # MinIO のポリシー JSON
 │   ├── shared/                       # Go の共通パッケージ（キュー名・イベント型など）
 │   └── storage_data/                 # MinIO のデータ（実行時に作成）
 ├── frontend/
 │   ├── src/                          # React（pages/、components/、context/、api/）
-│   └── nginx.conf                    # API ゲートウェイの設定
+│   └── nginx.conf                    # API ゲートウェイの設定（イメージにもコピーされ、compose がマウントして上書き）
 ├── monitoring-service/               # 監視ダッシュボード（別 compose）
 ├── Docs/                             # MinIO・Nginx・API の補足資料
 ├── docker-compose.yml                # 全サービスの定義（構成の正）
-├── .env.example                      # 環境変数のテンプレート
+├── .env.example                      # 環境変数のテンプレート（.env はイメージに入らない）
 ├── EditAI.md                         # AI 向け詳細仕様
 ├── AI_PROJECT_GUIDE.md               # AI 向けの入門ガイド
 ├── SECURITY_EXPLANATION.md           # セキュリティ設計
@@ -552,6 +553,7 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 | Redis | `requirepass`（`REDIS_PASSWORD`）で保護 |
 | サービス間通信の認証 | sfsp-api は `X-SFSP-API-Key`、内部 API（`/internal/...`）は `X-Internal-Key` が必須。Nginx は `/internal` を 404 にする |
 | Docker ソケットの扱い | sfsp-worker は Docker ソケットを直接マウントせず、`sfsp-docker-proxy` 経由で必要な API だけを使う |
+| 秘密情報の配布 | `.env` はイメージに焼き込まない（`.dockerignore` で除外）。各コンテナには、そのサービスが使う環境変数だけを compose の `environment:` で渡す（`env_file` は使わない） |
 | アップロードの上限 | 各 API でサイズ上限（超過は 413）、zip の展開にも件数・サイズ・圧縮率などの上限（zip bomb 対策） |
 | 監視ダッシュボード | HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`）。127.0.0.1 のみに公開し、許可外のホスト・Origin のリクエストを拒否 |
 
@@ -564,6 +566,7 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 | 症状 | 確認すること |
 |---|---|
 | サービスが起動しない | `docker compose logs <サービス名>`。多くは `.env` の設定漏れか依存サービスの起動失敗 |
+| `.env` に書いた値がコンテナに届かない | 各サービスは `docker-compose.yml` の `environment:` に書かれた変数しか受け取りません。そのサービスの `environment:` に追加してから `docker compose up -d` |
 | MinIO の `Access Denied` / `InvalidAccessKeyId` | `.env` の `*_MINIO_*` と `SFSP_*_KEY` が揃っているか。`minio-init` のログ（`docker logs atmosidea-minio-init`）でユーザー作成が成功しているか |
 | アップロードが `scanning` のまま | `sfsp-worker` のログ。ジョブが `Finished processing job` まで進んでいるか |
 | 正常なファイルが `malicious` / `failed` になる | `sfsp-db` の `scan_results.raw_output` で ClamAV の出力を確認 |
@@ -571,6 +574,8 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 | ログイン直後にログアウトされる | ブラウザの開発者ツールで `/api/profile/me` の応答を確認（401 のときだけログアウトされる） |
 | ゲーム・サイトが表示されない | `http://<id>.localhost:3001/` で直接開けるか。`static-sites` / `games` バケットにファイルがあるか（監視ダッシュボードのストレージブラウザで確認可能） |
 | Go のビルドで `exit status 128` | `go.mod` に `replace github.com/atmosidea/shared => ../../shared` があるか |
+| Go のビルドで `missing go.sum entry` | Dockerfile は `go mod tidy` を実行しません。依存を変えたらローカルで `go mod tidy` して `go.mod` / `go.sum` をコミットする |
+| frontend のビルドで `npm ci` が失敗 | `package.json` と `package-lock.json` が食い違っている。`npm install --legacy-peer-deps` で lock を更新する |
 | `upload_workdir` が無い | 問題ありません。起動時に自動で作成されます |
 | Redis の `NOAUTH` / sfsp-api や compose が起動しない | `.env` の `REDIS_PASSWORD` / `SFSP_API_KEY` / `INTERNAL_API_KEY` が空でないか。`.env.example` から作り直した場合は値を設定する |
 | サービス間の呼び出しが 401 / 403 | `X-SFSP-API-Key`（sfsp-api）や `X-Internal-Key`（内部 API）が `.env` の値と一致しているか |
@@ -599,7 +604,7 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 ### コードスタイル
 
 - **Go**: `gofmt` と `goimports` で整形
-- **TypeScript / React**: Prettier と ESLint（コミット前に `npm run lint`）
+- **TypeScript / React**: Prettier と ESLint（`frontend/.eslintrc.cjs`。コミット前に `frontend/` で `npm run lint`。監視ダッシュボードは `monitoring-service/frontend/` で同様）
 
 ### CI/CD（想定）
 

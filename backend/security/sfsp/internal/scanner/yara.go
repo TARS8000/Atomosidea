@@ -9,10 +9,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// YARAScanner implements the Scanner interface for YARA
+// YARAScanner runs YARA inside the sandbox container
 type YARAScanner struct {
 	yaraImage string // Docker image for yara client
-	rulesPath string // Path to YARA rules file on the worker's filesystem
+	rulesPath string // Path to the YARA rules file inside the yara-client image (the worker never reads it)
 	logger    *zap.SugaredLogger
 }
 

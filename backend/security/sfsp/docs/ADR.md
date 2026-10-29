@@ -81,3 +81,11 @@ The decision itself (one ephemeral, isolated Docker container per scanner run) i
 - **Sandbox settings**: `NetworkMode: none`, `CapDrop: ALL`, `no-new-privileges`, 1.5 GiB memory, 1 CPU, 256 PIDs, a 30 minute timeout, the scan volume mounted read-only, a read-only root filesystem with only a 512 MiB `/tmp` tmpfs writable, and `sfsp-api` / `sfsp-worker` themselves running as the non-root user `10001:10001`. The scanner runs directly as the container entrypoint.
 - **Images**: Scanner images are built locally by `docker compose build` and are never pulled at run time. Virus definitions are fetched when `sfsp-clamav-client` is built, because the sandbox has no network.
 - **Verdict**: A file is `clean` only if BOTH ClamAV and YARA report `clean`. The ClamAV result is decided by its exit code, and files that exceed a ClamAV limit or a ZIP extraction limit are `suspicious`.
+
+#### Update (2026-10-29)
+
+Cleanup only; the decision is unchanged:
+
+- **Worker image**: `sfsp-worker` starts the sandbox through the Docker SDK, so its image no longer installs `docker-cli` or `yara`, and the `yara-rules` directory is no longer mounted into it. The YARA rules exist only inside the `sfsp-yara-client` image. The builder services `sfsp-clamav-client` / `sfsp-yara-client` run with `network_mode: none`.
+- **Configuration**: No SFSP service receives the whole `.env` (no `env_file`, `.env` is not copied into images). The ClamAV and ZIP extraction limits are passed to `sfsp-worker` explicitly with the code defaults, so they can be tuned from `.env`.
+- **Shared code**: SFSP uses `github.com/atmosidea/shared` (`config`, `queue`, `model`, `event`); its own `internal/model` and unused queue/storage helpers were removed. The legacy `target_service` alias `thumbnail` was removed (only `site-thumbnail` is accepted).

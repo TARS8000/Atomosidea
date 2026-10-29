@@ -165,6 +165,8 @@ const VideoDetailPage = () => {
     return () => {
       stopPolling();
     };
+    // ポーリングは動画 ID ごとに 1 回だけ開始する（終端ステータスでは fetchDetails 側で停止する）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // --- [2] HLS.js のセットアップ ---
@@ -225,6 +227,8 @@ const VideoDetailPage = () => {
     } else {
       setError('お使いのブラウザはHLS動画の再生に対応していません。');
     }
+    // ポーリングで video オブジェクトが更新されるたびに HLS を作り直さないよう、id / status のみを依存にする
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, video?.id, video?.status]);
 
   // --- [3] フルスクリーンハンドリング ---

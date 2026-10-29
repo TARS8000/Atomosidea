@@ -11,7 +11,6 @@ set -eu
 : "${PGUSER:?PGUSER (POSTGRES_USER) must be set}"
 : "${PGPASSWORD:?PGPASSWORD (POSTGRES_PASSWORD) must be set}"
 : "${AUTH_SERVICE_DB_PASSWORD:?AUTH_SERVICE_DB_PASSWORD must be set}"
-: "${MYPAGE_SERVICE_DB_PASSWORD:?MYPAGE_SERVICE_DB_PASSWORD must be set}"
 : "${TEAM_SERVICE_DB_PASSWORD:?TEAM_SERVICE_DB_PASSWORD must be set}"
 : "${SFSP_WORKER_DB_PASSWORD:?SFSP_WORKER_DB_PASSWORD must be set}"
 
@@ -51,6 +50,5 @@ SQL
 }
 
 set_password auth-db auth_db auth_service_user "$AUTH_SERVICE_DB_PASSWORD"
-set_password auth-db auth_db mypage_service_user "$MYPAGE_SERVICE_DB_PASSWORD"
 set_password team-db team_db team_service_user "$TEAM_SERVICE_DB_PASSWORD"
 set_password app-db app_db sfsp_worker "$SFSP_WORKER_DB_PASSWORD"

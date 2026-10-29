@@ -186,6 +186,25 @@ const TeamDetailPage = () => {
     load();
   }, [load]);
 
+  // 投稿者の名前を一括取得（詳細ページと同じく /api/profile/:id を使用）
+  const loadUsernames = useCallback(async (items: Array<{ uploader_id?: string | null; user_id?: string | null }>) => {
+    const ids = Array.from(new Set(items.map((it) => it.uploader_id ?? it.user_id).filter(Boolean) as string[]));
+    if (ids.length === 0) return;
+    try {
+      const resps = await Promise.all(
+        ids.map((id) => axios.get<{ username: string }>(`/api/profile/${id}`).catch(() => ({ data: { username: '' } })))
+      );
+      const map: Record<string, string> = {};
+      resps.forEach((r, i) => {
+        const uname = r.data?.username?.trim();
+        if (uname) map[ids[i]] = uname;
+      });
+      setUsernames((prev) => ({ ...prev, ...map }));
+    } catch {
+      // 名前取得失敗時はカード側でuploader_idを表示
+    }
+  }, []);
+
   // コンテンツ一覧取得
   const loadContent = useCallback(
     async (type: TeamContentType) => {
@@ -213,27 +232,8 @@ const TeamDetailPage = () => {
         setContentLoading(false);
       }
     },
-    [token, contentSearch]
+    [token, contentSearch, loadUsernames]
   );
-
-  // 投稿者の名前を一括取得（詳細ページと同じく /api/profile/:id を使用）
-  const loadUsernames = useCallback(async (items: Array<{ uploader_id?: string | null; user_id?: string | null }>) => {
-    const ids = Array.from(new Set(items.map((it) => it.uploader_id ?? it.user_id).filter(Boolean) as string[]));
-    if (ids.length === 0) return;
-    try {
-      const resps = await Promise.all(
-        ids.map((id) => axios.get<{ username: string }>(`/api/profile/${id}`).catch(() => ({ data: { username: '' } })))
-      );
-      const map: Record<string, string> = {};
-      resps.forEach((r, i) => {
-        const uname = r.data?.username?.trim();
-        if (uname) map[ids[i]] = uname;
-      });
-      setUsernames((prev) => ({ ...prev, ...map }));
-    } catch {
-      // 名前取得失敗時はカード側でuploader_idを表示
-    }
-  }, []);
 
   useEffect(() => {
     if (activeTab === 'all') {
@@ -250,11 +250,11 @@ const TeamDetailPage = () => {
   // メンバーと参加リクエストの名前を取得
   useEffect(() => {
     if (members.length > 0) void loadUsernames(members);
-  }, [members]);
+  }, [members, loadUsernames]);
 
   useEffect(() => {
     if (joinRequests.length > 0) void loadUsernames(joinRequests);
-  }, [joinRequests]);
+  }, [joinRequests, loadUsernames]);
 
   const [memberMessage, setMemberMessage] = useState('');
 

@@ -25,10 +25,7 @@ const (
 
 // Config holds all application-wide configurations
 type Config struct {
-	DatabaseURL   string
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
+	DatabaseURL string
 
 	MinIO struct {
 		// Raw MinIO (ダウンロード用)
@@ -77,10 +74,6 @@ type Config struct {
 		MaxZipDepth       int   // SFSP_MAX_ZIP_DEPTH: zip 内のディレクトリ階層の上限
 	}
 
-	Worker struct {
-		DockerHost string
-	}
-
 	API struct {
 		Port string
 		Key  string // SFSP_API_KEY: /api/v1/* に必須の X-SFSP-API-Key
@@ -99,9 +92,6 @@ func LoadConfig() (config Config, err error) {
 	}
 
 	config.DatabaseURL = viper.GetString("SFSP_DATABASE_URL")
-	config.RedisPassword = viper.GetString("REDIS_PASSWORD")
-	config.RedisDB = viper.GetInt("REDIS_DB")
-	config.RedisAddr = ResolveRedisAddr(viper.GetString("REDIS_ADDR"), config.RedisPassword)
 
 	// Raw MinIO 接続情報の読み込み
 	config.MinIO.RawEndpoint = viper.GetString("SFSP_RAW_MINIO_ENDPOINT")
@@ -133,7 +123,6 @@ func LoadConfig() (config Config, err error) {
 	config.Scanner.YARAImage = viper.GetString("SFSP_SCANNER_YARA_IMAGE")
 	config.Scanner.YARARulesPath = viper.GetString("SFSP_SCANNER_YARA_RULES_PATH")
 
-	config.Worker.DockerHost = viper.GetString("DOCKER_HOST")
 	config.API.Port = viper.GetString("SFSP_API_PORT")
 	config.API.Key = strings.TrimSpace(viper.GetString("SFSP_API_KEY"))
 

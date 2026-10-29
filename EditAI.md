@@ -1,7 +1,7 @@
 # Atomosidea — AI 向け技術仕様書（現行版）
 
 このドキュメントは、`Atomosidea`（アトモシデア）の**現在の実装**を、AI がコードを変更するときに参照できる形で記述したものです。
-記載しているパス・テーブル名・キュー名・環境変数名・ポートは、`docker-compose.yml` と `backend/` 以下の実ファイルと照合済みです（最終照合: 2026-10-26、既知の問題への対応後）。
+記載しているパス・テーブル名・キュー名・環境変数名・ポートは、`docker-compose.yml` と `backend/` 以下の実ファイルと照合済みです（最終照合: 2026-10-29、不要なファイル・設定の整理と環境変数の最小化の後）。
 
 ---
 
@@ -85,6 +85,7 @@
 | | hls.js | HLS 再生 |
 | | jwt-decode | JWT のデコード（期限切れ判定・ユーザー情報） |
 | | react-image-crop | アイコン・背景画像の切り抜き |
+| | ESLint（`frontend/.eslintrc.cjs`） | `npm run lint`（`monitoring-service/frontend` にも同じく `.eslintrc.cjs` がある） |
 | バックエンド | Go 1.25 | 全サービス |
 | | Gin | HTTP ルーター（監視サービスのみ gorilla/mux + gorilla/websocket） |
 | | pgx/v5 | PostgreSQL（プレースホルダ `$1` を使用。static-site-upload-api / static-site-worker は lib/pq） |
@@ -139,7 +140,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 各ワーカー ◀──BRPOPLPUSH── sfsp:completed:<target>（→ :processing。clean のときだけ公開処理、終端状態を DB に書いてから Ack）
 ```
 
-- 取り出しは `backend/shared/queue` の `DequeueReliable` / `Ack` / `RecoverProcessing`（SFSP は `internal/queue` に同じもの）。起動時に `RecoverProcessing` で `<queue>:processing` に残ったメッセージを元のキューに戻す。各キューのコンシューマーは 1 つである前提。
+- 取り出しは `backend/shared/queue` の `DequeueReliable` / `Ack` / `RecoverProcessing`（SFSP は Redis 接続・投入に `shared/queue` を使い、`sfsp:scan_queue` の取り出しには `internal/queue` の同じ関数 + `Requeue` / `DeadLetter` を使う）。起動時に `RecoverProcessing` で `<queue>:processing` に残ったメッセージを元のキューに戻す。各キューのコンシューマーは 1 つである前提。
 
 ### 3.3. ネットワーク（`docker-compose.yml` より）
 
@@ -160,11 +161,23 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 
 ## 4. サービス一覧
 
-ビルドは `context: .`（プロジェクトルート）で、各 Dockerfile が `COPY . .` の後 `WORKDIR /app/<サービスのパス>` でビルドする（理由は [13 章](#13-ビルドと依存関係の制約)）。
+ビルドは `context: .`（プロジェクトルート）で、各 Dockerfile が `COPY . .` の後 `WORKDIR /app/<サービスのパス>` でビルドする（理由は [13 章](#13-ビルドと依存関係の制約)）。`frontend` だけは `context: ./frontend`。
+
+環境変数: どのサービスも `env_file: .env`（`.env` 全体）を受け取らない。`docker-compose.yml` の各サービスの `environment:` に、そのサービスのコードが読む変数だけを書き、値は `${VAR}` で `.env` から展開する。共通部分は YAML アンカーで取り込む。
+
+| アンカー | 中身 | 取り込むサービス |
+|---|---|---|
+| `redis-base-env` | `REDIS_ADDR=redis:6379`、`REDIS_PASSWORD` | team-service、mypage-service（`REDIS_DB` を読まない） |
+| `redis-env` | `redis-base-env` + `REDIS_DB=0` | auth-service と `backend/shared/config` を使う全サービス（profile / video-* / game-* / static-site-* / sfsp-*） |
+| `redis-url-env` | `REDIS_URL=redis://:<REDIS_PASSWORD>@redis:6379` | sfsp-api、sfsp-worker のみ |
+| `internal-api-env` | `INTERNAL_API_KEY` | auth-service、profile-service、team-service のみ |
+| `sfsp-client-env` | `SFSP_API_URL=http://sfsp-api:8080`（固定）、`SFSP_API_KEY` | profile-service、video-upload-api、video-worker、game-upload-api、static-site-upload-api |
+
+- 新しい環境変数をコードで読むようにしたら、そのサービスの `environment:` にも追加する（追加しないとコンテナには届かない）。`.env` に書くだけでは反映されない。
 
 | サービス | コンテナ名 | 内部ポート | 実装（`main.go` の場所） | 責務 |
 |---|---|---|---|---|
-| `frontend` | atmosidea-frontend | 80（ホスト 3001） | `frontend/`（`nginx.conf` はボリュームでマウント） | React 配信、API ゲートウェイ、MinIO へのプロキシ |
+| `frontend` | atmosidea-frontend | 80（ホスト 3001） | `frontend/`（`nginx.conf` はイメージの `/etc/nginx/nginx.conf` にコピーされ、compose が同じパスに読み取り専用でマウントして上書きする） | React 配信、API ゲートウェイ、MinIO へのプロキシ |
 | `auth-service` | atmosidea-auth-service | 8080 | `backend/auth/auth-worker/` | 登録・ログイン・Google OAuth・JWT・ログアウト・アカウント削除 |
 | `profile-service` | atmosidea-profile-service | 8084 | `backend/profile-service/profile-worker/` | プロフィール CRUD、画像のスキャン依頼、`sfsp:completed:profile` の処理 |
 | `mypage-service` | atmosidea-mypage-service | 8083 | `backend/profile-service/mypage-worker/` | 自分の投稿一覧 |
@@ -177,8 +190,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `static-site-worker` | atmosidea-static-site-worker | — | `backend/static-site-service/static-site-worker/` | `sfsp:completed:static-site` / `site-thumbnail` の処理 |
 | `sfsp-api` | sfsp-api | 8080 | `backend/security/sfsp/cmd/sfsp-api/`、`internal/api/` | スキャン依頼の受付、ジョブ登録 |
 | `sfsp-worker` | sfsp-worker | — | `backend/security/sfsp/cmd/sfsp-worker/`、`internal/worker/` | スキャン実行、結果イベントの発行、公開後のクリーンアップ |
-| `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用 |
-| `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用 |
+| `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用（`network_mode: none`。echo して終了） |
+| `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用（`network_mode: none`）。YARA ルール（`backend/security/sfsp/yara-rules/`）はこのイメージの `/etc/yara-rules` に焼き込まれる |
 | `sfsp-scan-volume-init` | sfsp-scan-volume-init | — | docker-compose.yml（`sfsp-yara-client` イメージを root で一時利用） | 起動のたびに 1 回だけ動き、スキャン用ボリューム `sfsp_temp_scan` の所有者を 10001 に揃える（非 root 化前に作られた既存ボリューム用）。`CHOWN` / `FOWNER` / `DAC_READ_SEARCH` のみ許可、ネットワークなし、読み取り専用ルート。`sfsp-worker` はこの完了を待つ |
 | `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | sfsp-worker 用の Docker API プロキシ。`CONTAINERS` / `IMAGES` / `POST` / `PING` / `VERSION` のみ許可 |
 | `db-role-init` | atmosidea-db-role-init | — | `backend/db-init/sync-role-passwords.sh` | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを `ALTER ROLE` する |
@@ -192,7 +205,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | サービス | コンテナ名 | ポート | 実装 |
 |---|---|---|---|
 | `mon-nginx` | mon-nginx | `127.0.0.1:8090:80` | `monitoring-service/nginx.conf` |
-| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットを `:ro` でマウント。全ルートで HTTP Basic 認証） |
+| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットを `:ro` でマウント。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network` と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
 | `mon-frontend` | mon-frontend-builder | — | `monitoring-service/frontend/`（ビルドして `dist/` に出力するだけ） |
 
 ### 4.1. フロントエンドのルート（`frontend/src/App.tsx`）
@@ -209,7 +222,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `/mypage`, `/edit-profile` | `MyPage`, `EditProfilePage` |
 | `/teams`, `/teams/:token` | `TeamListPage`, `TeamDetailPage` |
 
-共通コンポーネント: `components/Header.tsx`, `PrivateRoute.tsx`, `ImageCropperModal.tsx`, `AccountDeletionModal.tsx`。チーム API のクライアント: `api/team.ts`。認証状態: `context/AuthContext.tsx`。
+共通コンポーネント: `components/Header.tsx`, `ImageCropperModal.tsx`, `AccountDeletionModal.tsx`（どのルートからも使われていなかった `PrivateRoute.tsx` は削除済み）。チーム API のクライアント: `api/team.ts`（画面から使う関数だけ）。認証状態: `context/AuthContext.tsx`（`/api/profile/me` と `/api/auth/me` を並行取得し、`provider` は `/api/auth/me` から取る）。
 
 ---
 
@@ -219,15 +232,22 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 
 | コンテナ | DB 名 | 初期化スクリプト（compose がマウントするもの） | 接続ユーザー |
 |---|---|---|---|
-| `auth-db` | `auth_db` | `backend/auth/auth-datebase/auth-db/init.sql` | auth-service: `auth_service_user`、mypage-service: `mypage_service_user` |
-| `app-db` | `app_db` | `backend/datebase/app-db/init.sql`（同じディレクトリの `001_*.sql` / `002_*.sql` は既存ボリューム向けのマイグレーションで、compose はマウントしない） | `POSTGRES_USER`（sfsp-worker は `sfsp_worker`） |
+| `auth-db` | `auth_db` | `backend/auth/auth-datebase/auth-db/init.sql` | auth-service: `auth_service_user`（auth-db に接続するのは auth-service だけ） |
+| `app-db` | `app_db` | `backend/datebase/app-db/init.sql`（ディレクトリ内のファイルはこれだけ。旧マイグレーション `001_*.sql` / `002_*.sql` は削除済み） | `POSTGRES_USER`（sfsp-worker は `sfsp_worker`） |
 | `profile-db` | `profile_db` | `backend/profile-service/profile-db/init.sql` | `POSTGRES_USER` |
 | `team-db` | `team_db` | `backend/team-service/team-db/init.sql` | `team_service_user` |
 | `sfsp-db` | `sfsp_db` | `backend/security/sfsp-db/`（ディレクトリごと） | `POSTGRES_USER` |
 
 > - `datebase` は誤記ではなく実ディレクトリ名。
-> - `backend/auth/auth-db/init.sql` も存在するが、compose がマウントしているのは `backend/auth/auth-datebase/auth-db/init.sql`。
+> - auth-db の初期化スクリプトは `backend/auth/auth-datebase/auth-db/init.sql` だけ（古い複製 `backend/auth/auth-db/init.sql` とルートの `db.sql` は削除済み）。
 > - `init.sql` が実行されるのはボリュームが空のとき（初回）だけ。既存の DB にスキーマ変更を反映するには、マイグレーション SQL を手動で流すか、ボリュームを作り直す。
+> - 2026-10-29 に init.sql から外したもの（`mypage_service_user` ロール、`team_content` テーブル、profile-db のデモユーザー `user_atomos`）は、**既存のボリュームには残る**（どのコードも使わないので害はない）。消す場合は次を手動で流す（新しいボリュームでは不要）。
+>   ```sh
+>   # <POSTGRES_USER> は .env の POSTGRES_USER。1 行目はロールが既に無ければエラーになるだけ（何も変わらない）
+>   docker exec atmosidea-auth-db    psql -U <POSTGRES_USER> -d auth_db    -c "DROP OWNED BY mypage_service_user; DROP ROLE mypage_service_user;"
+>   docker exec atmosidea-team-db    psql -U <POSTGRES_USER> -d team_db    -c "DROP TABLE IF EXISTS team_content;"
+>   docker exec atmosidea-profile-db psql -U <POSTGRES_USER> -d profile_db -c "DELETE FROM users WHERE id = '01913197-0000-7000-8000-000000000001' AND username = 'user_atomos';"
+>   ```
 
 ### 5.1. auth-db
 
@@ -265,6 +285,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `status` | VARCHAR(50) | `offline`（既定）/ `active` / `pending` / `online` |
 | `created_at` / `updated_at` | TIMESTAMP | 作成・更新日時 |
 
+- 初期データは投入しない（以前あったデモユーザー `user_atomos` は init.sql から削除済み。既存ボリュームの扱いは [5 章冒頭](#5-データベース) の注記）。
 - `GET /api/profile/me` は、行が無ければ JWT の `username` で行を作成する（`username` が空なら `status = 'pending'`）。
 - フロントエンドは `status === 'pending'` のとき `/edit-profile` へ遷移させる。
 
@@ -331,9 +352,10 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `teams` | `id` UUID PK, `token` VARCHAR(24), `name`, `description`, `is_public` BOOL, `auto_approve` BOOL, `allow_member_invite` BOOL, `created_by` UUID, `created_at` | `UNIQUE(token)` |
 | `team_members` | `id` UUID PK, `team_id` UUID FK→teams, `user_id` UUID, `role` VARCHAR(20)（`owner` / `admin` / `member`）, `joined_at` | `UNIQUE(team_id, user_id)`、チーム削除で CASCADE |
 | `team_join_requests` | `id` UUID PK, `team_id` UUID FK, `user_id` UUID, `status`（`pending` / `approved` / `rejected` / `cancelled`）, `requested_at`, `reviewed_at`, `reviewed_by` UUID | `UNIQUE(team_id, user_id)` |
-| `team_content` | `id` UUID PK, `team_id` UUID FK, `content_type`（`video` / `game` / `static-site`）, `content_id` VARCHAR(20), `created_at` | `UNIQUE(team_id, content_type, content_id)` |
+| ~~`team_content`~~（2026-10-29 に init.sql から削除。どのコードも使っていなかった） | 旧定義: `id` UUID PK, `team_id` UUID FK, `content_type`（`video` / `game` / `static-site`）, `content_id` VARCHAR(20), `created_at` | 旧: `UNIQUE(team_id, content_type, content_id)`。既存ボリュームには残る（[5 章冒頭](#5-データベース)） |
 | `team_posts` | `id` UUID PK, `team_id` UUID FK, `author_id` UUID, `title`, `body`, `created_at` | |
 
+- `allow_member_invite` は `CREATE TABLE teams` に含まれている。init.sql 末尾にあった「列が無ければ `ALTER TABLE teams ADD COLUMN allow_member_invite`」の DO ブロックは 2026-10-29 に削除した（init.sql は空のボリュームでしか実行されないため、既存ボリュームのマイグレーションとしては動いていなかった）。列が無い古いボリュームでは `ALTER TABLE teams ADD COLUMN IF NOT EXISTS allow_member_invite BOOLEAN NOT NULL DEFAULT FALSE;` を手動で流す。
 - `token` は crypto/rand から作る 24 文字の base36（約 124 ビット）。URL にそのまま使う。
 - ロールの強さ: `owner`(3) > `admin`(2) > `member`(1)。`requireTeamRole(c, "admin")` のようにランクで判定する。
 - `team_members.team_id` は UUID。URL の `token` をそのまま入れてはいけない（`SELECT id FROM teams WHERE token = $1` で引く）。
@@ -381,18 +403,19 @@ MinIO は **1 インスタンス**（`atmosidea-minio`、`minio:9000`）。デ�
 | `GAME_MINIO_ACCESS_KEY_ID` | `app-game-policy` | `games` に `s3:*` | game-upload-api, game-worker, auth-service（削除時） |
 | `PROFILE_MINIO_ACCESS_KEY_ID` | `app-profile-policy` | `user-profiles` に `s3:*` | profile-service, auth-service（削除時） |
 | `STATIC_SITE_MINIO_ACCESS_KEY_ID` | `app-static-site-policy` | `static-sites` に `s3:*` | static-site-upload-api, static-site-worker, auth-service（削除時） |
-| `VIDEO_MINIO_ACCESS_KEY_ID` | `app-video-policy` | `videos` に `s3:*` | video-upload-api, video-worker |
-| `SFSP_UPLOAD_ACCESS_KEY` | `sfsp-upload-policy` | `raw-files` に PutObject | 各アップロード API（raw 側の設定） |
+| `VIDEO_MINIO_ACCESS_KEY_ID` | `app-video-policy` | `videos` に `s3:*` | video-upload-api, video-worker, auth-service（削除時） |
+| ~~`SFSP_UPLOAD_ACCESS_KEY`~~ | ~~`sfsp-upload-policy`~~ | — | **2026-10-29 に廃止**。どのコードも使っておらず（アップロード API は MinIO ではなく sfsp-api に送る）、ユーザー・ポリシー・`.env.example` の変数・`sfsp-upload-policy.json` を削除した |
 | `SFSP_API_ACCESS_KEY` | `sfsp-api-policy` | `raw-files` に `s3:*` | sfsp-api |
 | `SFSP_WORKER_RAW_ACCESS_KEY` | `sfsp-worker-raw-policy` | `raw-files` に Get / Delete / List | sfsp-worker |
-| `SFSP_WORKER_CLEAN_ACCESS_KEY` | `sfsp-worker-clean-policy` | `clean-files` / `quarantine` / `raw-files` に `s3:*` | sfsp-worker, video-upload-api（clean 側） |
-| `SFSP_GAME_WORKER_ACCESS_KEY` | `sfsp-game-worker-policy` | `clean-files` に GetObject | game-upload-api, game-worker |
-| `SFSP_STATIC_SITE_WORKER_ACCESS_KEY` | `sfsp-static-site-worker-policy` | `clean-files` に Get / Delete | static-site-upload-api, static-site-worker |
+| `SFSP_WORKER_CLEAN_ACCESS_KEY` | `sfsp-worker-clean-policy` | `clean-files` / `quarantine` / `raw-files` に `s3:*` | sfsp-worker, video-upload-api（clean-files の読み取りに使う。権限が広すぎる点は [15.4](#154-残っている問題2026-10-26-の対応後に判明)） |
+| `SFSP_GAME_WORKER_ACCESS_KEY` | `sfsp-game-worker-policy` | `clean-files` に GetObject | game-worker（game-upload-api には渡していない） |
+| `SFSP_STATIC_SITE_WORKER_ACCESS_KEY` | `sfsp-static-site-worker-policy` | `clean-files` に Get / Delete | static-site-worker（static-site-upload-api には渡していない） |
 | `SFSP_PROFILE_WORKER_ACCESS_KEY` | `sfsp-profile-worker-policy` | `clean-files` に GetObject | profile-service |
 | `SFSP_VIDEO_WORKER_ACCESS_KEY` | `sfsp-video-worker-policy` | `clean-files` に GetObject | video-worker |
 
-- どのアプリ用ポリシーにも `s3:ListAllMyBuckets` と `s3:GetBucketLocation` が付いている（起動時の `ListBuckets` / `BucketExists` に必要）。
-- 旧 `backend/minio-init/sfsp-worker-policy.json` と `initialize.sh`（旧マルチ MinIO 構成用）は未使用だったため削除した。`minio-init` が使うポリシーは compose がマウントする 12 個の `*-policy.json` だけ。
+- どのアプリ用ポリシー（`app-*`）にも `s3:ListAllMyBuckets` と `s3:GetBucketLocation` が付いている（起動時の `ListBuckets` / `BucketExists` に必要）。
+- バケットの作成と匿名ダウンロードの設定は `minio-init` が行う。以前は game-worker（`ensureBucket`）と static-site-upload-api も起動時に `MakeBucket` / `SetBucketPolicy` していたが、2026-10-29 に削除した。profile-service だけは今も起動時に `user-profiles` を（無ければ）作成し、匿名読み取りのポリシーを設定する。
+- 旧 `backend/minio-init/sfsp-worker-policy.json` と `initialize.sh`（旧マルチ MinIO 構成用）は未使用だったため削除した。2026-10-29 に `sfsp-upload-policy.json` も削除し、`minio-init` が使うポリシーは compose がマウントする 11 個の `*-policy.json` だけになった。既存の MinIO には古い `sfsp-upload` ユーザーとポリシーが残るが、`.env` に資格情報が無いので使われない（消すなら `mc admin user remove` / `mc admin policy remove`）。
 - **ユーザーやポリシーを変更するときは、`docker-compose.yml` の `minio-init`（environment / entrypoint / volumes の 3 か所）と `backend/minio-init/*.json` を同じ変更で更新する。**
 - `.env.example` では、アクセスキーをサービスごとに別の値にしている。同じ値にすると MinIO 上では 1 ユーザーになり、ポリシーが合算される。
 
@@ -411,7 +434,7 @@ MinIO は **1 インスタンス**（`atmosidea-minio`、`minio:9000`）。デ�
 | `blocklist:<jti>` | String（TTL = JWT の残り有効期限） | auth-service（ログアウト、アカウント削除） | JWT を検証する全サービスの `authMiddleware` |
 | `oauth_code:<code>` | String（TTL 60 秒） | auth-service（Google コールバック） | auth-service `POST /api/auth/oauth/exchange`（GETDEL で 1 回だけ） |
 
-Redis は `requirepass`（`REDIS_PASSWORD`）で保護している。接続には `REDIS_ADDR` + `REDIS_PASSWORD`、または `REDIS_URL=redis://:<password>@redis:6379`（パスワードは URL エンコードが必要）を使う。
+Redis は `requirepass`（`REDIS_PASSWORD`）で保護している。接続先と DB 番号は compose で固定（`REDIS_ADDR=redis:6379`、`REDIS_DB=0`）で、`.env` に書くのは `REDIS_PASSWORD` だけ。アプリ側サービスは `REDIS_ADDR` + `REDIS_PASSWORD`（+ `REDIS_DB`）、sfsp-api / sfsp-worker は `REDIS_URL=redis://:<password>@redis:6379`（パスワードは URL エンコードが必要なので英数字にする）を使う。`REDIS_HOST` / `REDIS_PORT` はどのコードも読まないため compose から削除した。
 
 ### 7.2. スキャン完了イベントのキュー
 
@@ -425,10 +448,10 @@ Redis は `requirepass`（`REDIS_PASSWORD`）で保護している。接続に�
 | `game-thumbnail` | `sfsp:completed:game-thumbnail` | game-worker | サムネイル |
 | `static-site` | `sfsp:completed:static-site` | static-site-worker | zip 展開・公開 |
 | `site-thumbnail` | `sfsp:completed:site-thumbnail` | static-site-worker | サムネイル |
-| `thumbnail` | `sfsp:completed:site-thumbnail`（※ site と同じ） | static-site-worker | 互換用の別名 |
+| ~~`thumbnail`~~ | — | — | **2026-10-29 に廃止**（`site-thumbnail` の互換用の別名だった。sfsp-api の許可リスト・`shared/queue`・static-site-worker から削除し、`ThumbnailCompletionQueue` 定数も削除） |
 | `profile` | `sfsp:completed:profile` | profile-service | アイコン・背景の反映 |
 
-それ以外の値は sfsp-api が拒否する。各ワーカーは `DequeueReliable` で取り出し、DB を終端状態にしてから `Ack` する。処理エラーは終端状態（`failed` / `error`）を記録して `Ack` する（無限再試行はしない）。DB に書けないときだけ `Ack` せず、次の起動時に `RecoverProcessing` で再処理される。既に終端状態の行への再配信は無視する。
+それ以外の値（`thumbnail` を含む）は sfsp-api が 400 で拒否する。各ワーカーは `DequeueReliable` で取り出し、DB を終端状態にしてから `Ack` する。処理エラーは終端状態（`failed` / `error`）を記録して `Ack` する（無限再試行はしない）。DB に書けないときだけ `Ack` せず、次の起動時に `RecoverProcessing` で再処理される。既に終端状態の行への再配信は無視する。
 
 ### 7.3. ScanCompletionEvent（`backend/shared/event/event.go`）
 
@@ -444,18 +467,18 @@ Redis は `requirepass`（`REDIS_PASSWORD`）で保護している。接続に�
 }
 ```
 
-ワーカーは `job_id` を `app-db` の `sfsp_job_id`（サムネイルは `thumbnail_sfsp_job_id`）と照合して対象の行を特定し、`file_id`（または `<file_id>/<filename>`）をキーに `clean-files` から取得する。
+ワーカーは `job_id` を `app-db` の `sfsp_job_id`（サムネイルは `thumbnail_sfsp_job_id`）と照合して対象の行を特定し、`file_id` をキーに `clean-files` から取得する（sfsp-worker は clean なファイルを `clean-files/<file_id>` に保存する）。game-worker / static-site-worker は `<file_id>` だけを読む（`<file_id>/<filename>` などの旧キーを順に試す処理は 2026-10-29 に削除）。profile-service と video-upload-api / video-worker には、まだ旧キーも試すフォールバックが残っている。
 
 ### 7.4. shared パッケージ（`github.com/atmosidea/shared`）
 
 | パッケージ | 内容 |
 |---|---|
-| `config/` | 環境変数の読み込み（Viper）、`Retry` |
+| `config/` | 環境変数の読み込み（Viper）、`Retry`。`Config` が持つのは Redis 用の `RedisAddr` / `RedisPassword` / `RedisDB` だけ（`queue.ConnectRedis` が使う。旧 SFSP 用の MinIO・スキャナー等のフィールドは 2026-10-29 に削除） |
 | `event/` | `ScanCompletionEvent` |
-| `model/` | 共通モデル |
-| `queue/` | Redis 接続、キュー名の定数、`EnqueueJob` / `DequeueJob` / `EnqueueScanCompletionEvent`、信頼性キュー用の `DequeueReliable` / `Ack` / `RecoverProcessing` |
+| `model/` | 共通モデル（`File` / `ScanJob` / `ScanResult` / `FileUploadResponse` など。SFSP が使う） |
+| `queue/` | Redis 接続（`ConnectRedis`）、キュー名の定数、`EnqueueJob` / `EnqueueScanCompletionEvent`、信頼性キュー用の `DequeueReliable` / `Ack` / `RecoverProcessing`（BRPOP で取り出す `DequeueJob` は削除済み） |
 
-SFSP（`backend/security/sfsp/`）は shared を使わず、`internal/model`・`internal/queue` に同じ定義を持っている。**キュー名やイベントの形を変えるときは両方を直す。**
+SFSP（`backend/security/sfsp/`）も shared を使う（`go.mod` に `replace github.com/atmosidea/shared => ../../shared`）。`cmd/sfsp-api`・`cmd/sfsp-worker` は `shared/config` と `shared/queue` で Redis に接続し、`internal/api` は `shared/model` と `shared/queue`（`EnqueueJob`）、`internal/worker` は `shared/event`・`shared/model`・`shared/queue`（`EnqueueScanCompletionEvent`）を使う。SFSP 独自の `internal/model` は 2026-10-29 に削除した。SFSP に残っている独自定義は `internal/queue`（`sfsp:scan_queue` の名前と、その信頼性キュー操作 `DequeueReliable` / `Ack` / `Requeue` / `DeadLetter` / `RecoverProcessing`。接続は shared のクライアントを `SetClient` で共有）と `internal/config`（SFSP 用の設定と `ResolveRedisAddr`）。**`sfsp:scan_queue` の名前や信頼性キューの動きを変えるときは `shared/queue` と `internal/queue` の両方を直す。**
 
 ---
 
@@ -483,8 +506,10 @@ SFSP（`backend/security/sfsp/`）は shared を使わず、`internal/model`・`
 
 1. `POST /api/games/upload`（multipart: `game` zip、`thumbnail`、`title`、`description`、任意で `team_id`）。
 2. game-upload-api が `games` に `status = 'scanning'` で先に INSERT → sfsp-api（`target_service=game`、ストリーミング送信）、サムネイルは `game-thumbnail` で別途送る → 応答ごとに job_id を UPDATE。上限: `MAX_GAME_UPLOAD_BYTES`（既定 1 GiB）/ `MAX_IMAGE_UPLOAD_BYTES`（既定 10 MiB）を超えると 413、画像以外のサムネイルは 415。
+   - 送信前に `verifyUnityWebGLZip` が zip 内の `.wasm` / `.wasm.br` / `.wasm.gz` を展開しながら（展開後の上限付き）`il2cpp` / `UnityEngine` を探し、Unity WebGL のビルドか確認する。gzip 圧縮だけのビルド（`.wasm.gz`）も受け付ける。
+   - sfsp-api の応答は常に `queued`。以前あった「sfsp-api が既に clean と返したら自前で完了イベントを発行する」処理（`republishIfClean`）は 2026-10-29 に削除した（ゲーム・静的サイトとも）。
 3. sfsp-worker がスキャン → `sfsp:completed:game`。
-4. game-worker: `clean` なら `processing` → `clean-files` から取得 → 上限付きで展開（`GAME_MAX_EXTRACTED_BYTES` 2 GiB / `GAME_MAX_ZIP_ENTRIES` 20000 / `GAME_MAX_ENTRY_BYTES` 1 GiB。超過・`../`・絶対パス・symlink は `failed`）→ `index.html` を探してルートを決定 → 解像度を抽出して CSS を注入 → `games/<id>/` へアップロード → `status = 'public'`、`game_url`・`native_width/height` を保存。`clean` 以外なら `quarantined` / `failed` / `invalid`。行が見つからないイベント（INSERT との競合）は 1/2/4/8/16 秒間隔で探し直す。
+4. game-worker: `clean` なら `processing` → `clean-files` から取得 → 上限付きで展開（`GAME_MAX_EXTRACTED_BYTES` 2 GiB / `GAME_MAX_ZIP_ENTRIES` 20000 / `GAME_MAX_ENTRY_BYTES` 1 GiB。超過・`../`・絶対パス・symlink は `failed`）→ `index.html` を探してルートを決定 → 解像度を抽出して CSS を注入 → `games/<id>/` へアップロード（`.br` / `.gz` の Unity ファイル（`.js` / `.wasm` / `.data`）には元の Content-Type と `Content-Encoding: br` / `gzip` を付ける）→ `status = 'public'`、`game_url`・`native_width/height`（抽出できなければ 1280 / 720）を保存。`clean` 以外なら `quarantined` / `failed` / `invalid`。行が見つからないイベント（INSERT との競合）は 1/2/4/8/16 秒間隔で探し直す。
 5. `AdjustGamePage` が `/api/games/:id` をポーリングし、`public` になったら `game_url` を iframe で表示。
 
 ### 8.4. 静的サイト
@@ -500,12 +525,12 @@ SFSP（`backend/security/sfsp/`）は shared を使わず、`internal/model`・`
    - 上限は `MAX_VIDEO_UPLOAD_BYTES`（既定 1 GiB、超過は 413）。sfsp-api へは io.Pipe でストリーミング送信する。
 2. **video-upload-api 内の goroutine**（`videoWorker`）が `sfsp:completed:stream` を `DequeueReliable` で取り出す → `clean` なら `processVideoAsync` を goroutine で実行:
    - `clean-files` から `UPLOAD_DIR`（`./backend/video-service/upload_workdir` を `/storage` にマウント）の `job-<id>-*` 一時ディレクトリへダウンロード（ユーザーのファイル名は使わない）。
-   - FFmpeg で 360p / 480p / 720p / 1080p の HLS とマスタープレイリストを作成し、サムネイルを生成。同時実行数は `FFMPEG_MAX_CONCURRENCY`（既定 2）、ffmpeg 1 回ごとのタイムアウトは `FFMPEG_TIMEOUT`（既定 2h）。
+   - FFmpeg で 360p / 480p / 720p / 1080p の HLS とマスタープレイリストを作成し、サムネイルを生成（最初のセグメント、無ければ元動画から。生成に失敗したら ERROR ログを出し、サムネイル無しで公開を続ける）。同時実行数は `FFMPEG_MAX_CONCURRENCY`（既定 2）、ffmpeg 1 回ごとのタイムアウトは `FFMPEG_TIMEOUT`（既定 2h）。
    - 処理中に動画が削除されると、削除ハンドラーがジョブをキャンセルし、ジョブ側も行の存在を再確認して `videos/<id>/` と `thumbnails/<id>` を消す。
    - `videos/<id>/...` と `videos/thumbnails/<id>` にアップロード（失敗時は最大 5 回までバックオフしてリトライ）。
    - `filename = /videos/<id>/playlist.m3u8`、`status = 'public'` に更新し、ローカルの一時ファイルを削除。
 3. 再生: `VideoDetailPage` → `/api/videos/<id>/stream/playlist.m3u8` → Nginx が MinIO の `videos/<id>/playlist.m3u8` にプロキシ。
-4. サムネイル差し替え: `PUT /api/videos/:id`（video-worker、投稿者 / 管理者のみ）→ `video-thumbnail` でスキャン → video-worker が画像形式を確認して保存。
+4. サムネイル差し替え: `PUT /api/videos/:id`（video-worker、投稿者 / 管理者のみ）→ `video-thumbnail` でスキャン → video-worker が `clean-files`（バケット名は `SFSP_CLEAN_BUCKET_NAME`、既定 `clean-files`）から取得し、画像形式を確認して保存。video-worker はローカルのディスク（`upload_workdir`・`THUMBNAIL_DIR`）を使わない。
 
 ### 8.6. プロフィール画像
 
@@ -517,6 +542,7 @@ SFSP（`backend/security/sfsp/`）は shared を使わず、`internal/model`・`
 - 加入: 公開チームに `POST /:token/join` → `auto_approve` なら即 `member`、そうでなければ `team_join_requests` に `pending`。非公開チームは加入申請できない（403）。
 - 承認: `PATCH /:token/join-requests/:requestId?action=approve`（admin 以上）→ トランザクション内で `pending` の申請だけを `approved` にし、**申請者本人**を `member` として追加（既存メンバーのロールは変えない）。該当する保留中の申請が無ければ 404。
 - チーム限定コンテンツ: 各アップロード API が `GET /api/teams/:token/permission` で投稿権限を確認し、コンテンツの `team_id` にトークンを保存する。閲覧時も動画・ゲーム・サイトの詳細 API と一覧の `?team=` が同じエンドポイントで `can_view` を確認する（Authorization を転送）。
+  - game-upload-api と static-site-upload-api は同じ実装: トークンを `^[A-Za-z0-9]{1,24}$` で検証してから問い合わせ（形式が違えば権限なし）、検証できた JWT だけを転送し、team-service に届かない・想定外の応答のときは拒否する（fail closed。一覧・詳細は 502、投稿は権限なし扱い）。team-service が 404 を返したら権限なし。
 - 退出・削除: 自分自身はいつでも退出できる（最後の owner は 409 `code: last_owner`）。他人を削除できるのは admin 以上で、相手のロールが自分より弱いときだけ。
 
 ### 8.8. アカウント削除
@@ -546,8 +572,10 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 | GET | `/google/callback` | — | クエリ | `/login/success?code=...` へリダイレクト（コードは 60 秒・1 回限り） |
 | POST | `/oauth/exchange` | — | `{"code"}` | 200 `{"token"}` / 400 / 401（無効・期限切れ） |
 | POST | `/logout` | JWT | — | 200 `{"message":"Successfully logged out"}` |
+| GET | `/me` | JWT | — | 200 `{"id","email","username","provider":"local\|google","isAdmin","status"}`（auth-db の自分の行。`username` は NULL なら `null`）/ 401 / 404 |
 | DELETE | `/me` | JWT | — | 200 `{"message","cleanupErrors":[...]}` |
-| GET | `/user/:userId` | — | — | `{"provider":"local\|google"}` |
+
+- 以前あった認証なしの `GET /user/:userId`（任意のユーザーの `provider` を返す）は 2026-10-29 に削除した。フロントエンドは `GET /me` の `provider` を使う（`AccountDeletionModal` が Google 用 / ローカル用の文言を切り替える）。
 
 ### 9.2. profile-service — `/api/profile`
 
@@ -559,7 +587,8 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 | PUT | （ベースパス） | JWT | `{"username","bio"}`、`status` を `active` に |
 | PUT | `/icon` | JWT | multipart `icon` → 202 `{"job_id","status":"scanning"}` |
 | PUT | `/background` | JWT | multipart `background` → 202 |
-| POST | `/internal/create`（旧パス。移行用） | `X-Internal-Key` | `{"user_id","username"}`。Nginx は `/api/profile/internal/` を 404 にする |
+
+`/api/profile` の下に内部 API は無い（移行用に残していた旧パスは 2026-10-29 に削除）。Nginx は念のため `/api/profile/internal/` を 404 にしている。
 
 内部専用（`/api/profile` の外。Nginx からは届かない。`X-Internal-Key` == `INTERNAL_API_KEY`、未設定なら常に 403）:
 
@@ -588,7 +617,7 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 |---|---|---|---|
 | POST | `/upload` | JWT | multipart `game`, `thumbnail`, `title`, `description` |
 | GET | （ベースパス） | — | 一覧（`?q=`、`?team=`、`status='public'` のみ。`?team=` は `can_view` が必要） |
-| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` のみ（それ以外 404）、`team_id` があれば `can_view`（無ければ 403、team-service 不達は 502） |
+| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` のみ（それ以外 404）、`team_id` があれば `can_view`（無ければ 403、team-service 不達は 502）。投稿者・管理者にだけ `thumbnail_sfsp_job_id` と `processing_details`（game-worker が書く進捗・失敗理由）を返す。応答に `uploader_name` は無い |
 | PUT | `/:id` | 投稿者本人のみ（管理者でも 403） | multipart `title`, `description`, `thumbnail` |
 | PUT | `/adjust/:id` | 投稿者本人のみ | `{"scale","offset_x","offset_y"}` |
 | DELETE | `/:id` | 投稿者 | ゲームと MinIO のファイルを削除（管理者も可） |
@@ -599,8 +628,8 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 | メソッド | パス | 認証 | 説明 |
 |---|---|---|---|
 | POST | `/upload` | JWT | multipart `file`, `thumbnail`, `title`, `description` |
-| GET | （ベースパス） | — | 一覧（`?q=`、`?team=`。public かつ `team_id IS NULL`、`?team=` は `can_view` が必要） |
-| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` かつ（`team_id` があれば `can_view`）のときだけ、それ以外 404 |
+| GET | （ベースパス） | — | 一覧（`?q=`、`?team=`。public かつ `team_id IS NULL`、`?team=` は `can_view` が必要（無ければ 403、team-service 不達は 502）） |
+| GET | `/:id` | 任意 | 詳細。投稿者・管理者以外は `public` かつ（`team_id` があれば `can_view`）のときだけ、それ以外 404。team-service 不達は 502 |
 | PUT | `/:id` | 投稿者 | タイトル・説明 |
 | DELETE | `/:id` | 投稿者 | サイトと MinIO のファイルを削除 |
 | DELETE | `/:id/thumbnail` | 投稿者 | サムネイル削除 |
@@ -654,17 +683,19 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 | メソッド | パス | 説明 |
 |---|---|---|
 | GET / HEAD | `/auth/check` | mon-nginx の `auth_request` 用（Basic 認証の確認だけ行う） |
-| GET | `/api/containers` | コンテナ一覧 |
-| GET | `/api/containers/stats` | CPU・メモリ |
-| POST | `/api/containers/restart/{name}` | 再起動 |
+| GET | `/api/containers` | コンテナ一覧（`id` / `name` / `image` / `status` / `state` / `health` / `restartCount` / `startedAt` など。`networks` / `isError` は返さない。ネットワークは `/api/topology` から取る） |
+| GET | `/api/containers/stats` | CPU・メモリ（CPU% は docker stats と同じ式。CPU 数は `OnlineCPUs` を優先し、cgroup v2 でも正しく出る） |
 | GET | `/api/connections/count` | `atmosidea-frontend` のログから直近 5 分のユニーク IP 数 |
 | GET | `/api/topology` | 構成図のデータ |
 | GET | `/api/volumes` | Docker ボリューム |
 | GET | `/api/minio/list/{containerName}?bucket=&prefix=` | MinIO の一覧 |
 | POST | `/api/minio/upload/{containerName}?bucket=&prefix=` | MinIO へアップロード（対象コンテナの root 資格情報を使う） |
 | DELETE | `/api/minio/delete/{containerName}?bucket=&key=` | MinIO から削除 |
-| GET (WS) | `/ws/logs?container=` または `/ws/logs/{id}` | ログのストリーミング |
+| GET (WS) | `/ws/logs?container=<名前または ID>` | ログのストリーミング（先頭のタイムスタンプを外した本文をテキストで送る。エラー行の判定はフロントエンドが行う） |
 
+- コンテナの再起動 API（`POST /api/containers/restart/{name}`）とパス形式の `/ws/logs/{id}` は 2026-10-29 に削除した。ダッシュボードは参照と MinIO の操作だけを行う。
+- OPTIONS（CORS プリフライト）は扱わない（同一オリジンなので不要）。
+- フロントエンドは `/api/containers` / `/api/containers/stats` を 3 秒ごと、`/api/topology` / `/api/volumes` を 15 秒ごとに取り直す。監視対象から外すのは `mon-*` と `*-builder` だけ（他プロジェクトのコンテナも表示される）。
 - `isTrustedRequest` が、Host が許可リスト（`localhost` / `127.0.0.1` / `::1` と `MONITORING_ALLOWED_HOSTS`）にあり、かつ Origin があれば同じホストであることを確認する。満たさなければ 403（WebSocket の `CheckOrigin` も同じ）。
 - CORS ヘッダーは返さない（フロントエンドは同じ nginx から配信される）。
 - 全ルート（`/api`、`/ws`）で HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`、定数時間比較）。未設定なら 503。mon-nginx は `auth_request` で UI も保護する。ループバック公開と同一オリジン制限も維持。
@@ -673,7 +704,7 @@ sfsp-worker は 30 秒ごとに app-db を見て、`public` になったコン�
 
 ## 10. Nginx（API ゲートウェイ）
 
-設定ファイル: `frontend/nginx.conf`（compose が `/etc/nginx/nginx.conf` に読み取り専用でマウント）。**変更したら `nginx -t` で構文を確認し、`docker compose restart frontend` で反映する。**
+設定ファイル: `frontend/nginx.conf`（イメージの `/etc/nginx/nginx.conf` にもコピーされるが、実行時は compose が同じパスに読み取り専用でマウントしたホストのファイルが使われる）。upstream はサービス名で固定しており、`resolver` は使わない（2026-10-29 に削除）。**変更したら `nginx -t` で構文を確認し、`docker compose restart frontend` で反映する。**
 
 ### 10.1. server ブロック
 
@@ -729,7 +760,7 @@ add_header X-Content-Type-Options "nosniff" always;
 ```
 
 - location 内で `add_header` を 1 つでも書くと、server レベルの `add_header`（メインの CSP）は**継承されない**。ヘッダーを追加するときは必要なものをすべてその location に書く。
-- メインの CSP は `script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net`、`frame-src 'self' http://*.localhost http://*.localhost:3001`。
+- メインの CSP（`location /`）は `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http://localhost http://localhost:3001 blob:; connect-src 'self' http://localhost http://localhost:3001; media-src 'self' blob:; frame-src 'self' http://*.localhost http://*.localhost:3001`。外部 CDN（以前の `https://cdn.jsdelivr.net`）と `ws://localhost` は 2026-10-29 に外した（どちらも使っていない）。`worker-src` が無いため `default-src 'self'` が適用され、hls.js の blob: Worker は起動できずメインスレッドで処理される（[15.4](#154-残っている問題2026-10-26-の対応後に判明)）。
 
 ### 10.5. サブドメイン（ゲーム・静的サイト）
 
@@ -751,7 +782,7 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 - 発行: auth-service の `generateJWT`。HS256、署名鍵は `JWT_SECRET`（全サービス共通）、有効期限 7 日。
 - クレーム: `sub` / `userID` / `user_id` / `id`（すべて同じユーザー ID）、`username`、`isAdmin`、`exp`、`jti`（UUID）。
 - 保存場所: フロントエンドの `localStorage['token']`（Cookie ではない）。
-- 検証: 各サービスの `authMiddleware`。auth / profile / mypage / team / video-* / game-upload-api / static-site-upload-api はすべて HS256 に固定し、`jti` の無いトークンは拒否する。
+- 検証: 各サービスの `authMiddleware`。auth / profile / mypage / team / video-* / game-upload-api / static-site-upload-api はすべて HS256 に固定し、`jti` の無いトークンは拒否する。game-upload-api と static-site-upload-api は同じ手順で、ユーザー ID を `sub` → `userID` → `user_id` → `id` の順に取り、UUID として解釈できなければ 401。
 
 ### 11.2. ログアウト（ブロックリスト）
 
@@ -806,7 +837,8 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 - `CapDrop: ALL` の下では clamav/clamav イメージの `/init`（chown を行う）が失敗する。Entrypoint を元に戻すとスキャン前に終了コード 1 で落ち、全ファイルが判定不能になる。
 - ウイルス定義は `sfsp-clamav-client` のビルド時に `freshclam` で更新する。サンドボックスはネットワークが無いので実行時には更新できない。定義を新しくするには `docker compose build --pull sfsp-clamav-client`。
 - sfsp-api と sfsp-worker は非 root（uid/gid 10001）で動く（`docker/api/Dockerfile`、`docker/worker/Dockerfile` の `USER 10001:10001`）。スキャン用ディレクトリ `/tmp/sfsp-scan` は 0755・10001 所有で、サンドボックスのスキャナー（`CapDrop: ALL`）が読めるようにしてある。既存の `sfsp_temp_scan` ボリュームは `sfsp-scan-volume-init` が毎回 chown する。
-- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy` 経由でサンドボックスを起動し、設定は compose の environment で明示的に渡す。
+- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy` 経由でサンドボックスを起動し（Docker SDK を使うので worker イメージに docker-cli は入っていない）、設定は compose の environment で明示的に渡す。`SFSP_CLAMAV_*` と `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` も `${VAR:-既定値}` の形で渡しているので、`.env` に書けば上書きできる（既定値は `internal/config/config.go` と同じ。`.env.example` にコメントアウトして列挙）。
+- YARA ルールは `sfsp-yara-client` イメージの `/etc/yara-rules` に焼き込まれており、sfsp-worker 自身は読まない（worker イメージに yara は無く、`yara-rules` のマウントも 2026-10-29 に外した）。ルールを変えたら `docker compose build sfsp-yara-client`。
 - 使う Docker API: `_ping`、`GET /images/{name}/json`、`POST /containers/create`、`start`、`wait`、`logs`、`DELETE /containers/{name}`。イメージの pull はしない（ローカルに無ければ `failed`）。
 - プロキシはリクエスト本文（Privileged・Binds 等）を検査しないので、完全な隔離ではない（[15 章](#15-既知の問題未対応)）。
 
@@ -830,17 +862,22 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 - SQL はすべてプレースホルダ（`$1`）を使う。
 - React の自動エスケープに頼り、`dangerouslySetInnerHTML` は使わない。
 - 秘密情報は `.env`（`.gitignore` 済み）。`.env.example` の値は公開済みなので本番では必ず変更する。
+- `.env` はイメージに入らない（Dockerfile はコピーせず、`.dockerignore` が `.env` / `.env.*` を除外）。各コンテナに届くのは compose の `environment:` に書いた、そのサービスが使う変数だけ（[4 章](#4-サービス一覧)）。
 
 ---
 
 ## 13. ビルドと依存関係の制約
 
-1. **`replace` ディレクティブ**: shared を使う Go サービスの `go.mod` には `replace github.com/atmosidea/shared => ../../shared` がある。新しいサービスを追加するときも必ず書く。無いと `exit status 128`（GitHub への認証エラー）でビルドが失敗する。
-2. **ビルドコンテキストはプロジェクトルート**: compose の `context: .`、Dockerfile は `COPY . .` → `WORKDIR /app/backend/<サービス>` の順。これで `../../shared` が解決される。この組み合わせを変えない。
-3. **`go mod tidy` の扱い**: 多くの Dockerfile は `go mod download` だけを行う。例外として、`profile-worker`・`game-upload-api`・`monitoring-service/backend` は Dockerfile 内で `go mod tidy` を実行し、SFSP の Dockerfile は `go.sum` が無いときだけ実行する。依存を追加したら、ローカルの `go.mod` / `go.sum` も更新すること（`video-worker` は `-mod=readonly` 相当でビルドされるため、`go.sum` が欠けると失敗する）。
-4. **最終イメージ**: `alpine:latest` に `ca-certificates` と `tzdata`。多くの Dockerfile がビルドステージで `.env` をイメージにコピーするため、**`.env` が無いとビルドが失敗する。**
+1. **`replace` ディレクティブ**: shared を使う Go モジュール（profile-worker、video-upload-api、video-worker、game-upload-api、game-worker、static-site-upload-api、static-site-worker、SFSP）の `go.mod` には `replace github.com/atmosidea/shared => ../../shared` がある。新しいサービスで shared を使うときも必ず書く。無いと `exit status 128`（GitHub への認証エラー）でビルドが失敗する。shared を import しない auth-worker / mypage-worker / team-worker の `go.mod` には、不要な `replace` を置かない（2026-10-29 に削除）。
+2. **ビルドコンテキストはプロジェクトルート**: compose の `context: .`、Dockerfile は `COPY . .` → `WORKDIR /app/backend/<サービス>` の順。これで `../../shared` が解決される。この組み合わせを変えない。`frontend` は `context: ./frontend`（`frontend/.dockerignore`）、`monitoring-service/backend` はそのディレクトリがコンテキスト。
+   - ルートの `.dockerignore` が `.git`・IDE の設定・`.env` / `.env.*`（`.env.example` は除く）・`node_modules`・`frontend/dist`・`backend/storage_data`・`backend/video-service/upload_workdir`・動画 / zip を除外する（コンテキストは約 2MB）。`backend/<サービス>/` のソースは除外してはいけない。
+3. **`go.sum` はコミット済み、ビルド時に `go mod tidy` しない**: どの Go の Dockerfile も `go mod download` → `CGO_ENABLED=0 GOOS=linux go build -o ...`（monitoring-service/backend は `GOOS=linux go build`）だけを行う（`go mod tidy` も `-a -installsuffix cgo` も使わない）。全モジュールの `go.sum`（`monitoring-service/backend/go.sum` を含む）はリポジトリにある。**依存を追加・削除したら、ローカルで `go mod tidy` して `go.mod` / `go.sum` をコミットする**（しないと `missing go.sum entry` でビルドが失敗する）。
+4. **最終イメージ**: `alpine:latest` に `ca-certificates` と `tzdata`。**`.env` はイメージにコピーしない**（設定は実行時に compose の `environment:` から渡る）ので、`.env` が無くてもビルドはできる（`docker compose` が `${...:?}` の変数を要求するので `up` には必要）。`EXPOSE` は実際の待ち受けポートに合わせてあり（static-site-upload-api は 8085）、ポートを持たないワーカー（game-worker、static-site-worker）には `EXPOSE` が無い。
+   - frontend は `npm ci --legacy-peer-deps`（`package-lock.json` どおりに入れる）→ `npm run build` → `nginx:stable-alpine` に `dist` と `nginx.conf`（`/etc/nginx/nginx.conf`）をコピー。依存を変えたら `package-lock.json` も更新する。
+   - sfsp-worker のイメージにはワーカーのバイナリだけが入る（docker-cli・yara は入れない）。
 5. **ローカルに Go が無い場合**: `docker run --rm -v "<リポジトリ>:/src:ro" -v atomosidea-gomodcache:/go/pkg/mod golang:1.25-alpine sh -c 'cd /src/<モジュール> && go build ./... && go vet ./...'` でビルドと vet を確認できる。
 6. **改行コード**: リポジトリのソースは LF。Windows の Python などで書き換えると CRLF になることがあるので注意する。
+7. **フロントエンドの lint**: `frontend/` と `monitoring-service/frontend/` に ESLint の設定（`.eslintrc.cjs`）があり、`npm run lint` が通る状態にしてある。
 
 ---
 
@@ -874,12 +911,35 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 | （同上）初期管理者 `admin@internal.local` が投入される | 投入しない |
 | （同上）ブロックリストを見るのは auth-service だけ | JWT を検証する全サービスが確認する |
 | （同上）`POST /api/profile/internal/create` は認証なし | `X-Internal-Key` 必須。正式なパスは `/internal/create` |
+| （2026-10-26〜28 の EditAI.md 13 章・16 章）多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込むため、`.env` が無いとビルドが失敗する | 2026-10-29 から、どの Dockerfile も `.env` をコピーしない。ルートの `.dockerignore` が `.env` / `.env.*` を除外し、設定は compose の `environment:` から実行時に渡る（[13 章](#13-ビルドと依存関係の制約)） |
+| （同上 13 章・AI_PROJECT_GUIDE.md）`profile-worker`・`game-upload-api`・`monitoring-service/backend` は Dockerfile 内で `go mod tidy` を実行し、SFSP は `go.sum` が無いときだけ実行する | 2026-10-29 から、どの Dockerfile も `go mod tidy` を実行しない（`go mod download` だけ）。全モジュールの `go.sum` をコミット済み（`monitoring-service/backend/go.sum` を新規追加）。`-a -installsuffix cgo` も削除 |
+| （同上 15.4）アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取る | `env_file` は全サービスから削除。各サービスはコードが読む変数だけを `environment:` で受け取る（[4 章](#4-サービス一覧)のアンカー表） |
+| （同上 7.4・17 章・AI_PROJECT_GUIDE.md）SFSP は shared を使わず、`internal/model`・`internal/queue` に同じ定義を持つ | SFSP は `shared/config`・`shared/queue`・`shared/model`・`shared/event` を使う。`internal/model` は削除。独自に残るのは `internal/queue`（`sfsp:scan_queue` の信頼性キュー操作）と `internal/config` |
+| （同上 9.1）`GET /api/auth/user/:userId`（認証なし）が `{"provider"}` を返す | 削除。JWT 必須の `GET /api/auth/me` が `{"id","email","username","provider","isAdmin","status"}` を返し、フロントエンドの `AuthContext` が `provider` をここから取る（以前は `/api/profile/me` の応答に無い `provider` を読んでいたため、ローカルアカウントでも `AccountDeletionModal` が Google 用の文言を出していた） |
+| （同上 9.2）移行用の旧パス `POST /api/profile/internal/create`（`X-Internal-Key` 必須）が残っている | 削除。内部 API は `/internal/create`（`/api/profile` の外）だけ |
+| （同上 5 章・Docs/MinIO_DB.md）mypage-service は `mypage_service_user`（`AUTH_DATABASE_URL`、`MYPAGE_SERVICE_DB_PASSWORD`）で auth-db にも接続する | mypage-service は app-db だけに接続する。ロール・変数・`db-role-init` の処理を削除（既存ボリュームのロールは [5 章冒頭](#5-データベース)の SQL で消せる） |
+| （同上 5.4・README・Docs/MinIO_DB.md）team-db に `team_content` テーブルがある | init.sql から削除（未使用だった）。既存ボリュームには残る |
+| （同上 Docs/MinIO_DB.md）profile-db の初回起動時にテストユーザー `user_atomos` が入る | 投入しない |
+| （同上 5 章）`backend/datebase/app-db/` に既存ボリューム向けの `001_*.sql` / `002_*.sql` があり、`backend/auth/auth-db/init.sql`（複製）とルートの `db.sql` もある | すべて削除。各 DB の初期化スクリプトは compose がマウントする `init.sql`（sfsp-db はディレクトリ）だけ。`placeholder.txt` と SFSP の空ディレクトリ（`reports/`・`test-samples/`・`sandbox/`・`scanners/`・`scripts/` の `.gitkeep`）も削除 |
+| （同上 6.2・Docs/MinIO_DB.md）`SFSP_UPLOAD_*`（`sfsp-upload-policy`、raw-files に PutObject）を各アップロード API と profile-service が使う | 誰も使っていなかったため廃止（ユーザー・ポリシー・`sfsp-upload-policy.json`・`.env.example` の変数を削除）。アップロード API はファイルを MinIO ではなく sfsp-api に送る |
+| （同上 7.2）`target_service=thumbnail` は `site-thumbnail` の互換用の別名 | 廃止。sfsp-api は 400 で拒否する |
+| （同上 4.1）共通コンポーネントに `PrivateRoute.tsx` がある | 削除（どのルートからも使われていなかった） |
+| （同上 docker-compose.yml の Redis アンカー）全サービスに `REDIS_ADDR` / `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` / `REDIS_URL` を渡す | `REDIS_HOST` / `REDIS_PORT` は削除。`REDIS_URL` は sfsp-api / sfsp-worker だけ、`REDIS_DB` は読むサービスだけ（[4 章](#4-サービス一覧)） |
+| （同上）`INTERNAL_API_KEY` を全アプリ側サービスに渡す | auth-service・profile-service・team-service だけ |
+| （同上 10.4・Docs/Nginx.md）メインの CSP の `script-src` に `https://cdn.jsdelivr.net`、`connect-src` に `ws://localhost` がある | どちらも削除（使っていない） |
+| （同上 9.9・README・monitoring-service/README.md）監視ダッシュボードに `POST /api/containers/restart/{name}` と `/ws/logs/{id}` がある。`/api/containers` が `networks` / `isError` を返す | 再起動 API と `/ws/logs/{id}` は削除（ログは `/ws/logs?container=` だけ）。`networks` / `isError` も返さない |
+| （同上 7.3）ワーカーは `file_id` か `<file_id>/<filename>` をキーに `clean-files` から取得する | game-worker / static-site-worker は `<file_id>` だけ（旧キーの候補を順に試す処理は削除）。profile-service / video 系にはフォールバックが残る |
+| （同上 15.4）game-worker が起動時に `ensureBucket` で `games` バケットの作成と匿名読み取りを設定する（static-site-upload-api も同様） | どちらも削除。`minio-init` が行う（profile-service の `user-profiles` だけは今も起動時に作成・設定する） |
+| （SFSP の Runbook / Dockerfile）sfsp-worker は `yara-rules` をマウントし、worker イメージに docker-cli と yara を入れる | マウントもインストールもしない。ルールは `sfsp-yara-client` イメージに焼き込まれ、サンドボックスの中でだけ使われる |
+| （SFSP の Runbook）ClamAV / zip 展開の上限（`SFSP_CLAMAV_*`、`SFSP_MAX_*`）は sfsp-worker の environment に無いので、`.env` に書いても効かない | 2026-10-29 から compose が `${VAR:-既定値}` で sfsp-worker に渡すので、`.env` に書けば効く（sfsp-api の `SFSP_MAX_UPLOAD_BYTES` も同様） |
+| （Docs/Nginx.md）`frontend/Dockerfile` は `nginx.conf` を `/etc/nginx/conf.d/default.conf` にコピーする | `/etc/nginx/nginx.conf` にコピーする（compose のマウント先と同じパス） |
+| （monitoring-service/README.md）`mon-backend` は `sfsp-isolated-net` にも参加する。compose に `version:` がある | 既存のネットワークで参加するのは `atmosidea-network` だけ（ほかは監視スタック内の `monitoring-network`）。`version:` は削除 |
 
 ---
 
 ## 15. 既知の問題（未対応）
 
-コードレビューで見つかった問題の一覧。15.1〜15.3 の行は 2026-10-26 の対応で解消済み（取り消し線 + 「対応済み」。履歴として残す）で、未対応のものは [15.4](#154-残っている問題2026-10-26-の対応後に判明) に残っている。**関連する箇所を変更するときは、この表を確認し、直したら行を削除せずに「対応済み」と追記する。**
+コードレビューで見つかった問題の一覧。15.1〜15.3 の行は 2026-10-26 の対応で解消済み（取り消し線 + 「対応済み」。履歴として残す）で、未対応のものは [15.4](#154-残っている問題2026-10-26-の対応後に判明) に残っている。15.4 のうち 2026-10-29 の整理で解消したものにも「対応済み（2026-10-29）」と書き、その整理で見つかった未対応の問題を 15.4 の末尾に追加した。**関連する箇所を変更するときは、この表を確認し、直したら行を削除せずに「対応済み」と追記する。**
 
 ### 15.1. セキュリティ
 
@@ -934,14 +994,20 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 
 | 重大度 | 問題 | 場所 |
 |---|---|---|
-| High | Nginx が MinIO に直接プロキシする経路（HLS `/api/videos/<id>/stream/*`、`/videos\|games\|static-sites/thumbnails/*`、サブドメイン `<id>.localhost`）に認可が無い。チーム限定・処理中のコンテンツも ID が分かれば取得できる（隔離済みファイルは公開バケットに置かれないので対象外）。`<img>`・hls.js・サブドメインには JWT が届かないため、署名付き URL か Cookie など別の仕組みが要る | `frontend/nginx.conf`、各バケットの匿名読み取りポリシー（game-worker の `ensureBucket` を含む） |
+| High | Nginx が MinIO に直接プロキシする経路（HLS `/api/videos/<id>/stream/*`、`/videos\|games\|static-sites/thumbnails/*`、サブドメイン `<id>.localhost`）に認可が無い。チーム限定・処理中のコンテンツも ID が分かれば取得できる（隔離済みファイルは公開バケットに置かれないので対象外）。`<img>`・hls.js・サブドメインには JWT が届かないため、署名付き URL か Cookie など別の仕組みが要る | `frontend/nginx.conf`、各バケットの匿名読み取りポリシー（game-worker の `ensureBucket` を含む。※ `ensureBucket` は 2026-10-29 に削除。現在は `minio-init` と profile-service の起動時処理が設定する） |
 | Medium | `sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる | `docker-compose.yml` |
-| Medium | 多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込み、アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取っている | 各 `Dockerfile`、`docker-compose.yml` |
+| Medium | ~~多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込み、アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取っている~~ **対応済み（2026-10-29）**: Dockerfile は `.env` をコピーせず、`.dockerignore` で `.env` / `.env.*` を除外。`env_file` を全サービスから削除し、各サービスはコードが読む変数だけを `environment:` で受け取る。**ただし DB の資格情報は下の「スーパーユーザー」の行のとおり残っている**（`.env` を含んでいた古いイメージは削除済み。今後 `docker compose build` で作るイメージには `.env` が入らない） | 各 `Dockerfile`、`docker-compose.yml`、`.dockerignore` |
 | Medium | `POSTGRES_PASSWORD` と MinIO の各キーは `.env.example` で公開済みの値のまま。変更するにはボリュームの作り直しが必要 | `.env` |
 | Low | Redis に job ID が無いまま `running` で止まった過去のスキャンジョブは回収されない | sfsp-worker |
 | Low | `docker compose` のプロジェクト名がフォルダ名から決まるため、フォルダ名が違うと別プロジェクトとして新しい空のボリュームが作られ、既存の DB が見えなくなる（稼働中のスタックは `atomosidea-claude`、このフォルダ `Atomosidea-work(claude)` から導出される名前は `atomosidea-workclaude`）。`.env` の `COMPOSE_PROJECT_NAME` か compose の `name:` で固定する | `docker-compose.yml`、各 `.bat` |
 | Low | 処理エラー時の status がサービスで違う（動画 `error`、ゲーム `failed`、静的サイト `error` / `failed`） | 各ワーカー |
 | Low | 削除済みの Google ユーザーは同じ Google アカウントで再登録できない。ログイン可能な status に `pending` も含めている | `auth-worker/main.go` |
+| Medium | （2026-10-29 に判明）MinIO のポリシーが最小権限になっていない。`app-*-policy`（games / static-sites / videos / user-profiles）と `sfsp-api-policy`（raw-files）は対象バケットに `s3:*`。video-upload-api は clean-files を読むだけなのに、sfsp-worker 用の `SFSP_WORKER_CLEAN_*`（clean-files / quarantine / raw-files に `s3:*`）を使っている（専用の `SFSP_VIDEO_WORKER_*` 相当の読み取り専用キーにすべき） | `backend/minio-init/*.json`、`docker-compose.yml` の video-upload-api |
+| Medium | （2026-10-29 に判明）app-db / profile-db / sfsp-db にはアプリ用ロールが無く、auth-service（`APP_DATABASE_URL`）・profile-service・video-*・game-*・static-site-*・mypage-service・sfsp-api / sfsp-worker（sfsp-db）が `POSTGRES_USER` / `POSTGRES_PASSWORD`（全 DB 共通のスーパーユーザー）で接続している。`env_file` の廃止後も、これらのサービスはスーパーユーザーの資格情報を持つ | `docker-compose.yml`、各 `init.sql` |
+| Low | （2026-10-29 に判明）メインの CSP に `worker-src` が無く `default-src 'self'` が適用されるため、hls.js の blob: Worker が起動できない（コンソールに CSP 違反が出て、hls.js はメインスレッドで処理を続けるので再生はできる）。`worker-src 'self' blob:` を足すか、hls.js を `enableWorker: false` にする | `frontend/nginx.conf`、`VideoDetailPage.tsx` |
+| Low | （2026-10-29 に判明）init.sql から外した `mypage_service_user` ロール（auth-db）・`team_content` テーブル（team-db）・デモユーザー `user_atomos`（profile-db）は、既存のボリュームには残っている（どのコードも使わない）。**この開発環境では対応済み（2026-10-29）**: 起動テストの後に `team_content` を DROP、`mypage_service_user` を `DROP OWNED` → `DROP ROLE`、`user_atomos` を DELETE（いずれも参照・行が無いことを確認済み）、MinIO の `sfsp-upload-access-key` ユーザーと `sfsp-upload-policy` を削除した。**ほかの環境の既存ボリューム**では、[5 章冒頭](#5-データベース)の SQL と `mc admin user remove` / `mc admin policy remove` を手動で流す | 既存の Docker ボリューム、`backend/storage_data` |
+| Low | （2026-10-29 に判明）profile-service と video-upload-api / video-worker は、clean-files の取得で今も旧キー（`<file_id>/<filename>`、SHA256 など）を順に試す。game / static-site は `<file_id>` だけに揃えた | `profile-worker/main.go`、`video-upload-api/main.go`、`video-worker/main.go` |
+| Low | （2026-10-29 に判明）`backend/shared/config.LoadConfig` は今も `.env` ファイルを読もうとする（イメージに `.env` が無いので起動時に「.env file not found」の警告が出るだけで、値は環境変数から読む） | `backend/shared/config/config.go` |
 
 ---
 
@@ -950,10 +1016,16 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 | 症状 | 原因と対処 |
 |---|---|
 | サービスが起動しない | `docker compose logs <サービス>`。`.env` の不足、依存サービスの起動失敗が多い |
-| ビルドで `COPY .env` が失敗 | `.env` が無い。`cp .env.example .env` |
+| ビルドで `COPY .env` が失敗 | （2026-10-28 以前の Dockerfile の症状）現在の Dockerfile は `.env` をコピーしないので起きない。古いブランチで出たら `cp .env.example .env` |
+| `docker compose up` が `... must be set in .env` で止まる | `.env` が無いか、必須の変数（`REDIS_PASSWORD`・`SFSP_API_KEY`・`INTERNAL_API_KEY`・`POSTGRES_*`・`*_DB_PASSWORD` など）が空。`cp .env.example .env` して値を設定する |
+| `.env` に書いた値がコンテナに届かない | 各サービスは `environment:` に書いた変数しか受け取らない（`env_file` は使っていない）。そのサービスの `environment:` に `VAR: ${VAR}` を追加して `docker compose up -d` |
+| 起動ログに `Warning: .env file not found` | 問題なし。`shared/config` が `.env` ファイルを探すだけで、値は環境変数から読む |
 | `exit status 128` | `go.mod` の `replace github.com/atmosidea/shared => ../../shared` が無い |
 | `replacement directory ../shared does not exist` | ビルドコンテキストがルートでない。`COPY . .` と `WORKDIR` を確認 |
-| `missing go.sum entry` / `updates to go.mod needed` | 依存を追加した後に `go.sum` を更新していない |
+| `missing go.sum entry` / `updates to go.mod needed` | 依存を追加した後に `go.sum` を更新していない。Dockerfile は `go mod tidy` を実行しないので、ローカル（または [13 章](#13-ビルドと依存関係の制約)の `docker run ... golang`）で `go mod tidy` して `go.mod` / `go.sum` をコミットする |
+| frontend のビルドで `npm ci` が失敗 | `package.json` と `package-lock.json` が食い違っている。`npm install --legacy-peer-deps` で lock を更新してコミットする |
+| 動画ページのコンソールに `worker-src` / blob: の CSP 違反 | 既知（[15.4](#154-残っている問題2026-10-26-の対応後に判明)）。hls.js はメインスレッドで動くので再生には影響しない |
+| `db-role-init` が `mypage_service_user` について何か言う / 古いロールが残っている | 現在の `db-role-init` は `mypage_service_user` を扱わない。古いボリュームに残ったロールは [5 章冒頭](#5-データベース)の SQL で削除できる |
 | MinIO の `Access Denied` / `InvalidAccessKeyId` | `.env` のキーと `minio-init` のユーザーが一致しているか。`docker logs atmosidea-minio-init` を確認。一時的なエラーは video の HLS アップロードでは最大 5 回リトライされる |
 | アップロードが `scanning` のまま | sfsp-worker のログで `Finished processing job: <id>` まで進んだか。完了イベントのキュー名と `target_service` が一致しているか |
 | 正常なファイルが `malicious` / `failed` | `sfsp-db.scan_results.raw_output` を確認。サンドボックスの Entrypoint を変更していないか（[12.2](#122-サンドボックスinternalsandboxdockergo)） |
@@ -974,8 +1046,9 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 
 1. **正のソース**は `docker-compose.yml` と `backend/` の実ファイル。ドキュメントと違えば実装を優先し、ドキュメントを直す。
 2. **パス・テーブル・カラム・キュー名・環境変数名**を変えたら、このドキュメントの該当箇所を同じ変更で更新する。
-3. **Go サービス**: `replace` ディレクティブ、ルートのビルドコンテキスト、`COPY . .` + `WORKDIR` を守る。依存を追加したら `go.mod` / `go.sum` も更新する。`go build ./...` と `go vet ./...` を通す。
-4. **キュー・イベント**: `backend/shared/queue` と `backend/security/sfsp/internal/queue`（・`model`）の両方を直す。`target_service` を追加したら sfsp-api の許可リストも直す。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` する（BRPOP を使わない）。
+3. **Go サービス**: `replace` ディレクティブ、ルートのビルドコンテキスト、`COPY . .` + `WORKDIR` を守る。依存を追加したら `go.mod` / `go.sum` も更新する（Dockerfile では `go mod tidy` しない）。`go build ./...` と `go vet ./...` を通す。Dockerfile に `.env` のコピーを戻さない。
+   - **環境変数**: コードで新しい変数を読むなら、`docker-compose.yml` のそのサービスの `environment:` と `.env.example` を同じ変更で更新する（`env_file` は使わない）。
+4. **キュー・イベント**: イベントの形は `backend/shared/event`（SFSP も同じものを使う）。`sfsp:scan_queue` の名前や信頼性キューの動きは `backend/shared/queue` と `backend/security/sfsp/internal/queue` の両方を直す（SFSP の `internal/model` は削除済みで、モデルは `shared/model`）。`target_service` を追加したら sfsp-api の許可リストも直す。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` する（BRPOP を使わない）。
 5. **Nginx**: `proxy_pass` の末尾スラッシュ禁止。location の評価順。`/api/videos/...` に新しいエンドポイントを video-upload-api 側で追加したら、専用の location も追加する（追加しないと video-worker に転送される）。location 内の `add_header` は server のものを継承しない。`nginx -t` → `docker compose restart frontend`。
 6. **ユーザーのファイルを配信する経路を追加・変更**: メインオリジンで HTML / JS を実行させない（サブドメインで配信するか、`CSP: sandbox` + `nosniff` を付ける）。サムネイル等は画像形式のみ保存する。
 7. **スキャン**: 判定は終了コードで行う。スキャナーのエラーは公開しない側（`failed`）に倒す。zip は展開した全体をスキャンする。サンドボックスの制限を緩めない。

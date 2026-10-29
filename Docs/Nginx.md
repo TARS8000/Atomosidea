@@ -43,11 +43,13 @@ NginxはDocker Composeにより`frontend`サービスとして定義され、`ht
 
 ### ビルドフロー（`frontend/Dockerfile`）
 
-1. **ビルドステージ:** `node:20-alpine` でReactアプリをビルドし、`dist` を生成。`VITE_STATIC_SITE_DOMAIN` などのビルド引数を取り込みます。
-2. **プロダクションステージ:** `nginx:stable-alpine` にビルド成果物を `/usr/share/nginx/html` へコピーし、`nginx.conf` を設定として読み込みます。
+1. **ビルドステージ:** `node:20-alpine` で `npm ci --legacy-peer-deps`（`package-lock.json` どおりに依存を入れる）→ `npm run build` を実行し、`dist` を生成。`VITE_STATIC_SITE_DOMAIN` などのビルド引数を取り込みます。
+2. **プロダクションステージ:** `nginx:stable-alpine` にビルド成果物を `/usr/share/nginx/html` へ、`nginx.conf` を `/etc/nginx/nginx.conf` へコピーします。
 3. コンテナ起動時は `nginx -g "daemon off;"` でフォアグラウンド起動します。
 
-> **補足:** `Dockerfile` は設定を `/etc/nginx/conf.d/default.conf` へコピーしますが、実行時には`docker-compose.yml` によるボリュームマウント（`/etc/nginx/nginx.conf`）が優先されます。実際の稼働設定はマウントされた`nginx.conf`（`frontend/nginx.conf`）が担当します。
+> **補足:** `Dockerfile` がイメージにコピーする先（`/etc/nginx/nginx.conf`）と、`docker-compose.yml` が `frontend/nginx.conf` を読み取り専用でマウントする先は同じパスです。compose で起動したときはマウントしたホストのファイルが使われるので、設定を変えたら再ビルドせずに `docker compose restart frontend` で反映できます（イメージ単体で起動した場合もビルド時の `nginx.conf` がそのまま使われます）。以前の `Dockerfile` は `/etc/nginx/conf.d/default.conf` にコピーしていました。
+>
+> ビルドコンテキストは `./frontend`（`frontend/.dockerignore` で `node_modules` などを除外）で、`.env` は使いません（ビルド引数は compose の `args` で渡します）。
 
 ---
 
@@ -94,7 +96,7 @@ Atomosideaは**1つのMinIOインスタンス**（`minio:9000`）を持ち、Ngi
 - **listen:** `80`
 - **server_name:** 正規表現 `~^(?<subdomain>[a-z0-9]{10})\.localhost$`
 - **役割:** `{10文字の英小文字・数字}.localhost` というサブドメインで、ゲームまたはstatic-siteをMinIOから配信します。アプリ（`localhost`）とは別オリジンになります。
-- Dockerの内蔵DNSを `resolver 127.0.0.11 valid=5s` で指定しています。
+- `resolver` は指定していません（以前は `resolver 127.0.0.11 valid=5s` がありましたが、`proxy_pass` の宛先は upstream 名で、起動時に解決されるため不要として削除しました）。
 - `server_name` の正規表現はバックスラッシュを含むため、引用符で囲む必要があります。
 
 ### 2. メインアプリケーション用 Block（localhost & default）
@@ -199,7 +201,7 @@ add_header Permissions-Policy "camera=(self), microphone=(self), geolocation=(),
 
 メインBlockでは、セキュリティとパフォーマンスの設定を行っています。
 
-- **Content-Security-Policy (CSP):** スクリプト・スタイル・メディア・フレームなどの送信元を限定し、XSSなどの攻撃を緩和します。`cdn.jsdelivr.net` をスクリプトの送信元に加え、ゲーム・static-siteのサブドメインをiframeで埋め込めるよう `frame-src` に `http://*.localhost` を許可しています。
+- **Content-Security-Policy (CSP):** スクリプト・スタイル・メディア・フレームなどの送信元を限定し、XSSなどの攻撃を緩和します。スクリプトは自オリジンのみ（`'self' 'unsafe-inline' 'unsafe-eval'`。以前あった外部CDN `https://cdn.jsdelivr.net` は削除）、`connect-src` は `'self'` と `http://localhost(:3001)`（以前あった `ws://localhost` は削除）で、ゲーム・static-siteのサブドメインをiframeで埋め込めるよう `frame-src` に `http://*.localhost` を許可しています。`worker-src` が無いため `default-src 'self'` が適用され、hls.js の blob: Worker は起動できません（hls.js はメインスレッドで処理するので再生は可能。`EditAI.md` 15.4）。
 - **client_max_body_size:** メインBlockの既定は `12m`（画像10 MiB＋multipartのオーバーヘッド）です。大きなファイルを受け付けるアップロードAPIだけ、専用のlocationで引き上げています（`/api/videos/upload` と `/api/games/upload` は `1100m`、`/api/static-sites/upload` は `550m`。いずれも `proxy_request_buffering off`）。正確な上限はバックエンドが `MAX_*_UPLOAD_BYTES` で検査し、超過すると 413 を返します。
 - **パフォーマンス:** `sendfile`、`tcp_nopush`、`tcp_nodelay`、`keepalive_timeout` などで静的ファイル配信を高速化しています。
 - **タイムアウト:** 動画・ゲーム・static-siteのアップロードなど時間がかかる処理に対し、アップロード用のlocationで `proxy_read_timeout`・`proxy_send_timeout` を300秒に設定しています（`/api/videos/upload` のみ `proxy_connect_timeout` も300秒）。それ以外のlocationはNginxの既定値です。

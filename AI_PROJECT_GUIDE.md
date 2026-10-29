@@ -245,10 +245,11 @@ AIが変更を行う際、特に注意すべき**プロジェクト固有の制�
 - 補足: 正規表現の `location` は書いた順に評価され、最初に一致したものが使われる。また `location` 内で `add_header` を1つでも書くと、serverレベルの `add_header`（メインのCSP）は継承されない。
 
 ### ⚠️ Trap 2: Goの `shared` 依存とDockerビルド
-- 全Goサービスは `github.com/atmosidea/shared` を共有する。
-- `go.mod` 末尾に `replace github.com/atmosidea/shared => ../../shared`（サービスの階層に合わせた相対パス）が必要。**忘れると `exit status 128`（GitHub認証エラー）でビルド失敗。**
-- Dockerビルドは **常にルートコンテキスト** で `COPY . .` 後 `WORKDIR /app/<パス>`。多くのDockerfileは `go mod download` だけを行う。ただし `profile-worker`・`game-upload-api`・`monitoring-service/backend` のDockerfileは `RUN go mod tidy` を実行し、SFSPのDockerfileは `go.sum` が無いときだけ実行する。依存を追加したら、ローカルの `go.mod` / `go.sum` も更新すること。
-- **AIの対応**: 新Goサービス作成時、`replace` を正しく追記。既存Dockerfileの `COPY . .` / `WORKDIR` / ビルドコンテキストを破壊しない。
+- 多くのGoサービス（profile-worker・video-*・game-*・static-site-*・SFSP）は `github.com/atmosidea/shared` を共有する（auth-worker・mypage-worker・team-worker は使わないので `replace` も無い）。
+- shared を使う `go.mod` には末尾に `replace github.com/atmosidea/shared => ../../shared`（サービスの階層に合わせた相対パス）が必要。**忘れると `exit status 128`（GitHub認証エラー）でビルド失敗。**
+- Dockerビルドは **常にルートコンテキスト** で `COPY . .` 後 `WORKDIR /app/<パス>`。どのDockerfileも `go mod download` → `go build` だけを行い、`go mod tidy` は実行しない（全モジュールの `go.sum` はコミット済み）。依存を追加・削除したら、ローカルで `go mod tidy` して `go.mod` / `go.sum` をコミットすること（しないと `missing go.sum entry` でビルド失敗）。
+- `.env` はイメージにコピーしない（ルートの `.dockerignore` が除外）。設定は `docker-compose.yml` の各サービスの `environment:` から実行時に渡る。`env_file: .env` は使わず、各サービスにはそのコードが読む変数だけを書く。
+- **AIの対応**: 新Goサービス作成時、`replace` を正しく追記。既存Dockerfileの `COPY . .` / `WORKDIR` / ビルドコンテキストを破壊しない。Dockerfileに `.env` のコピーや `go mod tidy` を戻さない。コードで新しい環境変数を読むなら、そのサービスの `environment:` と `.env.example` にも追加する。
 
 ### ⚠️ Trap 3: 「正のソース」は実装
 - ドキュメント（本ガイド・README・`EditAI.md` など）と実装(`docker-compose.yml`・`backend/`)が**食い違った場合、実装が正**。信頼する順は `docker-compose.yml` → `backend/` と `init.sql` → `EditAI.md` → 本ガイド・README。
@@ -257,7 +258,7 @@ AIが変更を行う際、特に注意すべき**プロジェクト固有の制�
 
 ### ⚠️ Trap 4: サービス間契約
 - キュー名(`sfsp:scan_queue`等)、レスポンスJSON、DBスキーマ、内部APIのキー（`X-SFSP-API-Key` / `X-Internal-Key`）は「契約」。
-- キュー名やイベントの形は `backend/shared/queue` と SFSP の `internal/queue`（`internal/model`）に同じ定義が二重にある。
+- イベントの形（`backend/shared/event`）とモデル（`backend/shared/model`）は SFSP も shared のものを使う（SFSP 独自の `internal/model` は削除済み）。ただし `sfsp:scan_queue` の名前と信頼性キューの操作は、`backend/shared/queue` と SFSP の `internal/queue` に二重にある。
 - **AIの対応**: 一方だけ変更せず、両方を含む関連全サービスで整合を取る。変更後は関連サービスをすべて再ビルド。
 
 ### ⚠️ Trap 5: 静的サイトのサブドメイン分離
@@ -299,7 +300,7 @@ AIが変更を行う際、特に注意すべき**プロジェクト固有の制�
 
 1. **正のソース確認**: パス・DB名・キュー名・環境変数は `docker-compose.yml` と `backend/` で確認。
 2. **影響範囲特定**: 変更が「どのサービスの契約」に関わるか特定。関連全サービスをリストアップ。
-3. **Goサービス**: `go.mod` の `replace` を確認。`Dockerfile` のビルド方式を破壊しない。
+3. **Goサービス**: `go.mod` の `replace` を確認。`Dockerfile` のビルド方式を破壊しない。依存を変えたら `go.sum` もコミット。新しい環境変数は compose の `environment:` と `.env.example` にも追加。
 4. **Nginx編集**: 末尾スラッシュなし `proxy_pass` 規約遵守。編集後 `nginx -t` → `docker compose restart frontend`。
 5. **DBスキーマ**: 対応DBの `init.sql` を更新（auth-db/app-db/profile-db/team-db/sfsp-db）。既存ボリュームには反映されないので、必要ならマイグレーションSQLも用意する。
 6. **MinIO政策**: バケット/ユーザー/ポリシー変更は `docker-compose.yml` の `minio-init` と `backend/minio-init/*.json` と `.env.example` を対で更新。

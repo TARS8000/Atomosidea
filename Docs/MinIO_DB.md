@@ -31,7 +31,7 @@ Atomosideaの永続層は、データベースはインスタンス単位（物�
 
 - **コンテンツ種別ごとに専用バケットと専用IAMユーザー**を用意し、各サービスが自分のバケットだけを操作できるようにして、他種別への影響を限定する。
 - **SFSPはRaw（スキャン前）とClean（スキャン後）を同一MinIO内の別バケット**に分け、スキャンで問題が見つかったファイルがClean側へ到達しない構造にする。
-- **データベースは用途別に分割し、権限を細分化**。`auth-db`（`auth_service_user`／`mypage_service_user`）、`team-db`（`team_service_user`）、`app-db`のSFSPワーカー用（`sfsp_worker`、読み取り専用）は専用ロールで接続し、最小権限の原則に従う。それ以外（`app-db`・`profile-db`・`sfsp-db`への他のサービスの接続）は`POSTGRES_USER`で接続する。ロールのパスワードは`init.sql`に書かず、`db-role-init`が`.env`の値で設定する。
+- **データベースは用途別に分割し、権限を細分化**。`auth-db`（`auth_service_user`）、`team-db`（`team_service_user`）、`app-db`のSFSPワーカー用（`sfsp_worker`、読み取り専用）は専用ロールで接続し、最小権限の原則に従う。それ以外（`app-db`・`profile-db`・`sfsp-db`への他のサービスの接続）は`POSTGRES_USER`（全DB共通のスーパーユーザー）で接続しており、ここはまだ最小権限になっていない（`EditAI.md` 15.4）。ロールのパスワードは`init.sql`に書かず、`db-role-init`が`.env`の値で設定する。
 
 ---
 
@@ -39,7 +39,9 @@ Atomosideaの永続層は、データベースはインスタンス単位（物�
 
 5つのPostgreSQL 16インスタンスを運用します。すべてイメージ `postgres:16`、`restart: always`で、`pg_isready`によるhealthcheckを持ちます。`auth-db`・`app-db`・`profile-db`・`team-db`はネットワーク `backend-db-network`、`sfsp-db`は専用の `sfsp-db-network` に属し、どちらも `internal: true`（外向き通信なし）です。ホストにポートは公開されません。
 
-各データベースはDockerの永続ボリューム（`/var/lib/postgresql/data`）に保存され、ボリュームが空の初回起動時のみ、`docker-entrypoint-initdb.d`経由で`init.sql`が実行されてスキーマが構築されます。アプリ用ロールは`init.sql`でパスワードなしで作成され、起動のたびに実行される`db-role-init`サービス（`backend/db-init/sync-role-passwords.sh`）が`.env`の`AUTH_SERVICE_DB_PASSWORD`・`MYPAGE_SERVICE_DB_PASSWORD`・`TEAM_SERVICE_DB_PASSWORD`・`SFSP_WORKER_DB_PASSWORD`を`ALTER ROLE`で設定します（既存ボリュームにも適用されるため、`.env`を変えて`up`するだけでローテーションできます）。
+各データベースはDockerの永続ボリューム（`/var/lib/postgresql/data`）に保存され、ボリュームが空の初回起動時のみ、`docker-entrypoint-initdb.d`経由で`init.sql`が実行されてスキーマが構築されます。アプリ用ロールは`init.sql`でパスワードなしで作成され、起動のたびに実行される`db-role-init`サービス（`backend/db-init/sync-role-passwords.sh`）が`.env`の`AUTH_SERVICE_DB_PASSWORD`・`TEAM_SERVICE_DB_PASSWORD`・`SFSP_WORKER_DB_PASSWORD`を`ALTER ROLE`で設定します（既存ボリュームにも適用されるため、`.env`を変えて`up`するだけでローテーションできます）。
+
+> **既存ボリュームについて:** `init.sql` から外した `mypage_service_user` ロール（auth-db）・`team_content` テーブル（team-db）・テストユーザー `user_atomos`（profile-db）は、以前のバージョンで作ったボリュームには残ります。どのコードも使わないので害はありません。消す場合の SQL は `EditAI.md` の 5 章冒頭にあります。
 
 ### データベース一覧
 
@@ -59,20 +61,19 @@ Atomosideaの永続層は、データベースはインスタンス単位（物�
 
 初期化ファイル: `backend/auth/auth-datebase/auth-db/init.sql`
 
-複数のサービスが1つの`users`テーブルを共有する構成です。
+`users`テーブルを使うのは`auth-service`だけです（以前は`mypage-service`も接続していましたが、現在は`app-db`だけに接続します）。
 
 - **ロール**
   - `auth_service_user` — `auth-service`が接続（登録・ログイン・Google認証）。パスワードは`db-role-init`が`.env`の`AUTH_SERVICE_DB_PASSWORD`から設定。
-  - `mypage_service_user` — `mypage-service`が接続（投稿一覧の読み取り）。パスワードは`db-role-init`が`.env`の`MYPAGE_SERVICE_DB_PASSWORD`から設定。
 - **テーブル: `users`**
   - `id` UUID（PK）, `username`, `google_name`, `email`（NOT NULL）, `password_hash`, `provider`（`local`/`google`）, `provider_id`, `is_admin` BOOLEAN, `status`, `created_at`
   - `UNIQUE(provider, email)` と `UNIQUE(provider, provider_id)` でGoogle認証の重複を防止
 - **デフォルト管理者はありません**
   - `init.sql`は管理者アカウントを投入しません（既知のパスワードが公開されるため）。管理者は`POST /api/auth/register`と`ADMIN_REGISTRATION_CODE`で作成します。
 - **権限**
-  - 両ロールに`users`テーブルのSELECT/INSERT/UPDATE/DELETEを付与。`public`スキーマのUSAGE/CREATEも付与。
+  - `auth_service_user`に`users`テーブルのSELECT/INSERT/UPDATE/DELETEを付与。`public`スキーマのUSAGE/CREATEも付与。
 
-> **注意:** `auth-db`の`users`テーブルはauth-serviceとmypage-serviceが**共有**します。mypage-serviceは`AUTH_DATABASE_URL`（ユーザー`mypage_service_user`、パスワード`MYPAGE_SERVICE_DB_PASSWORD`）で接続します。
+> **注意:** mypage-serviceは auth-db に接続しません（`AUTH_DATABASE_URL`・`mypage_service_user`・`MYPAGE_SERVICE_DB_PASSWORD` は廃止）。ユーザーの情報が必要な画面は auth-service の `GET /api/auth/me` または profile-service を使います。
 
 #### app-db（`app_db`）— コンテンツメタデータ
 
@@ -94,7 +95,7 @@ Atomosideaの永続層は、データベースはインスタンス単位（物�
 
 - **テーブル: `users`**
   - `id` UUID（PK）, `username`, `bio` TEXT, `icon_url` TEXT, `background_image_url` TEXT, `icon_sfsp_job_id` UUID, `background_sfsp_job_id` UUID, `status`（デフォルト`offline`）, `created_at`, `updated_at`
-- **テストデータ** — 初回起動時に`user_atomos`（UUIDv7形式）が`ON CONFLICT (id) DO NOTHING`で挿入。実環境では不要なら削除可能。
+- **テストデータ** — 投入しません（以前は初回起動時に`user_atomos`を挿入していましたが、`init.sql`から削除しました。古いボリュームには残っていることがあります）。
 
 #### team-db（`team_db`）— チーム・コンテンツ共有
 
@@ -106,9 +107,9 @@ Discordの招待リンク風、トークン（URL）ベースのクローズド�
   - `teams` — チーム。`id` UUID（PK）、`token` VARCHAR(24)（UNIQUE、24文字のbase36・crypto/randで生成・約124ビットのエントロピー）、`name` VARCHAR(255)（NOT NULL）、`description` TEXT、`is_public` BOOLEAN（デフォルト`false`）、`auto_approve` BOOLEAN（デフォルト`false`）、`allow_member_invite` BOOLEAN（デフォルト`false`）、`created_by` UUID、`created_at` タイムスタンプ
   - `team_members` — チーム所属。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`user_id` UUID、`role`（`owner`/`admin`/`member`、デフォルト`member`）、`joined_at` タイムスタンプ。`UNIQUE(team_id, user_id)`
   - `team_join_requests` — 承認型の加入リクエスト。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`user_id` UUID、`status`（`pending`/`approved`/`rejected`/`cancelled`、デフォルト`pending`）、`requested_at`、`reviewed_at`、`reviewed_by` UUID。`UNIQUE(team_id, user_id)`
-  - `team_content` — 既存コンテンツ（動画・ゲーム・static-site）をチームに紐付けるためのリンク表（Phase 2用）。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`content_type`（`video`/`game`/`static-site`）、`content_id` VARCHAR(20)、`created_at`。`UNIQUE(team_id, content_type, content_id)`
+  - （削除済み）`team_content` — 既存コンテンツをチームに紐付ける予定だったリンク表（Phase 2用）。どのコードも使っていなかったため`init.sql`から削除しました。チーム限定のコンテンツは、各コンテンツの`team_id`列（app-db）で表します。古いボリュームにはテーブルが残っていることがあります。
   - `team_posts` — チーム独自の投稿（Phase 1）。`id` UUID（PK）、`team_id`（`teams.id`へのFK、`ON DELETE CASCADE`）、`author_id` UUID、`title` VARCHAR(255)、`body` TEXT、`created_at` タイムスタンプ
-- **ロール: `team_service_user`** — `teams`・`team_members`・`team_join_requests`・`team_content`・`team_posts`へのSELECT/INSERT/UPDATE/DELETE。パスワードは`db-role-init`が`.env`の`TEAM_SERVICE_DB_PASSWORD`から設定。`team_posts`の`author_id`から著者名を取得する場合は、`app-db`ではなく`profile-service`の`GET /api/profile/:id`から取得（`app-db`に`users`テーブルは無い）。
+- **ロール: `team_service_user`** — `teams`・`team_members`・`team_join_requests`・`team_posts`へのSELECT/INSERT/UPDATE/DELETE。パスワードは`db-role-init`が`.env`の`TEAM_SERVICE_DB_PASSWORD`から設定。`team_posts`の`author_id`から著者名を取得する場合は、`app-db`ではなく`profile-service`の`GET /api/profile/:id`から取得（`app-db`に`users`テーブルは無い）。
 
 #### sfsp-db（`sfsp_db`）— スキャンプラットフォーム
 
@@ -198,25 +199,29 @@ MinIOでは、アプリ用サービス・アップロードAPI・SFSP API・各�
 | `GAME_MINIO_*` | game-upload-api、game-worker、auth-service（アカウント削除時） | `app-game-policy` | `games` に**全操作**＋バケット一覧 |
 | `PROFILE_MINIO_*` | profile-service、auth-service（アカウント削除時） | `app-profile-policy` | `user-profiles` に**全操作**＋バケット一覧 |
 | `STATIC_SITE_MINIO_*` | static-site-upload-api、static-site-worker、auth-service（アカウント削除時） | `app-static-site-policy` | `static-sites` に**全操作**＋バケット一覧 |
-| `VIDEO_MINIO_*` | video-upload-api、video-worker | `app-video-policy` | `videos` に**全操作**＋バケット一覧 |
-| `SFSP_UPLOAD_*` | 各upload API、profile-service | `sfsp-upload-policy` | `raw-files` に**PutObject**（スキャン用アップロード） |
+| `VIDEO_MINIO_*` | video-upload-api、video-worker、auth-service（アカウント削除時） | `app-video-policy` | `videos` に**全操作**＋バケット一覧 |
 | `SFSP_API_*` | `sfsp-api` | `sfsp-api-policy` | `raw-files` に**全操作**＋バケット一覧（ジョブ作成・保存） |
 | `SFSP_WORKER_RAW_*` | `sfsp-worker` | `sfsp-worker-raw-policy` | `raw-files` から**GetObject/DeleteObject/ListBucket**（スキャン用取り込み・後処理削除） |
-| `SFSP_WORKER_CLEAN_*` | `sfsp-worker`、`video-upload-api`（clean側） | `sfsp-worker-clean-policy` | `clean-files`・`quarantine`・`raw-files` に**全操作**＋バケット管理（Clean書込・Raw削除） |
-| `SFSP_GAME_WORKER_*` | `game-upload-api`、`game-worker` | `sfsp-game-worker-policy` | `clean-files/*` から**GetObject**（展開用ダウンロード） |
-| `SFSP_VIDEO_WORKER_*` | `video-worker` | `sfsp-video-worker-policy` | `clean-files/*` から**GetObject**（HLS変換用ダウンロード） |
-| `SFSP_STATIC_SITE_WORKER_*` | `static-site-upload-api`、`static-site-worker` | `sfsp-static-site-worker-policy` | `clean-files/*` から**GetObject/DeleteObject**（展開用ダウンロード・処理後の削除） |
+| `SFSP_WORKER_CLEAN_*` | `sfsp-worker`、`video-upload-api`（HLS変換用に clean-files を読む） | `sfsp-worker-clean-policy` | `clean-files`・`quarantine`・`raw-files` に**全操作**＋バケット管理（Clean書込・Raw削除） |
+| `SFSP_GAME_WORKER_*` | `game-worker` | `sfsp-game-worker-policy` | `clean-files/*` から**GetObject**（展開用ダウンロード） |
+| `SFSP_VIDEO_WORKER_*` | `video-worker` | `sfsp-video-worker-policy` | `clean-files/*` から**GetObject**（差し替えサムネイルのダウンロード） |
+| `SFSP_STATIC_SITE_WORKER_*` | `static-site-worker` | `sfsp-static-site-worker-policy` | `clean-files/*` から**GetObject/DeleteObject**（展開用ダウンロード・処理後の削除） |
 | `SFSP_PROFILE_WORKER_*` | `profile-service` | `sfsp-profile-worker-policy` | バケット一覧＋`clean-files/*` から**GetObject**（スキャン後アイコン取得） |
+
+> 以前あった `SFSP_UPLOAD_*`（`sfsp-upload-policy`、`raw-files` への PutObject）は、どのコードも使っていなかったため廃止しました（ユーザー・ポリシー・`sfsp-upload-policy.json`・`.env.example` の変数を削除）。アップロード API は MinIO に直接書かず、ファイルを sfsp-api に送ります。既存の MinIO には古いユーザー / ポリシーが残りますが、`.env` に資格情報が無いので使われません。
+>
+> 各サービスには、そのサービスが使うキーだけを `docker-compose.yml` の `environment:` で渡します（`.env` 全体は渡しません）。
 
 ### ポリシー設計のポイント
 
-- **Uploadユーザーは「書き込み専用」** — `raw-files`へのPutObjectのみ。読み取り不可により、アップロード側からスキャン結果への不正な干渉を防止。
+- **アップロードAPIは raw-files に触れない** — ファイルは sfsp-api 経由で `raw-files` に入る。アップロード側からスキャン前後のファイルへ直接干渉できない。
 - **Workerは「取り込み→書込み→削除」を1人が担当** — `sfsp-worker`がRawから読み取り、Cleanへ書き込み、処理済みRawを削除するフルサイクルを持つ。これによりスキャンパイプラインが完結。
 - **各コンテンツワーカーは「Cleanからの読み取り中心」** — ゲーム・動画・static-site・profileのワーカーは`clean-files/*`のGetObjectが基本（static-siteのみ処理後の削除用にDeleteObjectも持つ）。アップロードしたRawにはアクセスしない。
 - **アプリ用ユーザーは「自分のバケットだけ」** — `app-*-policy`は対応する1バケット（`games`・`user-profiles`・`static-sites`・`videos`）にのみ全操作を許可する。
 - **APIは「Rawへの全操作」** — ジョブ作成とファイル保存のため`raw-files`に全権限。
+- **まだ最小権限になっていない点** — `app-*-policy`と`sfsp-api-policy`は対象バケットに`s3:*`を許可している。また`video-upload-api`は clean-files を読むだけなのに、`sfsp-worker`用の`SFSP_WORKER_CLEAN_*`（clean-files・quarantine・raw-filesに全操作）を使っている（`EditAI.md` 15.4）。
 
-ポリシーファイル: `backend/minio-init/` 配下の`sfsp-*-policy.json`と`app-*-policy.json`。旧`sfsp-worker-policy.json`は未使用だったため削除した。
+ポリシーファイル: `backend/minio-init/` 配下の`sfsp-*-policy.json`（7個）と`app-*-policy.json`（4個）。旧`sfsp-worker-policy.json`と`sfsp-upload-policy.json`は未使用だったため削除した。
 
 ---
 
@@ -228,8 +233,8 @@ MinIOでは、アプリ用サービス・アップロードAPI・SFSP API・各�
 
 1. **エイリアス設定** — 単一のMinIOに`mc alias set`で接続情報を設定（MinIOが健康になるまでループで待機）。
 2. **バケット作成** — `mc mb --ignore-existing`で全バケットを作成（既存は無視）。
-3. **匿名アクセス設定** — アプリ用バケットに`mc anonymous set download`を適用。
-4. **IAMポリシー作成** — `mc admin policy create`で12種類のポリシー（SFSP用8＋アプリ用4）をMinIOへ登録。
+3. **匿名アクセス設定** — アプリ用バケットに`mc anonymous set download`を適用（バケットの作成と匿名設定は minio-init の役目。game-worker・static-site-upload-api の起動時の作成処理は削除済み。profile-service だけは今も起動時に `user-profiles` を確認・設定する）。
+4. **IAMポリシー作成** — `mc admin policy create`で11種類のポリシー（SFSP用7＋アプリ用4）をMinIOへ登録。
 5. **IAMユーザー作成・割り当て** — `mc admin user add`で各サービス用ユーザーを作成し、`mc admin policy attach`でポリシーを紐付け。
 
 **依存関係:**
@@ -274,8 +279,8 @@ MinIOでは、アプリ用サービス・アップロードAPI・SFSP API・各�
 |---|---|
 | `backend/auth/auth-datebase/auth-db/init.sql` | auth-dbのスキーマ・ロール（パスワードなし）。管理者は投入しない |
 | `backend/datebase/app-db/init.sql` | app-dbの3テーブル・インデックス・トリガー・sfsp_worker権限 |
-| `backend/profile-service/profile-db/init.sql` | profile-dbのusersテーブル・テストデータ |
-| `backend/team-service/team-db/init.sql` | team-dbのteams/team_members/team_join_requests/team_content/team_postsスキーマ |
+| `backend/profile-service/profile-db/init.sql` | profile-dbのusersテーブル（テストデータは無し） |
+| `backend/team-service/team-db/init.sql` | team-dbのteams/team_members/team_join_requests/team_postsスキーマ |
 | `backend/security/sfsp-db/001_sfsp_initial_schema.sql` | sfsp-dbのfiles/scan_jobs/scan_resultsスキーマ |
 | `backend/db-init/sync-role-passwords.sh` | `db-role-init`が実行。`.env`の値でアプリ用DBロールのパスワードを設定 |
 
@@ -283,7 +288,6 @@ MinIOでは、アプリ用サービス・アップロードAPI・SFSP API・各�
 
 | ファイル | 役割 |
 |---|---|
-| `backend/minio-init/sfsp-upload-policy.json` | upload API・profile-serviceのraw-filesへのPutObject |
 | `backend/minio-init/sfsp-api-policy.json` | sfsp-apiのraw-filesへの全操作 |
 | `backend/minio-init/sfsp-worker-raw-policy.json` | sfsp-workerのraw-filesからの読み取り・削除 |
 | `backend/minio-init/sfsp-worker-clean-policy.json` | sfsp-workerのclean-files/quarantineへの書き込み・raw削除 |

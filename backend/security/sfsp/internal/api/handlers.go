@@ -63,7 +63,6 @@ var allowedServices = map[string]bool{
 	"game":            true,
 	"stream":          true,
 	"profile":         true,
-	"thumbnail":       true,
 	"video-thumbnail": true,
 	"game-thumbnail":  true,
 	"site-thumbnail":  true,
@@ -288,7 +287,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 
 func (a *API) rejectTargetService(c *gin.Context, targetService string) {
 	a.Logger.Errorf("Invalid target_service: %s", targetService)
-	c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid target_service: %s. Allowed values are 'static-site', 'game', 'stream', 'profile', 'thumbnail', 'video-thumbnail', 'game-thumbnail', 'site-thumbnail'", targetService)})
+	c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid target_service: %s. Allowed values are 'static-site', 'game', 'stream', 'profile', 'video-thumbnail', 'game-thumbnail', 'site-thumbnail'", targetService)})
 }
 
 func (a *API) HandleGetJob(c *gin.Context) {

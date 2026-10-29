@@ -1,19 +1,17 @@
-version: '3.8'
-
 services:
   mon-nginx:
     image: nginx:alpine
     container_name: mon-nginx
     restart: always
     ports:
-      # 運用ダッシュボード（コンテナ再起動・MinIO 操作が可能）のため、Basic 認証に加えてホストのループバックのみに公開する
+      # 運用ダッシュボード（MinIO の操作が可能）のため、Basic 認証に加えてホストのループバックのみに公開する
       - "127.0.0.1:8090:80"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./frontend/dist:/var/www/html:ro # mon-frontendによって生成されるホストのdistディレクトリをマウント
     depends_on:
       - mon-backend
-      - mon-frontend # mon-frontendのビルドが完了してから起動
+      - mon-frontend # 起動順を mon-frontend の後にするだけ（ビルド完了は待たない。完了前は dist が空または前回のビルド）
     networks:
       - monitoring-network
 
@@ -33,20 +31,18 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - monitoring-network
-      - atmosidea-network # 既存のネットワークに接続
-      - sfsp-isolated-net # SFSPの隔離ネットワークに接続
+      - atmosidea-network # 既存のネットワークに接続（MinIO の操作で atmosidea-minio:9000 に到達するため）
 
   mon-frontend:
     build:
       context: ./frontend
     container_name: mon-frontend-builder
     volumes:
-      - ./frontend:/app # ホストのfrontendディレクトリをコンテナの/appにマウント
-      - ./frontend/dist:/app/dist # ビルド成果物をホストのfrontend/distに出力
+      - ./frontend:/app # ホストのfrontendディレクトリをコンテナの/appにマウント（ビルド成果物は /app/dist = ホストの frontend/dist に出力される）
       - /app/node_modules # node_modulesは匿名ボリュームとして扱い、ホストを汚染しない
     command: npm run build # ビルドコマンドを実行
-    # このサービスはビルドが完了したら終了します。
-    # mon-nginxがdepends_onでこのサービスの完了を待つため、ビルドされたファイルが利用可能になります。
+    # このサービスはビルドが完了したら終了する。mon-nginx はビルド完了を待たずに起動するが、
+    # 静的ファイルはホストの frontend/dist を直接配信するため、ビルドが終われば再起動なしで新しい内容が配信される。
 
 networks:
   monitoring-network:
@@ -54,6 +50,3 @@ networks:
   atmosidea-network:
     external: true
     name: atmosidea-network
-  sfsp-isolated-net:
-    external: true
-    name: sfsp-isolated-net

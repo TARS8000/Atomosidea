@@ -14,17 +14,16 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/atmosidea/shared/config"
-	"github.com/atmosidea/shared/event"
 	"github.com/atmosidea/shared/queue"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -64,54 +63,74 @@ var allowedThumbnailTypes = map[string]bool{
 	"image/webp": true,
 }
 
-// teamPermission は team-service の /permission の応答。
+// チームトークンは base36 の 24 文字。URL パスにそのまま埋め込むので形式を検証する（game-upload-api と同じ）。
+var teamTokenPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,24}$`)
+
+// teamPermission は team-service の GET /api/teams/<token>/permission の応答。
 type teamPermission struct {
-	IsPublic bool   `json:"is_public"`
-	CanView  bool   `json:"can_view"`
-	CanPost  bool   `json:"can_post"`
-	Role     string `json:"role"`
+	CanView bool `json:"can_view"`
+	CanPost bool `json:"can_post"`
 }
 
-// fetchTeamPermission は呼び出し元（Authorization を転送）のチームに対する権限を取得する。
-// 取得に失敗した場合は権限なし（すべて false）として扱う。
-func fetchTeamPermission(c *gin.Context, teamToken string) teamPermission {
-	var perm teamPermission
+// fetchTeamPermission は team-service に呼び出し元の権限を問い合わせる。
+// 形式が不正なトークンは問い合わせずに権限なしとする。
+// authHeader は検証済みのトークンのときだけ渡す（空なら匿名として問い合わせる）。
+// 通信エラー等は error を返すので、呼び出し側は拒否として扱う（fail closed）。
+func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*teamPermission, error) {
+	if !teamTokenPattern.MatchString(teamToken) {
+		return &teamPermission{}, nil
+	}
 	if teamServiceURL == "" {
 		teamServiceURL = "http://team-service:8080"
 	}
-	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", teamServiceURL+"/api/teams/"+teamToken+"/permission", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", teamServiceURL+"/api/teams/"+teamToken+"/permission", nil)
 	if err != nil {
-		logger.Errorf("fetchTeamPermission: failed to create request: %v", err)
-		return perm
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	if authHeader := c.GetHeader("Authorization"); authHeader != "" {
+	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
 	resp, err := teamHTTPClient.Do(req)
 	if err != nil {
-		logger.Errorf("fetchTeamPermission: request failed for team %s: %v", teamToken, err)
-		return perm
+		return nil, fmt.Errorf("request failed for team %s: %w", teamToken, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return &teamPermission{}, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		logger.Warnf("fetchTeamPermission: team service returned %d for team %s", resp.StatusCode, teamToken)
-		return teamPermission{}
+		return nil, fmt.Errorf("team service returned %d for team %s", resp.StatusCode, teamToken)
 	}
+	var perm teamPermission
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&perm); err != nil {
-		logger.Errorf("fetchTeamPermission: failed to decode response: %v", err)
-		return teamPermission{}
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	return perm
+	return &perm, nil
+}
+
+// viewerAuthHeader は optionalUser で検証できた場合だけ Authorization ヘッダーを返す
+// （無効なトークンを team-service に転送しない）。
+func viewerAuthHeader(c *gin.Context, userID string) string {
+	if userID == "" {
+		return ""
+	}
+	return c.GetHeader("Authorization")
 }
 
 // teamAccessCheck calls the team-service permission endpoint to verify that the
 // caller is allowed to post to the given team. Returns true if posting is allowed.
 // A missing/empty team_id is treated as a public post (always allowed).
+// authMiddleware を通過したリクエストでのみ呼ぶ（Authorization はそのまま転送する）。
 func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	if teamToken == "" {
 		return true
 	}
-	return fetchTeamPermission(c, teamToken).CanPost
+	perm, err := fetchTeamPermission(c.Request.Context(), teamToken, c.GetHeader("Authorization"))
+	if err != nil {
+		logger.Errorf("teamAccessCheck: %v", err)
+		return false
+	}
+	return perm.CanPost
 }
 
 // StaticSite represents a static site entry in the database.
@@ -131,12 +150,10 @@ type StaticSite struct {
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 }
 
+// SfspUploadResponse は sfsp-api の POST /api/v1/files の応答（使うのは job_id だけ）。
+// スキャン結果は常に完了イベントで届く（sfsp-api は status "queued" しか返さない）。
 type SfspUploadResponse struct {
-	FileID   string `json:"file_id"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename"`
+	JobID string `json:"job_id"`
 }
 
 func envInt64(name string, def int64) int64 {
@@ -159,11 +176,6 @@ func main() {
 	}
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
-
-	err = godotenv.Load()
-	if err != nil {
-		logger.Warnf("Error loading .env file, assuming production environment: %v", err)
-	}
 
 	maxSiteUploadBytes = envInt64("MAX_SITE_UPLOAD_BYTES", maxSiteUploadBytes)
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
@@ -225,40 +237,7 @@ func main() {
 	}
 	logger.Info("Successfully connected to MinIO!")
 
-	buckets := []string{minioBucket}
-
-	for _, bucket := range buckets {
-		if bucket == "" {
-			continue
-		}
-		exists, err := minioClient.BucketExists(context.Background(), bucket)
-		if err != nil {
-			logger.Fatalf("Failed to check MinIO bucket '%s': %v", bucket, err)
-		}
-		if !exists {
-			err = minioClient.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{})
-			if err != nil {
-				logger.Fatalf("Failed to create MinIO bucket '%s': %v", bucket, err)
-			}
-			logger.Infof("Successfully created MinIO bucket: %s", bucket)
-		}
-
-		policy := fmt.Sprintf(`{
-          "Version": "2012-10-17",
-          "Statement": [{
-             "Effect": "Allow",
-             "Principal": {"AWS": ["*"]},
-             "Action": ["s3:GetObject"],
-             "Resource": ["arn:aws:s3:::%s/*"]
-          }]
-       }`, bucket)
-		err = minioClient.SetBucketPolicy(context.Background(), bucket, policy)
-		if err != nil {
-			logger.Warnf("Warning: Failed to set bucket policy to public: %v", err)
-		} else {
-			logger.Info("Successfully set MinIO bucket policy to Public Read")
-		}
-	}
+	// バケットの作成と匿名ダウンロードの設定は minio-init が行う
 
 	if err := queue.ConnectRedis(cfg, logger); err != nil {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
@@ -335,13 +314,16 @@ func authenticate(c *gin.Context) (userID string, isAdmin bool, status int, msg 
 		return "", false, http.StatusUnauthorized, "Token has been invalidated"
 	}
 
-	if idStr, ok := claims["sub"].(string); ok {
-		userID = idStr
-	} else if idStr, ok := claims["userID"].(string); ok {
-		userID = idStr
-	} else if idStr, ok := claims["user_id"].(string); ok {
-		userID = idStr
-	} else {
+	for _, key := range []string{"sub", "userID", "user_id", "id"} {
+		if val, ok := claims[key].(string); ok && val != "" {
+			userID = val
+			break
+		}
+	}
+	if userID == "" {
+		return "", false, http.StatusUnauthorized, "Invalid user ID in token"
+	}
+	if _, err := uuid.Parse(userID); err != nil {
 		return "", false, http.StatusUnauthorized, "Invalid user ID in token"
 	}
 	isAdmin, _ = claims["isAdmin"].(bool)
@@ -511,33 +493,6 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	return &out, nil
 }
 
-// republishIfClean は sfsp-api が既に clean と判定済みのファイルを返した場合に、
-// 完了イベントを自分で発行する（sfsp-worker からはイベントが来ないため）。
-func republishIfClean(ctx context.Context, resp *SfspUploadResponse, jobID uuid.UUID, filename, targetService string) {
-	if strings.ToLower(resp.Status) != "clean" {
-		return
-	}
-	fileID, err := uuid.Parse(resp.FileID)
-	if err != nil {
-		logger.Errorf("Invalid File ID from SFSP: %v (file_id=%q)", err, resp.FileID)
-		return
-	}
-	ev := event.ScanCompletionEvent{
-		JobID:         jobID,
-		FileID:        fileID,
-		FinalStatus:   "clean",
-		ScannedAt:     time.Now().UTC(),
-		SHA256:        resp.SHA256,
-		Filename:      filename,
-		TargetService: targetService,
-	}
-	if err := queue.EnqueueScanCompletionEvent(ctx, ev); err != nil {
-		logger.Errorf("CRITICAL: Failed to re-publish %s completion event for existing clean file: %v", targetService, err)
-	} else {
-		logger.Infof("Re-published %s completion event for existing clean file, job %s", targetService, jobID)
-	}
-}
-
 func uploadStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	userIDStr := c.GetString("userID")
@@ -651,7 +606,6 @@ func uploadStaticSiteHandler(c *gin.Context) {
 			abort(http.StatusInternalServerError, "Failed to register static site")
 			return
 		}
-		republishIfClean(reqCtx, thumbResp, thumbJobID, thumbnailHeader.Filename, "site-thumbnail")
 	}
 
 	sfspRespData, err := uploadToSFSP(reqCtx, file, fileHeader.Filename, "static-site")
@@ -671,7 +625,6 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		abort(http.StatusInternalServerError, "Failed to register static site")
 		return
 	}
-	republishIfClean(reqCtx, sfspRespData, sfspJobID, fileHeader.Filename, "static-site")
 
 	c.JSON(http.StatusAccepted, gin.H{"message": "Static site upload initiated for scanning", "siteId": siteID})
 }
@@ -688,7 +641,14 @@ func listStaticSitesHandler(c *gin.Context) {
 	argIdx := 1
 	if teamToken != "" {
 		// チームの投稿一覧は閲覧権限（非公開チームならメンバー）が必要
-		if !fetchTeamPermission(c, teamToken).CanView {
+		viewerID, _ := optionalUser(c)
+		perm, err := fetchTeamPermission(reqCtx, teamToken, viewerAuthHeader(c, viewerID))
+		if err != nil {
+			logger.Errorf("listStaticSitesHandler: team permission check failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to verify team permission"})
+			return
+		}
+		if !perm.CanView {
 			c.JSON(http.StatusForbidden, gin.H{"error": "You are not allowed to view this team's content"})
 			return
 		}
@@ -759,9 +719,17 @@ func getStaticSiteHandler(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Static site not found"})
 			return
 		}
-		if s.TeamID != "" && !fetchTeamPermission(c, s.TeamID).CanView {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Static site not found"})
-			return
+		if s.TeamID != "" {
+			perm, err := fetchTeamPermission(reqCtx, s.TeamID, viewerAuthHeader(c, userID))
+			if err != nil {
+				logger.Errorf("getStaticSiteHandler: team permission check failed: %v", err)
+				c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to verify team permission"})
+				return
+			}
+			if !perm.CanView {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Static site not found"})
+				return
+			}
 		}
 		// 投稿者以外には内部情報を返さない
 		s.ProcessingDetails = nil
@@ -846,8 +814,6 @@ func updateStaticSiteHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update static site thumbnail"})
 		return
 	}
-
-	republishIfClean(reqCtx, thumbSfspResp, parsedThumbJobID, thumbnailHeader.Filename, "site-thumbnail")
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message": "Thumbnail upload accepted for scanning",

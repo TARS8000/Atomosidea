@@ -28,7 +28,6 @@ const (
 	GameCompletionQueue       = "sfsp:completed:game"
 	StreamCompletionQueue     = "sfsp:completed:stream"
 	ProfileCompletionQueue    = "sfsp:completed:profile"
-	ThumbnailCompletionQueue  = "sfsp:completed:thumbnail"
 	VideoThumbnailCompletionQueue = "sfsp:completed:video-thumbnail"
 	GameThumbnailCompletionQueue  = "sfsp:completed:game-thumbnail"
 	SiteThumbnailCompletionQueue = "sfsp:completed:site-thumbnail"
@@ -82,22 +81,6 @@ func EnqueueJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
-// DequeueJob removes and returns a job ID from the scan queue (blocking)
-func DequeueJob(ctx context.Context) (string, error) {
-	result, err := RedisClient.BRPop(ctx, 0, ScanQueueName).Result()
-	if err != nil {
-		if err != context.Canceled {
-			Logger.Errorf("Failed to dequeue job from %s: %v", ScanQueueName, err)
-		}
-		return "", err
-	}
-	if len(result) < 2 {
-		Logger.Errorf("Invalid result from BRPop on %s: %v", ScanQueueName, result)
-		return "", fmt.Errorf("invalid result from BRPop: %v", result)
-	}
-	return result[1], nil
-}
-
 // EnqueueScanCompletionEvent enqueues a scan completion event to the appropriate service-specific queue
 func EnqueueScanCompletionEvent(ctx context.Context, e event.ScanCompletionEvent) error { // event.ScanCompletionEvent を使用
 	if RedisClient == nil {
@@ -127,8 +110,6 @@ func EnqueueScanCompletionEvent(ctx context.Context, e event.ScanCompletionEvent
 		queueName = StreamCompletionQueue
 	case "profile":
 		queueName = ProfileCompletionQueue
-	case "thumbnail":
-		queueName = SiteThumbnailCompletionQueue
 	case "video-thumbnail":
 		queueName = VideoThumbnailCompletionQueue
 	case "game-thumbnail":

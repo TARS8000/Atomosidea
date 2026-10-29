@@ -16,7 +16,6 @@ import (
 )
 
 var (
-	dbAuth    *pgxpool.Pool
 	dbApp       *pgxpool.Pool
 	jwtSecret   []byte
 	redisClient *redis.Client
@@ -133,14 +132,7 @@ func main() {
 		log.Printf("WARNING: Failed to connect to Redis at %s: %v", redisAddr, err)
 	}
 	cancelPing()
-	authDbUrl := os.Getenv("AUTH_DATABASE_URL")
 	appDbUrl := os.Getenv("APP_DATABASE_URL")
-
-	dbAuth, err = pgxpool.New(context.Background(), authDbUrl)
-	if err != nil {
-		log.Fatalf("Unable to connect to auth database: %v\n", err)
-	}
-	defer dbAuth.Close()
 
 	dbApp, err = pgxpool.New(context.Background(), appDbUrl)
 	if err != nil {

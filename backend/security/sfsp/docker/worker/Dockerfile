@@ -13,11 +13,8 @@ COPY . .
 # security ディレクトリに移動して go.mod を処理
 WORKDIR /app/backend/security/sfsp
 
-# 日本の高速プロキシを使用するように設定
-ENV GOPROXY=https://goproxy.io,direct
-
-# go.sum が無い時だけ go mod tidy を実行
-RUN test -f go.sum || go mod tidy
+# 公式プロキシを優先し、失敗したら goproxy.io、最後に直接取得する（"|" 区切りはどのエラーでも次に切り替える）
+ENV GOPROXY="https://proxy.golang.org|https://goproxy.io|direct"
 
 # パッケージをダウンロード (go.sum に基づいてダウンロードされる)
 RUN go mod download
@@ -27,17 +24,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/sfsp-worker ./cmd/sfsp-w
 
 FROM alpine:latest
 
-# Install Docker client and other necessary tools
-RUN apk add --no-cache docker-cli yara
-
 WORKDIR /app
 
 # Copy the built binary from the builder stage
 COPY --from=builder /usr/local/bin/sfsp-worker /usr/local/bin/sfsp-worker
 
-# The worker needs access to yara rules, which will be mounted via a volume
-# in docker-compose.yml. This just ensures the directory exists.
-RUN mkdir -p /etc/yara-rules
+# ワーカーは Docker SDK（sfsp-docker-proxy 経由）でサンドボックスを起動するだけなので docker-cli は不要。
+# YARA とルールはサンドボックス側のイメージ（sfsp-yara-client）にあり、ワーカーは読まない
 
 # 非 root ユーザー（uid/gid 10001）で実行する。Docker ソケットは持たず、sfsp-docker-proxy 経由でサンドボックスを起動するので root は不要。
 # スキャン用ディレクトリ（名前付きボリューム sfsp_temp_scan のマウント先）を、ボリュームが最初に作られる前にこのユーザー所有で用意しておく

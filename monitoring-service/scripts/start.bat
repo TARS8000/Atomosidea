@@ -4,7 +4,7 @@ set "MON_ENV_FILE=%~dp0..\..\.env"
 set "MON_COMPOSE_FILE=%~dp0..\docker-compose.monitoring.yml"
 
 echo Building monitoring services without cache...
-docker-compose --env-file "%MON_ENV_FILE%" -f "%MON_COMPOSE_FILE%" build --no-cache
+docker compose --env-file "%MON_ENV_FILE%" -f "%MON_COMPOSE_FILE%" build --no-cache
 if %errorlevel% neq 0 (
     echo Build failed.
     pause
@@ -12,7 +12,7 @@ if %errorlevel% neq 0 (
 )
 
 echo Starting monitoring services...
-docker-compose --env-file "%MON_ENV_FILE%" -f "%MON_COMPOSE_FILE%" up -d
+docker compose --env-file "%MON_ENV_FILE%" -f "%MON_COMPOSE_FILE%" up -d
 if %errorlevel% neq 0 (
     echo Startup failed.
     pause
