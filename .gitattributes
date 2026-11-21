@@ -5,5 +5,5 @@ Dockerfile* text eol=lf
 *.bat text eol=crlf
 # nginx configs are bind-mounted into Linux containers: keep LF
 *.conf text eol=lf
-# Test fixtures replayed byte-for-byte by Go tests (recorded Docker API requests): keep LF
-backend/security/sfsp-docker-guard/testdata/** text eol=lf
+# sfsp-docker-guard: its Go tests replay recorded Docker API requests from testdata/ line by line: keep LF
+backend/security/sfsp-docker-guard/** text=auto eol=lf

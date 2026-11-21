@@ -773,9 +773,10 @@ services:
 
   # sfsp-worker と sfsp-docker-proxy の間に置く、Docker API のリクエスト本文まで検査するプロキシ（backend/security/sfsp-docker-guard）。
   # sfsp-worker の internal/sandbox/docker.go が送るリクエストだけを通す：/_ping、許可したイメージの inspect、
-  # スキャン用ボリュームを読み取り専用・ネットワーク無し・CapDrop ALL・no-new-privileges・読み取り専用ルート・資源制限付きの
-  # sfsp-sandbox-* コンテナの作成と、そのコンテナの start / wait / logs / 削除。それ以外（Privileged・ホストのパスのバインド・
-  # exec・archive・pull・ほかのコンテナの操作など）は 403。詳しくは backend/security/sfsp-docker-guard/main.go の先頭
+  # スキャン用ボリュームを読み取り専用・ネットワーク無し・CapDrop ALL・no-new-privileges・読み取り専用ルート・
+  # docker.go と同じ資源の上限・/tmp は noexec の tmpfs の sfsp-sandbox-* コンテナの作成と、そのコンテナの start / wait / logs / 削除。
+  # それ以外（Privileged・ホストのパスのバインド・exec・archive・pull・ほかのコンテナの操作など）は 403。
+  # 詳しくは backend/security/sfsp-docker-guard/main.go の先頭
   sfsp-docker-guard:
     build:
       context: ./backend/security/sfsp-docker-guard
@@ -787,6 +788,10 @@ services:
       # （スキャン用ボリュームは下の volumes で name: sfsp_temp_scan と固定しているので、compose のプロジェクト名に依らない）
       SFSP_GUARD_ALLOWED_IMAGES: "${SFSP_SCANNER_CLAMAV_IMAGE:-sfsp-clamav-client:latest},${SFSP_SCANNER_YARA_IMAGE:-sfsp-yara-client:latest}"
       SFSP_GUARD_SCAN_VOLUME: sfsp_temp_scan
+      # サンドボックスの数の上限（DoS 対策。超えた作成・start は 403）。sfsp-worker はサンドボックスを 1 つずつ動かして毎回消すので、
+      # 同時に動いてよい数 2 は 2 倍の余裕。停止済みを含めた数は 32 まで（詳しくは sfsp-docker-guard/main.go の先頭）
+      SFSP_GUARD_MAX_ACTIVE_SANDBOXES: ${SFSP_GUARD_MAX_ACTIVE_SANDBOXES:-2}
+      SFSP_GUARD_MAX_SANDBOXES: ${SFSP_GUARD_MAX_SANDBOXES:-32}
     read_only: true
     cap_drop:
       - ALL

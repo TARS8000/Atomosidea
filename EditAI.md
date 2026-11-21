@@ -97,7 +97,7 @@
 | | MinIO ×1 | オブジェクトストレージ（バケットとユーザーで分離） |
 | セキュリティ | ClamAV, YARA | アップロードのスキャン（Docker サンドボックス内） |
 | 動画 | FFmpeg | HLS 変換・サムネイル生成（`video-upload-api` 内で実行） |
-| 監視 | monitoring-service | Docker ソケット経由のダッシュボード（別 compose） |
+| 監視 | monitoring-service | 読み取り専用の Docker API プロキシ（mon-docker-proxy）経由のダッシュボード（別 compose） |
 
 ---
 
@@ -194,7 +194,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用（`network_mode: none`。echo して終了） |
 | `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用（`network_mode: none`）。YARA ルール（`backend/security/sfsp/yara-rules/`）はこのイメージの `/etc/yara-rules` に焼き込まれる |
 | `sfsp-scan-volume-init` | sfsp-scan-volume-init | — | docker-compose.yml（`sfsp-yara-client` イメージを root で一時利用） | 起動のたびに 1 回だけ動き、スキャン用ボリューム `sfsp_temp_scan` の所有者を 10001 に揃える（非 root 化前に作られた既存ボリューム用）。`CHOWN` / `FOWNER` / `DAC_READ_SEARCH` のみ許可、ネットワークなし、読み取り専用ルート。`sfsp-worker` はこの完了を待つ |
-| `sfsp-docker-guard` | sfsp-docker-guard | 2375 | `backend/security/sfsp-docker-guard/` | sfsp-worker と sfsp-docker-proxy の間の検査プロキシ（Go 標準ライブラリのみ）。`internal/sandbox/docker.go` が送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す。許可するイメージ・スキャン用ボリュームは `SFSP_GUARD_ALLOWED_IMAGES` / `SFSP_GUARD_SCAN_VOLUME` |
+| `sfsp-docker-guard` | sfsp-docker-guard | 2375 | `backend/security/sfsp-docker-guard/` | sfsp-worker と sfsp-docker-proxy の間の検査プロキシ（Go 標準ライブラリのみ）。`internal/sandbox/docker.go` が送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す。資源の上限は docker.go と同じ値ちょうど、/tmp の tmpfs は noexec に作り直す。サンドボックスは同時に 2 つ・停止済みを含めて 32 まで（`SFSP_GUARD_MAX_ACTIVE_SANDBOXES` / `SFSP_GUARD_MAX_SANDBOXES`）。許可するイメージ・スキャン用ボリュームは `SFSP_GUARD_ALLOWED_IMAGES` / `SFSP_GUARD_SCAN_VOLUME` |
 | `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | Docker API プロキシ（届くのは sfsp-docker-guard だけ）。`CONTAINERS` / `IMAGES` / `POST` / `PING` のみ許可 |
 | `db-role-init` | atmosidea-db-role-init | — | `backend/db-init/sync-role-passwords.sh` | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを `ALTER ROLE` する |
 | `auth-db` ほか DB | atmosidea-*-db / sfsp-db | 5432 | 各 `init.sql` | [5 章](#5-データベース) |
@@ -207,7 +207,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | サービス | コンテナ名 | ポート | 実装 |
 |---|---|---|---|
 | `mon-nginx` | mon-nginx | `127.0.0.1:8090:80` | `monitoring-service/nginx.conf` |
-| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットを `:ro` でマウント。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network` と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
+| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットはマウントせず、`DOCKER_HOST=tcp://mon-docker-proxy:2375`。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network`・`mon-docker-net`（`internal: true`。mon-docker-proxy 用）と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
+| `mon-docker-proxy` | mon-docker-proxy | 2375 | `tecnativa/docker-socket-proxy:0.3.0`（compose で定義） | mon-backend 専用の読み取り専用 Docker API プロキシ。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD のみ（`POST=0`） |
 | `mon-frontend` | mon-frontend-builder | — | `monitoring-service/frontend/`（ビルドして `dist/` に出力するだけ） |
 
 ### 4.1. フロントエンドのルート（`frontend/src/App.tsx`）

@@ -1,6 +1,6 @@
 # Monitoring Service（監視ダッシュボード）
 
-開発者向けにシステム全体の状態（コンテナ・リソース・MinIO・ログ）を一元的に監視するサービス。Dockerソケットに直接接続し（読み取り専用でマウント）、各コンテナの稼働状況、CPU・メモリ使用率、依存関係、アクティブユーザー数、MinIOオブジェクトの閲覧・アップロード・削除、リアルタイムログのストリーミングを提供する。画面はコンテナをツリーで管理する形（左にツリー、右に概要・詳細）。コンテナの再起動などDockerを操作する機能は持たない（以前あった再起動APIは削除した）。
+開発者向けにシステム全体の状態（コンテナ・リソース・MinIO・ログ）を一元的に監視するサービス。読み取り専用の Docker API プロキシ（`mon-docker-proxy`）経由で Docker に接続し、各コンテナの稼働状況、CPU・メモリ使用率、依存関係、アクティブユーザー数、MinIOオブジェクトの閲覧・アップロード・削除、リアルタイムログのストリーミングを提供する。画面はコンテナをツリーで管理する形（左にツリー、右に概要・詳細）。コンテナの再起動などDockerを操作する機能は持たない（以前あった再起動APIは削除した）。
 
 - **アクセス:** `http://127.0.0.1:8090`（ホストのループバックのみに公開。HTTP Basic認証あり）
 - **技術スタック:** Go（バックエンド）+ React/Vite（フロントエンド）+ Nginx（配信・プロキシ）
@@ -8,18 +8,19 @@
 
 ## アーキテクチャ
 
-3コンテナで構成され、Nginxがフロント（静的ファイル）とAPI/WebSocketを振り分ける。
+4コンテナで構成され、Nginxがフロント（静的ファイル）とAPI/WebSocketを振り分ける。
 
 | コンテナ | 画像 / ビルド | 役割 |
 |---|---|---|
 | `mon-nginx` | `nginx:alpine` | `127.0.0.1:8090`→80。静的フロントを`auth_request`による認証付きで配信し、`/api/`（REST のみ）と`/ws`（WebSocket の Upgrade ヘッダーを転送）を`mon-backend:8080`へプロキシ。`client_max_body_size 32m`（MinIO へのアップロード用。既定の 1MB だと 413 になる） |
-| `mon-backend` | `golang:1.25-alpine`（マルチステージビルド） | Dockerソケット経由でコンテナ一覧・統計・MinIO操作・WebSocketログストリーミングを提供。全ルートでHost/Origin検証とHTTP Basic認証を行う。内部ポート8080 |
+| `mon-backend` | `golang:1.25-alpine`（マルチステージビルド） | `mon-docker-proxy` 経由でコンテナ一覧・統計・MinIO操作・WebSocketログストリーミングを提供。全ルートでHost/Origin検証とHTTP Basic認証を行う。内部ポート8080 |
+| `mon-docker-proxy` | `tecnativa/docker-socket-proxy:0.3.0` | `mon-backend` 専用の読み取り専用 Docker API プロキシ（`docker.sock` を `:ro` でマウントするのはこれだけ）。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけを通し、`POST=0`（コンテナの作成・exec・restart・stop・削除などは 403）。ログの追従が切れないよう HAProxy のタイムアウトを 24 時間にしている |
 | `mon-frontend`（コンテナ名`mon-frontend-builder`） | `node:20-alpine` | `npm run build`で`./frontend/dist`へ出力して終了（ビルド専用、稼働しない） |
 
 ### 依存関係
 
 - `mon-nginx` は `mon-backend`・`mon-frontend` の後に起動する（`depends_on`は起動順のみで、ビルド完了までは待たない）。ビルド成果物（`./frontend/dist`）はホストのバインドマウントなので、ビルドが終われば`/var/www/html`から配信される。
-- `mon-backend` は `/var/run/docker.sock`をroでマウントし、`monitoring-network`と`atmosidea-network`に接続する。各コンテナのヘルス状態・起動時刻・再起動回数は`inspectContainerMeta`、ネットワーク接続情報は`getContainerNetworks`（`/api/topology`用）が`ContainerInspect`で動的に取得する。compose のプロジェクト名・サービス名・`depends_on` はコンテナのラベル（`com.docker.compose.*`）から読む。
+- `mon-backend` は `/var/run/docker.sock` をマウントせず、`DOCKER_HOST=tcp://mon-docker-proxy:2375` で `mon-docker-proxy` を使う（`mon-docker-net`、`internal: true`、`mon-backend` と `mon-docker-proxy` だけ）。`docker.sock` の `:ro` はファイルが読み取り専用になるだけで API は全部使えるため。ネットワークは `monitoring-network`・`mon-docker-net`・`atmosidea-network` に接続する。各コンテナのヘルス状態・起動時刻・再起動回数は`inspectContainerMeta`、ネットワーク接続情報は`getContainerNetworks`（`/api/topology`用）が`ContainerInspect`で動的に取得する。compose のプロジェクト名・サービス名・`depends_on` はコンテナのラベル（`com.docker.compose.*`）から読む。
 - `docker-compose.monitoring.yml` に `version:` は無い（Compose v2 では不要）。
 
 ## セットアップ

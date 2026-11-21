@@ -291,7 +291,8 @@ AIが変更を行う際、特に注意すべき**プロジェクト固有の制�
 
 ### 8.3. SFSPサンドボックス
 - スキャナーのコンテナは `NetworkMode: none`（ネットワークなし）、`CapDrop: ALL`、`no-new-privileges`、スキャン対象ボリュームは `:ro` マウント、リソース制限（メモリ1.5GB・CPU 1・PID 256・30分のタイムアウト。ZIP爆弾等のDoS対策）。
-- `sfsp-worker` はDockerソケットも `.env` も直接マウントせず、`sfsp-docker-guard` → `sfsp-docker-proxy` 経由でサンドボックスを起動する。`sfsp-docker-proxy` は URL とメソッドでしか絞れないため、`sfsp-docker-guard` が `internal/sandbox/docker.go` の送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す（Privileged・ホストのパスのバインド・exec・pull・ほかのコンテナの操作などは 403）。`docker.go` のコンテナ設定や Docker API の呼び方を変えたら `sfsp-docker-guard` も合わせて直す。
+- `sfsp-worker` はDockerソケットも `.env` も直接マウントせず、`sfsp-docker-guard` → `sfsp-docker-proxy` 経由でサンドボックスを起動する。`sfsp-docker-proxy` は URL とメソッドでしか絞れないため、`sfsp-docker-guard` が `internal/sandbox/docker.go` の送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す（Privileged・ホストのパスのバインド・exec・pull・ほかのコンテナの操作などは 403）。`docker.go` のコンテナ設定や Docker API の呼び方を変えたら `sfsp-docker-guard` も合わせて直す（資源の上限は docker.go と同じ値ちょうどしか通さない。食い違うと `go test` の `TestLimitsMatchSandboxDockerGo` が落ちる）。
+- 監視ダッシュボードの `mon-backend` も Docker ソケットを直接マウントせず、読み取り専用の `mon-docker-proxy`（GET/HEAD だけ）経由で使う。
 
 🔑 **AIの対応**: 認証・認可・sandbox関連を変更する際は、上記トレードオフを踏まえた上で。理解せずに変更すると脆弱性を持ち込むためです。
 

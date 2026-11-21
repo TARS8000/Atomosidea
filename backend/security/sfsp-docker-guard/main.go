@@ -25,6 +25,19 @@
 // ゼロでも転送しない（Docker に届くのは、このファイルの createRequest に書いた項目だけ）。
 // 大文字小文字を変えたキー（"privileged" など。Docker の JSON デコードは大文字小文字を区別しない）や重複キーも、
 // 作り直した本文には入らないので効かない。
+//
+// 資源の上限（メモリ・CPU・プロセス数・/tmp の tmpfs のサイズ）は sandbox/docker.go が送る値ちょうど。
+// /tmp の tmpfs は、送られたオプションによらず rw,noexec,nosuid,nodev,size=<上限以下> で作り直す。
+//
+// サンドボックスの数にも上限がある（DoS 対策）。作成と start の前に、ラベル app=sfsp-sandbox のコンテナを上流で数え、
+// 動いている（exited・dead 以外の）ものが SFSP_GUARD_MAX_ACTIVE_SANDBOXES（既定 2）以上、
+// または停止済みを含めて SFSP_GUARD_MAX_SANDBOXES（既定 32）以上なら 403 にする。
+// sfsp-worker は 1 つだけで、ジョブを 1 つずつ処理し、ClamAV → YARA の順にサンドボックスを 1 つずつ動かして毎回消す
+// （internal/worker/worker.go の StartWorker・processJob。同時に動くのは 1 つ）ので、2 は 2 倍の余裕
+// （sfsp-worker が落ちて動いたまま残ったものが 1 つあっても止まらない）。
+// 数えてから作る（start する）までは、このプロセスの中ではロックで直列にしている。sfsp-docker-proxy に届くのは
+// sfsp-docker-guard だけなので普通はこれで足りるが、Docker 側で原子的に確かめているわけではない
+// （ほかの経路でラベル app=sfsp-sandbox のコンテナが作られると、数えた後に増えうる。増えた分も次の作成からは数える）。
 package main
 
 import (
@@ -42,18 +55,26 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// サンドボックスに許す資源の上限（internal/sandbox/docker.go の値：メモリ 1.5 GiB・1 CPU・プロセス 256）。
-// 上げるときはここも変える
+// サンドボックスに許す資源の上限。internal/sandbox/docker.go が送る値ちょうど（docker.go に定数で書いてあり、
+// 環境変数などでは変わらない）。docker.go で上げたら、ここも変える（TestLimitsMatchSandboxDockerGo が食い違いを見つける）
 const (
-	maxMemory    = 2 << 30 // 2 GiB
-	maxNanoCPUs  = 2_000_000_000
-	maxPidsLimit = 1024
-	maxBodyBytes = 1 << 20
-	maxArgs      = 256
-	maxArgBytes  = 8192
+	maxMemory     = 1536 << 20    // Resources.Memory: 1536 * 1024 * 1024
+	maxNanoCPUs   = 1_000_000_000 // Resources.NanoCPUs
+	maxPidsLimit  = 256           // pidsLimit
+	maxTmpfsBytes = 512 << 20     // sandboxTmpfsOptions の size=512m
+	maxBodyBytes  = 1 << 20
+	maxArgs       = 256
+	maxArgBytes   = 8192
+)
+
+// サンドボックスの数の上限の既定値（先頭のコメントを参照）
+const (
+	defaultMaxActiveSandboxes = 2
+	defaultMaxSandboxes       = 32
 )
 
 const (
@@ -78,8 +99,11 @@ var (
 
 	// サンドボックスに付けてよいラベル（sandbox/docker.go が付けるもの）
 	allowedLabels = map[string]bool{"app": true, "job_id": true, "scanner": true}
-	// /tmp の tmpfs に付けてよいオプション（size= と mode= は別に許す）
-	allowedTmpfsOpts = map[string]bool{"rw": true, "noexec": true, "nosuid": true, "nodev": true}
+	// /tmp の tmpfs で受け付けるが、値は使わずに rw,noexec,nosuid,nodev で上書きするオプション。
+	// これ以外（uid=・nr_inodes= など）は拒否する。mode= は落とす（tmpfs の既定の 1777 になる）
+	overriddenTmpfsOpts = map[string]bool{"rw": true, "ro": true, "exec": true, "noexec": true, "suid": true,
+		"nosuid": true, "dev": true, "nodev": true}
+	tmpfsSizeRe = regexp.MustCompile(`^([0-9]{1,12})([kKmMgG]?)$`)
 )
 
 // 各操作で転送してよいクエリ（ここに無いクエリが付いていたら拒否する）
@@ -118,6 +142,11 @@ type guard struct {
 	client   *http.Client
 	images   map[string]bool // サンドボックスに使ってよいイメージ
 	scanBind string          // 唯一許すバインド（"<スキャン用の名前付きボリューム>:/scan_target:ro"）
+
+	maxActive int // 同時に動いて（exited・dead 以外で）よいサンドボックスの数
+	maxTotal  int // 停止済みを含めて存在してよいサンドボックスの数
+	// 数えてから作る・start するまでを直列にする（先頭のコメントを参照）
+	limitMu sync.Mutex
 }
 
 func newGuard(upstream string, images []string, scanVolume string) (*guard, error) {
@@ -130,9 +159,11 @@ func newGuard(upstream string, images []string, scanVolume string) (*guard, erro
 		return nil, fmt.Errorf("scan volume must be a named volume: %q", scanVolume)
 	}
 	g := &guard{
-		upstream: u,
-		images:   map[string]bool{},
-		scanBind: scanVolume + ":" + scanTarget + ":ro",
+		upstream:  u,
+		images:    map[string]bool{},
+		scanBind:  scanVolume + ":" + scanTarget + ":ro",
+		maxActive: defaultMaxActiveSandboxes,
+		maxTotal:  defaultMaxSandboxes,
 		client: &http.Client{
 			// ContainerWait はスキャンが終わるまで（最長 30 分）返らないので、全体のタイムアウトは付けない。
 			// 呼び出し元が切断すると r.Context() が取り消され、上流へのリクエストも止まる
@@ -220,7 +251,68 @@ func (g *guard) handleCreate(w http.ResponseWriter, r *http.Request, version str
 		g.deny(w, r, "container config not allowed: "+err.Error())
 		return
 	}
+	g.limitMu.Lock()
+	defer g.limitMu.Unlock()
+	if !g.checkSandboxCount(w, r, version, "") {
+		return
+	}
 	g.forward(w, r, http.MethodPost, version+"/containers/create", url.Values{"name": {q.Get("name")}}, out)
+}
+
+// checkSandboxCount は上流のサンドボックス（ラベル app=sfsp-sandbox のコンテナ。exclude の ID は除く）を数え、
+// 上限以上なら 403、数えられなければ 502 を返して false を返す。呼び出し側は limitMu を持っていること
+func (g *guard) checkSandboxCount(w http.ResponseWriter, r *http.Request, version, exclude string) bool {
+	active, total, err := g.countSandboxes(r.Context(), version, exclude)
+	if err != nil {
+		log.Printf("ERROR %s %q: count sandboxes: %v", r.Method, r.URL.Path, err)
+		writeError(w, http.StatusBadGateway, "sfsp-docker-guard: cannot count sandboxes")
+		return false
+	}
+	if active >= g.maxActive || total >= g.maxTotal {
+		g.deny(w, r, fmt.Sprintf("too many sandboxes (running %d, max %d; total %d, max %d)", active, g.maxActive, total, g.maxTotal))
+		return false
+	}
+	return true
+}
+
+// countSandboxes は上流の GET /containers/json?all=1&filters={"label":["app=sfsp-sandbox"]} でサンドボックスを数え、
+// 動いている（exited・dead 以外の）数と、停止済みを含めた数を返す
+func (g *guard) countSandboxes(ctx context.Context, version, exclude string) (active, total int, err error) {
+	filters, _ := json.Marshal(map[string][]string{"label": {sandboxLabelKey + "=" + sandboxLabelValue}})
+	u := *g.upstream
+	u.Path = version + "/containers/json"
+	u.RawQuery = url.Values{"all": {"1"}, "filters": {string(filters)}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+	var list []struct {
+		ID     string            `json:"Id"`
+		State  string            `json:"State"`
+		Labels map[string]string `json:"Labels"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&list); err != nil {
+		return 0, 0, err
+	}
+	for _, c := range list {
+		// フィルターが効かなかったときのために、ラベルもここで確かめる
+		if c.ID == exclude || c.Labels[sandboxLabelKey] != sandboxLabelValue {
+			continue
+		}
+		total++
+		if c.State != "exited" && c.State != "dead" {
+			active++
+		}
+	}
+	return active, total, nil
 }
 
 // checkCreate はコンテナ作成の本文を検査し、許可した項目だけで作り直した本文を返す
@@ -332,10 +424,11 @@ func (g *guard) checkHostConfig(hc map[string]any) (hostConfig, error) {
 			if path != "/tmp" || !ok {
 				return out, fmt.Errorf("HostConfig.Tmpfs %q is not allowed (only /tmp)", path)
 			}
-			if err := checkTmpfsOpts(opts); err != nil {
+			safe, err := safeTmpfsOpts(opts)
+			if err != nil {
 				return out, err
 			}
-			out.Tmpfs[path] = opts
+			out.Tmpfs[path] = safe
 		}
 	}
 
@@ -365,21 +458,49 @@ func (g *guard) checkHostConfig(hc map[string]any) (hostConfig, error) {
 		"Tmpfs", "Memory", "NanoCpus", "PidsLimit", "AutoRemove")
 }
 
-func checkTmpfsOpts(opts string) error {
-	seen := map[string]bool{}
+// safeTmpfsOpts は /tmp の tmpfs のオプションを、送られた値によらず rw,noexec,nosuid,nodev,size=<上限以下> にして返す。
+// size が無ければ上限（512m）にする（無いと tmpfs の既定の「メモリの半分」になる）。上限を超える size と、
+// 知らないオプションは拒否する。スキャナー（clamscan・yara）は /tmp に一時ファイルを書くだけで /tmp から何も実行しない
+// （sandbox/docker.go ももともと noexec を付けて送っている）
+func safeTmpfsOpts(opts string) (string, error) {
+	size := "512m"
 	for _, o := range strings.Split(opts, ",") {
+		k, v, hasValue := strings.Cut(o, "=")
 		switch {
-		case allowedTmpfsOpts[o]:
-			seen[o] = true
-		case strings.HasPrefix(o, "size=") || strings.HasPrefix(o, "mode="):
+		case !hasValue && overriddenTmpfsOpts[k]:
+		case hasValue && k == "mode":
+		case hasValue && k == "size":
+			n, err := parseTmpfsSize(v)
+			if err != nil {
+				return "", err
+			}
+			if n < 1 || n > maxTmpfsBytes {
+				return "", fmt.Errorf("tmpfs size must be between 1 and %d bytes, got %q", maxTmpfsBytes, v)
+			}
+			size = v
 		default:
-			return fmt.Errorf("tmpfs option %q is not allowed", o)
+			return "", fmt.Errorf("tmpfs option %q is not allowed", o)
 		}
 	}
-	if !seen["nosuid"] || !seen["nodev"] {
-		return errors.New("tmpfs must be nosuid,nodev")
+	return "rw,noexec,nosuid,nodev,size=" + size, nil
+}
+
+// parseTmpfsSize は tmpfs の size=（バイト数、または k・m・g 付き。% は不可）をバイト数にする
+func parseTmpfsSize(v string) (int64, error) {
+	m := tmpfsSizeRe.FindStringSubmatch(v)
+	if m == nil {
+		return 0, fmt.Errorf("tmpfs size %q is not allowed", v)
 	}
-	return nil
+	n, _ := strconv.ParseInt(m[1], 10, 64)
+	switch strings.ToLower(m[2]) {
+	case "k":
+		n <<= 10
+	case "m":
+		n <<= 20
+	case "g":
+		n <<= 30
+	}
+	return n, nil
 }
 
 func sandboxLabels(v any) (map[string]string, error) {
@@ -427,13 +548,13 @@ func (g *guard) handleContainerOp(w http.ResponseWriter, r *http.Request, versio
 	// 操作の前に、相手がサンドボックスかを上流に問い合わせて確かめる
 	id, status, body, err := g.sandboxID(r.Context(), version, ref)
 	if err != nil {
-		log.Printf("ERROR %s %s: inspect: %v", r.Method, r.URL.Path, err)
+		log.Printf("ERROR %s %q: inspect: %v", r.Method, r.URL.Path, err)
 		writeError(w, http.StatusBadGateway, "sfsp-docker-guard: inspect failed")
 		return
 	}
 	if status != http.StatusOK {
 		// 存在しない（404）などは上流の応答をそのまま返す（docker クライアントが NotFound として扱える）
-		log.Printf("%s %s -> inspect %d", r.Method, r.URL.Path, status)
+		log.Printf("%s %q -> inspect %d", r.Method, r.URL.Path, status)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
@@ -442,6 +563,14 @@ func (g *guard) handleContainerOp(w http.ResponseWriter, r *http.Request, versio
 	if id == "" {
 		g.deny(w, r, "container is not an sfsp sandbox")
 		return
+	}
+	if op == "/start" {
+		// 停止済みのサンドボックスを start し直して、上限を超えて同時に動かすことはできない
+		g.limitMu.Lock()
+		defer g.limitMu.Unlock()
+		if !g.checkSandboxCount(w, r, version, id) {
+			return
+		}
 	}
 	g.forward(w, r, r.Method, version+"/containers/"+id+op, q, nil)
 }
@@ -504,12 +633,12 @@ func (g *guard) forward(w http.ResponseWriter, r *http.Request, method, path str
 	}
 	resp, err := g.client.Do(req)
 	if err != nil {
-		log.Printf("ERROR %s %s: %v", r.Method, r.URL.Path, err)
+		log.Printf("ERROR %s %q: %v", r.Method, r.URL.Path, err)
 		writeError(w, http.StatusBadGateway, "sfsp-docker-guard: upstream error")
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("%s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
+	log.Printf("%s %q -> %d", r.Method, r.URL.Path, resp.StatusCode)
 
 	for k, vs := range resp.Header {
 		switch http.CanonicalHeaderKey(k) {
@@ -543,8 +672,10 @@ func (g *guard) forward(w http.ResponseWriter, r *http.Request, method, path str
 	}
 }
 
+// deny は 403 を返す。パス（%0A などをデコードしたもの）・クエリ・理由（キー名などを含む）は信頼できないので、
+// ログの行を偽造されないよう %q で書く（メソッドは net/http がトークン文字だけか確かめている）
 func (g *guard) deny(w http.ResponseWriter, r *http.Request, reason string) {
-	log.Printf("DENY %s %s?%s: %s", r.Method, r.URL.Path, r.URL.RawQuery, reason)
+	log.Printf("DENY %s %q?%q: %q", r.Method, r.URL.Path, r.URL.RawQuery, reason)
 	writeError(w, http.StatusForbidden, "sfsp-docker-guard: "+reason)
 }
 
@@ -653,6 +784,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	if g.maxActive, err = envInt("SFSP_GUARD_MAX_ACTIVE_SANDBOXES", defaultMaxActiveSandboxes); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if g.maxTotal, err = envInt("SFSP_GUARD_MAX_SANDBOXES", defaultMaxSandboxes); err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           g,
@@ -660,7 +797,8 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 		// WriteTimeout は付けない（ContainerWait が最長 30 分かかる）
 	}
-	log.Printf("sfsp-docker-guard listening on %s -> %s (images=%v, bind=%s)", listen, upstream, keys(g.images), g.scanBind)
+	log.Printf("sfsp-docker-guard listening on %s -> %s (images=%v, bind=%s, max sandboxes: running %d, total %d)",
+		listen, upstream, keys(g.images), g.scanBind, g.maxActive, g.maxTotal)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -669,6 +807,19 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt は環境変数 k を 1 以上の整数として読む（未設定なら def）
+func envInt(k string, def int) (int, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer: %q", k, v)
+	}
+	return n, nil
 }
 
 func keys(m map[string]bool) []string {

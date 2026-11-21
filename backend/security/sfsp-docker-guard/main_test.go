@@ -4,11 +4,18 @@ package main
 // （github.com/docker/docker v28.3.3 のクライアント）が実際に送ったリクエストを記録したもの。
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +32,20 @@ type fakeDocker struct {
 	mu         sync.Mutex
 	reqs       []string
 	createBody []byte
+	// GET /containers/json が返すコンテナ（作成のたびに State: created で 1 つ足す）
+	listed    []fakeContainer
+	listError bool // GET /containers/json を 500 にする
+	created   int
+}
+
+type fakeContainer struct {
+	ID     string            `json:"Id"`
+	State  string            `json:"State"`
+	Labels map[string]string `json:"Labels"`
+}
+
+func sandboxIn(state string) fakeContainer {
+	return fakeContainer{ID: strings.Repeat("c", 64), State: state, Labels: map[string]string{"app": "sfsp-sandbox"}}
 }
 
 func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -37,9 +58,21 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(p, "/_ping"):
 		w.Write([]byte("OK"))
+	case strings.HasSuffix(p, "/containers/json"):
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.listError {
+			w.WriteHeader(500)
+			return
+		}
+		b, _ := json.Marshal(append([]fakeContainer{}, f.listed...))
+		w.Write(b)
 	case strings.HasSuffix(p, "/containers/create"):
 		f.mu.Lock()
 		f.createBody = body
+		f.created++
+		f.listed = append(f.listed, fakeContainer{ID: fmt.Sprintf("%064x", f.created), State: "created",
+			Labels: map[string]string{"app": "sfsp-sandbox"}})
 		f.mu.Unlock()
 		w.WriteHeader(201)
 		w.Write([]byte(`{"Id":"` + sandboxID + `"}`))
@@ -127,7 +160,9 @@ func TestSfspWorkerSequenceAllowed(t *testing.T) {
 	}
 	create, _ := os.ReadFile("testdata/create-sfsp-worker.json")
 	_, srv := setup(t)
+	// 行末の \r も落とす（Windows で core.autocrlf=true のまま取り出した場合。.gitattributes で LF に固定もしている）
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		line = strings.TrimSpace(line)
 		method, path, _ := strings.Cut(line, " ")
 		body := ""
 		if strings.Contains(path, "/containers/create") {
@@ -209,9 +244,17 @@ func TestCreateRejectsDangerousConfig(t *testing.T) {
 		"Sysctls":                hc("Sysctls", map[string]any{"kernel.core_pattern": "|/x"}),
 		"Runtime":                hc("Runtime", "runc-unsafe"),
 		"Tmpfs other path":       hc("Tmpfs", map[string]any{"/etc": "rw"}),
-		"Tmpfs suid":             hc("Tmpfs", map[string]any{"/tmp": "rw,exec,suid,dev"}),
+		"Tmpfs size too big":     hc("Tmpfs", map[string]any{"/tmp": "rw,noexec,nosuid,nodev,size=513m"}),
+		"Tmpfs size percent":     hc("Tmpfs", map[string]any{"/tmp": "size=50%"}),
+		"Tmpfs size garbage":     hc("Tmpfs", map[string]any{"/tmp": "size=1e9"}),
+		"Tmpfs uid":              hc("Tmpfs", map[string]any{"/tmp": "rw,noexec,nosuid,nodev,uid=0"}),
+		"Tmpfs not string":       hc("Tmpfs", map[string]any{"/tmp": 1}),
+		"Tmpfs not object":       hc("Tmpfs", []any{"/tmp"}),
 		"Memory 0":               hc("Memory", 0),
 		"Memory huge":            hc("Memory", int64(64)<<30),
+		"Memory over worker":     hc("Memory", int64(1536<<20)+1),
+		"NanoCpus over worker":   hc("NanoCpus", int64(1_000_000_001)),
+		"PidsLimit over worker":  hc("PidsLimit", 257),
 		"PidsLimit -1":           hc("PidsLimit", -1),
 		"PidsLimit missing":      hc("PidsLimit", nil),
 		"NanoCpus missing":       hc("NanoCpus", nil),
@@ -369,4 +412,215 @@ func TestNewGuardRejectsHostPathVolume(t *testing.T) {
 	if _, err := newGuard("http://x:2375", []string{" ", ""}, "sfsp_temp_scan"); err == nil {
 		t.Error("empty image list accepted")
 	}
+}
+
+// /tmp の tmpfs は、送られたオプションによらず rw,noexec,nosuid,nodev とサイズ上限付きで作り直して転送する
+func TestTmpfsOptionsForced(t *testing.T) {
+	for in, want := range map[string]string{
+		"rw,noexec,nosuid,nodev,size=512m": "rw,noexec,nosuid,nodev,size=512m", // sandbox/docker.go が送るもの
+		"rw,exec,suid,dev":                 "rw,noexec,nosuid,nodev,size=512m",
+		"ro,mode=0777":                     "rw,noexec,nosuid,nodev,size=512m",
+		"size=64m":                         "rw,noexec,nosuid,nodev,size=64m",
+		"size=1048576":                     "rw,noexec,nosuid,nodev,size=1048576",
+		"exec,size=524288k":                "rw,noexec,nosuid,nodev,size=524288k",
+	} {
+		f, srv := setup(t)
+		m := realCreate(t)
+		m["HostConfig"].(map[string]any)["Tmpfs"] = map[string]any{"/tmp": in}
+		if resp := do(t, srv, "POST", "/v1.51/containers/create?name="+sbName, marshal(t, m)); resp.StatusCode != 201 {
+			t.Fatalf("%q: got %d", in, resp.StatusCode)
+		}
+		var got createRequest
+		if err := json.Unmarshal(f.createBody, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.HostConfig.Tmpfs["/tmp"] != want || len(got.HostConfig.Tmpfs) != 1 {
+			t.Errorf("%q: forwarded %q, want %q", in, got.HostConfig.Tmpfs, want)
+		}
+	}
+	for _, s := range []string{"1g", "513m", "536870913", "1G", "50%", "", "m", "-1"} {
+		if _, err := safeTmpfsOpts("size=" + s); err == nil {
+			t.Errorf("size=%s accepted", s)
+		}
+	}
+}
+
+// サンドボックスの数の上限：作成は、動いているものが maxActive 以上か、停止済みを含めて maxTotal 以上なら拒否する
+func TestCreateSandboxLimit(t *testing.T) {
+	running, exited := sandboxIn("running"), sandboxIn("exited")
+	other := fakeContainer{ID: strings.Repeat("d", 64), State: "running", Labels: map[string]string{"app": "sfsp-db"}}
+	cases := []struct {
+		name   string
+		listed []fakeContainer
+		want   int
+	}{
+		{"none", nil, 201},
+		{"one orphan running", []fakeContainer{running}, 201},
+		{"two running", []fakeContainer{running, sandboxIn("created")}, 403},
+		{"paused and restarting count", []fakeContainer{sandboxIn("paused"), sandboxIn("restarting")}, 403},
+		{"exited do not count as running", []fakeContainer{exited, exited, exited, sandboxIn("dead")}, 201},
+		{"total limit", repeat(exited, defaultMaxSandboxes), 403},
+		{"below total limit", repeat(exited, defaultMaxSandboxes-1), 201},
+		{"other labels ignored", []fakeContainer{other, other, other}, 201},
+	}
+	for _, c := range cases {
+		f, srv := setup(t)
+		f.listed = c.listed
+		resp := do(t, srv, "POST", "/v1.51/containers/create?name="+sbName, marshal(t, realCreate(t)))
+		if resp.StatusCode != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, resp.StatusCode, c.want)
+		}
+		reqs := f.requests()
+		if len(reqs) == 0 || !strings.HasPrefix(reqs[0], "GET /v1.51/containers/json?") {
+			t.Fatalf("%s: did not count first: %v", c.name, reqs)
+		}
+		q, _ := url.ParseQuery(strings.SplitN(reqs[0], "?", 2)[1])
+		if q.Get("all") != "1" || q.Get("filters") != `{"label":["app=sfsp-sandbox"]}` {
+			t.Errorf("%s: count query %v", c.name, q)
+		}
+		if forwarded := len(reqs) == 2; forwarded != (c.want == 201) {
+			t.Errorf("%s: requests %v", c.name, reqs)
+		}
+	}
+
+	// 数えられなければ作らない（502）
+	f, srv := setup(t)
+	f.listError = true
+	if resp := do(t, srv, "POST", "/v1.51/containers/create?name="+sbName, marshal(t, realCreate(t))); resp.StatusCode != 502 {
+		t.Errorf("list error: got %d, want 502", resp.StatusCode)
+	}
+	if len(f.requests()) != 1 {
+		t.Errorf("list error: forwarded %v", f.requests())
+	}
+}
+
+// 同時に来た作成も、数えてから作るまでを直列にするので上限を超えない
+func TestCreateSandboxLimitConcurrent(t *testing.T) {
+	f, srv := setup(t)
+	var wg sync.WaitGroup
+	codes := make(chan int, 20)
+	body := marshal(t, realCreate(t))
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- do(t, srv, "POST", "/v1.51/containers/create?name="+sbName, body).StatusCode
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	ok := 0
+	for c := range codes {
+		if c == 201 {
+			ok++
+		} else if c != 403 {
+			t.Errorf("got %d", c)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ok != defaultMaxActiveSandboxes || f.created != defaultMaxActiveSandboxes {
+		t.Errorf("created %d (forwarded %d), want %d", ok, f.created, defaultMaxActiveSandboxes)
+	}
+}
+
+// 停止済みのサンドボックスを start し直して、上限を超えて動かすことはできない（start する当のコンテナは数えない）
+func TestStartSandboxLimit(t *testing.T) {
+	self := fakeContainer{ID: sandboxID, State: "created", Labels: map[string]string{"app": "sfsp-sandbox"}}
+	for _, c := range []struct {
+		name   string
+		listed []fakeContainer
+		want   int
+	}{
+		{"only itself", []fakeContainer{self}, 200},
+		{"itself and one orphan", []fakeContainer{self, sandboxIn("running")}, 200},
+		{"two others running", []fakeContainer{self, sandboxIn("running"), sandboxIn("running")}, 403},
+	} {
+		f, srv := setup(t)
+		f.listed = c.listed
+		if resp := do(t, srv, "POST", "/v1.51/containers/"+sandboxID+"/start", ""); resp.StatusCode != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, resp.StatusCode, c.want)
+		}
+		started := false
+		for _, r := range f.requests() {
+			started = started || r == "POST /v1.51/containers/"+sandboxID+"/start"
+		}
+		if started != (c.want == 200) {
+			t.Errorf("%s: requests %v", c.name, f.requests())
+		}
+	}
+	f, srv := setup(t)
+	f.listError = true
+	if resp := do(t, srv, "POST", "/v1.51/containers/"+sandboxID+"/start", ""); resp.StatusCode != 502 {
+		t.Errorf("list error: got %d, want 502", resp.StatusCode)
+	}
+}
+
+// 拒否のログは %q で書くので、パスやキーに改行（%0A）を入れてもログの行を偽造できない
+func TestDenyLogEscapesUntrustedInput(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	_, srv := setup(t)
+	do(t, srv, "GET", "/v1.51/x%0A2026/01/01%2000:00:00%20POST%20%22/v1.51/containers/create%22%20-%3E%20201", "")
+	do(t, srv, "POST", "/v1.51/containers/create?name="+sbName+"&a%0Ab=1", "")
+	out := buf.String()
+	if n := strings.Count(out, "\n"); n != 2 {
+		t.Errorf("want 2 log lines, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, `\n2026/01/01 00:00:00 POST`) || !strings.Contains(out, `query not allowed: a\nb`) {
+		t.Errorf("newline not escaped:\n%s", out)
+	}
+}
+
+// 資源の上限と tmpfs が sfsp の internal/sandbox/docker.go（../sfsp）の値と揃っているか（リポジトリを取り出した手元の go test で確かめる。
+// Docker のビルドではコンテキストに無いので飛ばす）
+func TestLimitsMatchSandboxDockerGo(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "sfsp", "internal", "sandbox", "docker.go"))
+	if err != nil {
+		t.Skip("sandbox/docker.go not found:", err)
+	}
+	find := func(re string) string {
+		m := regexp.MustCompile(re).FindSubmatch(src)
+		if m == nil {
+			t.Fatalf("%s not found in docker.go; update this test and the limits in main.go", re)
+		}
+		return string(m[1])
+	}
+	mem, _ := strconv.ParseInt(find(`Memory:\s+([0-9]+) \* 1024 \* 1024,`), 10, 64)
+	cpus, _ := strconv.ParseInt(strings.ReplaceAll(find(`NanoCPUs:\s+([0-9_]+),`), "_", ""), 10, 64)
+	pids, _ := strconv.ParseInt(find(`pidsLimit := int64\(([0-9]+)\)`), 10, 64)
+	tmpfs := find(`sandboxTmpfsOptions = "([^"]+)"`)
+	if mem<<20 != maxMemory || cpus != maxNanoCPUs || pids != maxPidsLimit {
+		t.Errorf("docker.go sends Memory=%dMiB NanoCPUs=%d PidsLimit=%d; guard allows %d / %d / %d",
+			mem, cpus, pids, maxMemory, maxNanoCPUs, maxPidsLimit)
+	}
+	if got, err := safeTmpfsOpts(tmpfs); err != nil || got != tmpfs {
+		t.Errorf("docker.go tmpfs %q -> %q, %v", tmpfs, got, err)
+	}
+}
+
+func TestEnvInt(t *testing.T) {
+	t.Setenv("SFSP_GUARD_TEST_N", "")
+	if n, err := envInt("SFSP_GUARD_TEST_N", 7); n != 7 || err != nil {
+		t.Errorf("unset: %d %v", n, err)
+	}
+	t.Setenv("SFSP_GUARD_TEST_N", "3")
+	if n, err := envInt("SFSP_GUARD_TEST_N", 7); n != 3 || err != nil {
+		t.Errorf("3: %d %v", n, err)
+	}
+	for _, v := range []string{"0", "-1", "x"} {
+		t.Setenv("SFSP_GUARD_TEST_N", v)
+		if _, err := envInt("SFSP_GUARD_TEST_N", 7); err == nil {
+			t.Errorf("%q accepted", v)
+		}
+	}
+}
+
+func repeat(c fakeContainer, n int) []fakeContainer {
+	out := make([]fakeContainer, n)
+	for i := range out {
+		out[i] = c
+	}
+	return out
 }
