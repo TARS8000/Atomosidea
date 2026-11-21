@@ -1,5 +1,5 @@
 -- team-db schema for team-service
--- Teams, members, and content links for closed/token-based content sharing.
+-- Teams, members, join requests, and team posts for closed/token-based content sharing.
 
 DO $$
 BEGIN
@@ -56,16 +56,6 @@ CREATE TABLE IF NOT EXISTS team_join_requests (
     UNIQUE (team_id, user_id)
 );
 
--- Content links (Phase 2)
-CREATE TABLE IF NOT EXISTS team_content (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    content_type VARCHAR(20) NOT NULL,
-    content_id VARCHAR(20) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    UNIQUE (team_id, content_type, content_id)
-);
-
 -- Team-native content posts (Phase 1)
 CREATE TABLE IF NOT EXISTS team_posts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -76,14 +66,5 @@ CREATE TABLE IF NOT EXISTS team_posts (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE teams, team_members, team_content, team_posts TO team_service_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE teams, team_members, team_posts TO team_service_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE team_join_requests TO team_service_user;
-
--- Migration: existing databases created before allow_member_invite existed.
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'teams' AND column_name = 'allow_member_invite') THEN
-    ALTER TABLE teams ADD COLUMN allow_member_invite BOOLEAN NOT NULL DEFAULT FALSE;
-  END IF;
-END
-$$;

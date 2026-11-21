@@ -1,40 +1,37 @@
-# Git files
+# Root build context (context: .) is used by every backend service and SFSP.
+# Their Dockerfiles do `COPY . .` and need backend/shared plus their own module,
+# so never exclude backend/<service>/ source directories here.
+# The frontend builds with context ./frontend and uses frontend/.dockerignore instead.
+
+# Git / IDE / tooling
 .git
 .gitignore
-
-# IDE files
 .idea
+.vscode
+*.iml
+.kilo
+.cursor
 
-# Node.js dependencies
-node_modules
+# Secrets: runtime config comes from docker-compose `environment:`, never from the image
+.env
+.env.*
+!.env.example
 
-# Temporary files and directories
-tmp
-temp
+# Node.js dependencies and frontend build outputs (not needed by any root-context build)
+**/node_modules
+frontend/node_modules
+frontend/dist
+monitoring-service/frontend/node_modules
+monitoring-service/frontend/dist
 
-# Build outputs
-dist
-build
-coverage
+# Runtime data (bind-mounted volumes, not image content)
+backend/storage_data
+backend/video-service/upload_workdir
 
-# Local environment files
-#.env # コメントアウト
-
-# Large media files and test samples
-# These should be managed by runtime volumes, not embedded in images.
-uploads
-videos
-backend/security/sfsp/test-samples
-backend/security/sfsp/reports
-game_storage_db
-backend/auth/auth-storage/profile_storage_db
-backend/static-site-service/static_site_storage_db
-backend/video-service/video_storage_db
-
-# Specific media file extensions
-*.mp4
-*.mov
-*.mkv
-*.webm
-*.avi
-*.zip
+# Large media / archives that may be dropped locally for testing
+**/*.mp4
+**/*.mov
+**/*.mkv
+**/*.webm
+**/*.avi
+**/*.zip

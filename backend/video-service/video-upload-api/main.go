@@ -41,7 +41,6 @@ var (
 	db                   *pgxpool.Pool
 	jwtSecret            []byte
 	uploadDir            string
-	thumbnailDir         string
 	sfspApiUrl           string
 	sfspApiKey           string
 	sfspCleanMinioClient *minio.Client
@@ -116,24 +115,11 @@ const (
 	StatusQuarantined = "quarantined"
 )
 
-type Video struct {
-	ID                string `json:"id"`
-	Title             string `json:"title"`
-	Description       string `json:"description"`
-	Filename          string `json:"filename"`
-	ThumbnailPath     string `json:"thumbnail_path"`
-	UploaderID        string `json:"uploader_id"`
-	TeamID            string `json:"team_id"`
-	Status            string `json:"status"`
-	ProcessingDetails string `json:"processing_details"`
-}
-
 type SfspUploadResponse struct {
-	FileID   string `json:"file_id"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename"`
+	FileID string `json:"file_id"`
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
+	SHA256 string `json:"sha256"`
 }
 
 func generateRandomID() (string, error) {
@@ -362,7 +348,6 @@ func main() {
 		logger.Fatal("JWT_SECRET environment variable is not set")
 	}
 	uploadDir = os.Getenv("UPLOAD_DIR")
-	thumbnailDir = os.Getenv("THUMBNAIL_DIR")
 	databaseUrl := os.Getenv("DATABASE_URL")
 	sfspApiUrl = os.Getenv("SFSP_API_URL")
 	sfspApiKey = os.Getenv("SFSP_API_KEY")
@@ -400,9 +385,6 @@ func main() {
 
 	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
 		logger.Fatalf("Failed to create upload directory: %v", err)
-	}
-	if err := os.MkdirAll(thumbnailDir, os.ModePerm); err != nil {
-		logger.Fatalf("Failed to create thumbnail directory: %v", err)
 	}
 
 	cfg, err := config.LoadConfig()
@@ -929,12 +911,11 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 	generatedThumbnailPath := filepath.Join(workDir, "thumbnail.jpg")
 	firstSegmentPath := filepath.Join(hlsOutputPath, "360p", "playlist.m3u8")
 
-	if _, err := os.Stat(firstSegmentPath); os.IsNotExist(err) {
-		err = generateThumbnail(jobCtx, tempVideoPath, generatedThumbnailPath)
-	} else {
-		err = generateThumbnail(jobCtx, firstSegmentPath, generatedThumbnailPath)
+	thumbnailSource := firstSegmentPath
+	if _, statErr := os.Stat(firstSegmentPath); os.IsNotExist(statErr) {
+		thumbnailSource = tempVideoPath
 	}
-	if err != nil {
+	if err := generateThumbnail(jobCtx, thumbnailSource, generatedThumbnailPath); err != nil {
 		logger.Errorf("ERROR: Failed to generate thumbnail for video %s: %v", videoID, err)
 	} else {
 		thumbnailPath = uploadThumbnailToMinIO(jobCtx, videoID, generatedThumbnailPath)
@@ -1111,10 +1092,6 @@ func deleteHandler(c *gin.Context) {
 	// HLSはMinIOへ保存しているのでMinIOから削除する。
 	if err := removeHLSMinIO(context.Background(), videoID); err != nil {
 		logger.Errorf("Failed to delete HLS from MinIO for video %s: %v", videoID, err)
-	}
-	// 旧実装の作業ディレクトリ（UPLOAD_DIR/<id>）が残っていれば削除する。
-	if err := os.RemoveAll(filepath.Join(uploadDir, videoID)); err != nil {
-		logger.Warnf("Failed to remove leftover local HLS directory for video %s: %v", videoID, err)
 	}
 
 	objectName := "thumbnails/" + videoID

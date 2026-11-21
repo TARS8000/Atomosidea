@@ -19,7 +19,6 @@ import (
 	"github.com/atmosidea/shared/config"
 	"github.com/atmosidea/shared/event"
 	"github.com/atmosidea/shared/queue"
-	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
@@ -36,7 +35,7 @@ var (
 	sfspApiUrl           string
 	sfspApiKey           string
 	sfspCleanMinioClient *minio.Client
-	sfspCleanBucketName  = "clean-files"
+	sfspCleanBucketName  string
 	videoMinioClient     *minio.Client
 	videoBucketName      = "videos"
 	logger               *zap.SugaredLogger
@@ -67,18 +66,8 @@ type Video struct {
 	CreatedAt          time.Time  `json:"created_at"`
 }
 
-// 💡 動画更新時のリクエストボディ構造体
-type UpdateVideoInput struct {
-	Title       string `json:"title" binding:"required"`
-	Description string `json:"description"`
-}
-
 type SfspUploadResponse struct {
-	FileID   string `json:"file_id"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename"`
+	JobID string `json:"job_id"`
 }
 
 // imageExtensions は保存を許可する画像の Content-Type と拡張子の対応。
@@ -138,6 +127,11 @@ func main() {
 	}
 	teamServiceURL = strings.TrimRight(teamServiceURL, "/")
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", 10<<20)
+
+	sfspCleanBucketName = os.Getenv("SFSP_CLEAN_BUCKET_NAME")
+	if sfspCleanBucketName == "" {
+		sfspCleanBucketName = "clean-files"
+	}
 
 	sfspCleanMinioEndpoint := os.Getenv("SFSP_CLEAN_MINIO_ENDPOINT")
 	sfspCleanMinioAccessKey := os.Getenv("SFSP_CLEAN_MINIO_ACCESS_KEY_ID")
@@ -201,12 +195,6 @@ func main() {
 
 	r := gin.Default()
 	r.MaxMultipartMemory = 8 << 20
-	config := cors.DefaultConfig()
-	config.AllowOrigins = []string{"http://localhost:3001"} // フロントエンドのURL
-	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
-	config.AllowHeaders = []string{"Origin", "Content-Type", "Authorization"}
-	config.AllowCredentials = true
-	r.Use(cors.New(config))
 
 	api := r.Group("/api/videos")
 	{

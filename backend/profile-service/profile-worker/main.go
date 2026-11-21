@@ -50,12 +50,9 @@ const multipartOverheadBytes = 1 << 20
 // errFileTooLarge はファイルパートが MAX_IMAGE_UPLOAD_BYTES を超えたことを示す。
 var errFileTooLarge = errors.New("file exceeds the upload size limit")
 
+// SfspUploadResponse は SFSP のアップロード応答のうち、このサービスが使うフィールドだけを持つ。
 type SfspUploadResponse struct {
-	FileID   string `json:"file_id"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename"`
+	JobID string `json:"job_id"`
 }
 
 type ProfileResponse struct {
@@ -221,9 +218,6 @@ func main() {
 		api.PUT("", authMiddleware(), updateProfileHandler)
 		api.PUT("/icon", authMiddleware(), updateIconHandler)
 		api.PUT("/background", authMiddleware(), updateBackgroundHandler)
-
-		// 旧パス（移行期間のみ）。/internal/create と同じく X-Internal-Key が必須
-		api.POST("/internal/create", internalAuthMiddleware(), createInternalProfileHandler)
 	}
 
 	log.Println("Profile service starting on port 8084")

@@ -16,6 +16,4 @@ COPY . .
 # Viteアプリケーションをビルド
 RUN npm run build
 
-# ビルド成果物はホストのボリュームに書き出されるため、最終イメージへのコピーは不要
-# FROM nginx:alpine
-# COPY --from=builder /app/dist /usr/share/nginx/html
+# ビルド成果物（dist）はホストのボリュームに書き出され、mon-nginx が配信する（最終イメージへのコピーは不要）

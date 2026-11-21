@@ -62,7 +62,7 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
 -   **Check**:
     1.  **`sfsp-api` logs**: `docker compose logs sfsp-api`. Look for `SFSP_API_KEY is not set` (the API refuses to start without it) and for connection errors to `sfsp-db`, `minio`, or `redis` (including Redis `NOAUTH` errors).
     2.  **Dependency status**: Ensure `sfsp-db`, `minio`, `redis` are running (`docker compose ps`).
-    3.  **Configuration**: Verify the `.env` variables used by `sfsp-api` are set correctly, especially `SFSP_API_KEY`, `REDIS_PASSWORD`, `POSTGRES_USER` / `POSTGRES_PASSWORD` (compose builds `SFSP_DATABASE_URL` from them), and `SFSP_API_ACCESS_KEY` / `SFSP_API_SECRET_KEY` (compose maps them to the `SFSP_*MINIO*` variables).
+    3.  **Configuration**: Verify the `.env` variables used by `sfsp-api` are set correctly, especially `SFSP_API_KEY`, `REDIS_PASSWORD`, `POSTGRES_USER` / `POSTGRES_PASSWORD` (compose builds `SFSP_DATABASE_URL` from them), and `SFSP_API_ACCESS_KEY` / `SFSP_API_SECRET_KEY` (compose maps them to `SFSP_RAW_MINIO_*` / `SFSP_CLEAN_MINIO_*`). `sfsp-api` does not read `.env` itself: like every service, it only receives the variables listed in its `environment` section of `docker-compose.yml` (no `env_file`, and `.env` is not copied into the image). `REDIS_URL` and `SFSP_API_URL` are fixed in `docker-compose.yml`.
     4.  **401 responses**: The caller does not send `X-SFSP-API-Key`, or its value differs from the `SFSP_API_KEY` of `sfsp-api`. **413 responses**: the file exceeds `SFSP_MAX_UPLOAD_BYTES` (default 2 GiB - 1).
 -   **Solution**: Address connection issues, restart dependencies if necessary, or correct the `.env` configuration (then run `docker compose up -d` to recreate the affected services).
 
@@ -83,7 +83,7 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
     1.  **`sfsp-worker` logs**: `docker compose logs sfsp-worker`. Look for specific errors from ClamAV or YARA scans, or sandbox execution failures.
     2.  **Sandbox output**: The `stdout`/`stderr` of each scanner run are stored in `scan_results.raw_output` in `sfsp-db`, and failures are also logged by `sfsp-worker`.
     3.  **Scanner image issues**: Ensure the `sfsp-clamav-client` and `sfsp-yara-client` images are functional. Try running them manually with a test file.
-    4.  **YARA rules**: If YARA scans fail, verify `backend/security/sfsp/yara-rules/general.yar` exists and is valid. The sandbox reads the copy that was baked into the `sfsp-yara-client` image at build time.
+    4.  **YARA rules**: If YARA scans fail, verify `backend/security/sfsp/yara-rules/general.yar` exists and is valid. The sandbox reads the copy that was baked into the `sfsp-yara-client` image (`/etc/yara-rules`) at build time. `sfsp-worker` itself neither mounts nor reads the rules, and its image contains no `yara` or `docker` CLI.
     5.  **Not an error, but rejected**: A ZIP that violates the extraction limits (`SFSP_MAX_ZIP_ENTRIES`, `SFSP_MAX_EXTRACTED_BYTES`, `SFSP_MAX_ZIP_ENTRY_BYTES`, `SFSP_MAX_ZIP_RATIO`, `SFSP_MAX_ZIP_DEPTH`, Zip Slip, symlinks) or a file that exceeds a ClamAV limit ends as `suspicious` and goes to the `quarantine` bucket; see `scan_jobs.processing_details`.
 -   **Solution**: Debug scanner issues based on logs. Update scanner images or YARA rules if necessary (see "Scanner Updates").
 
@@ -124,13 +124,13 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
 ### Scan and Extraction Limits
 
 -   Defaults apply unless overridden: `SFSP_MAX_UPLOAD_BYTES` (2 GiB - 1), `SFSP_MAX_EXTRACTED_BYTES` (4 GiB), `SFSP_MAX_ZIP_ENTRIES` (20000), `SFSP_MAX_ZIP_ENTRY_BYTES` (2 GiB - 1), `SFSP_MAX_ZIP_RATIO` (1000), `SFSP_MAX_ZIP_DEPTH` (32), and the `SFSP_CLAMAV_*` options. ClamAV cannot scan a file of 2 GiB or more, so the per-file limits are capped at 2 GiB - 1.
--   `sfsp-api` reads `.env`, but `sfsp-worker` receives only the variables listed in the `environment` section of `docker-compose.yml`. To change a worker limit, add the variable there and run `docker compose up -d sfsp-worker`. The effective values are logged at worker startup (`SFSP worker limits`).
+-   No SFSP service reads `.env` directly: `sfsp-api` and `sfsp-worker` receive only the variables listed in their `environment` sections of `docker-compose.yml`. `SFSP_MAX_UPLOAD_BYTES` (sfsp-api) and all `SFSP_CLAMAV_*` / `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` (sfsp-worker) are already listed there as `${VAR:-default}`, with the same defaults as `internal/config/config.go`. To change a limit, set the variable in `.env` (the commented-out lines in `.env.example` show every option) and run `docker compose up -d sfsp-api sfsp-worker`. The effective values are logged at worker startup (`SFSP worker limits`).
 
 ## 6. Security Procedures
 
 -   **Incident Response**: Refer to `backend/security/sfsp/docs/Incident_Guide.md`.
 -   **Vulnerability Management**: Regularly scan Docker images and dependencies for known vulnerabilities.
--   **Access Control**: Ensure only authorized personnel have access to the Docker host and `.env` files. Do not mount `/var/run/docker.sock` or `.env` into `sfsp-worker`; only `sfsp-docker-proxy` mounts the socket (read-only).
+-   **Access Control**: Ensure only authorized personnel have access to the Docker host and `.env` files. Do not mount `/var/run/docker.sock` or `.env` into `sfsp-worker`; only `sfsp-docker-proxy` mounts the socket (read-only). Do not copy `.env` into any image or pass it with `env_file`; the root `.dockerignore` excludes `.env` / `.env.*` from the build context.
 -   **Key Rotation**: To rotate `SFSP_API_KEY` or `REDIS_PASSWORD`, change it in `.env` and recreate every service that uses it (`docker compose up -d`). Callers of `sfsp-api` must send the new `X-SFSP-API-Key` value.
 
 ---

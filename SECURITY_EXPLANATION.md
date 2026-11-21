@@ -70,7 +70,7 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 
 3.  **[`sfsp-api`]**
     *   まず `X-SFSP-API-Key` ヘッダーを `SFSP_API_KEY` と定数時間で比較します。一致しなければ本文を読まずに `401` を返します（キーが未設定の場合、`sfsp-api` は起動しません）。
-    *   `target_service` が許可リスト（`game`, `static-site`, `stream`, `profile`, `*-thumbnail` など）にあることを確認します（それ以外は `400`）。
+    *   `target_service` が許可リスト（`game`, `static-site`, `stream`, `profile`, `video-thumbnail`, `game-thumbnail`, `site-thumbnail`）にあることを確認します（それ以外は `400`。旧い別名の `thumbnail` も今は `400`）。
     *   ファイルをメモリや一時ファイルに溜めず、MinIOの `raw-files` バケット（未スキャン用）へストリーミングで保存しながら、SHA256ハッシュを計算します。`SFSP_MAX_UPLOAD_BYTES`（既定2GiB-1）を超えると `413` を返します。
     *   `sfsp-db`の`files`テーブルにファイルメタデータ（SHA256、ファイル名等）を、`scan_jobs`テーブルに新しいジョブを `status='queued'` で記録します。SHA256は記録するだけで、同じハッシュのファイルがあっても重複排除はしません（毎回スキャンします）。
     *   Redisの `sfsp:scan_queue` リストに、このジョブのIDをプッシュします。
@@ -83,7 +83,7 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
     *   対象がZIPの場合は、まず上限付きで展開します。Zip Slip・symlink・デバイスファイル・重複エントリを拒否し、エントリ数・展開サイズ・圧縮率・ディレクトリの深さの上限を超えるものは `suspicious` と判定します。展開したディレクトリ**全体**を以降のスキャン対象とします。
     *   **サンドボックス内でスキャンを実行します。**
         *   a. **ClamAVスキャン:** `sfsp-clamav-client` Dockerイメージを、ファイルが読み取り専用でマウントされたサンドボックス内で起動し、ウイルススキャンを実行します。
-        *   b. **YARAスキャン:** `sfsp-yara-client` Dockerイメージを同様のサンドボックス内で起動し、定義済みルールセット（`yara-rules/`）に基づいて不正なパターンを検出します。
+        *   b. **YARAスキャン:** `sfsp-yara-client` Dockerイメージを同様のサンドボックス内で起動し、定義済みルールセット（`backend/security/sfsp/yara-rules/`。ビルド時に `sfsp-yara-client` イメージの `/etc/yara-rules` へ焼き込まれ、`sfsp-worker` 自身はルールを持ちません）に基づいて不正なパターンを検出します。
     *   スキャン結果を `sfsp-db` の `scan_results` テーブルに記録します。
 
 5.  **[`sfsp-worker` (後処理)]**
@@ -150,13 +150,13 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 
 ### 3.3. インフラと運用セキュリティ
 
-*   **環境変数の管理:** データベースのパスワード、JWTの秘密鍵、外部APIキーなどの機密情報は、すべて`.env`ファイルで管理されます。このファイルは`.gitignore`に含まれており、Gitリポジトリにコミットされることはありません。DBロールのパスワードはSQLに書かず、`db-role-init` が `.env` の値で `ALTER ROLE` します。なお `.env.example` の値は公開済みなので、本番では必ず変更してください。また、多くのDockerfileがビルド時に `.env` をイメージにコピーしており、アプリ側サービスは `env_file: .env` で受け取っています。イメージやコンテナを共有する際は注意が必要です（`EditAI.md` 15.4）。
+*   **環境変数の管理:** データベースのパスワード、JWTの秘密鍵、外部APIキーなどの機密情報は、すべて`.env`ファイルで管理されます。このファイルは`.gitignore`に含まれており、Gitリポジトリにコミットされることはありません。DBロールのパスワードはSQLに書かず、`db-role-init` が `.env` の値で `ALTER ROLE` します。なお `.env.example` の値は公開済みなので、本番では必ず変更してください。`.env` はDockerイメージに入れません（Dockerfileはコピーせず、`.dockerignore` が `.env` / `.env.*` を除外します）。各コンテナには `.env` 全体ではなく、`docker-compose.yml` の `environment:` に書いた、そのサービスが使う変数だけが渡ります（`env_file` は使いません）。例えば `INTERNAL_API_KEY` は auth-service・profile-service・team-service だけ、`SFSP_API_KEY` は sfsp-api とそれを呼ぶサービスだけが持ちます。ただし app-db などはアプリ用ロールが無く、多くのサービスが `POSTGRES_USER` / `POSTGRES_PASSWORD`（スーパーユーザー）で接続している点は残っています（`EditAI.md` 15.4）。
 *   **Dockerセキュリティ:**
     *   **最小イメージの利用:** 各サービスのDockerイメージは、`alpine`などの軽量なベースイメージを基に構築され、攻撃対象領域を削減しています。
     *   **ネットワーク分離:** 外向き通信ができるのは `atmosidea-network` だけです。それ以外の `backend-db-network`（アプリ用DB群）、`sfsp-isolated-net`（Redis・MinIO・`sfsp-api`・アップロードAPI/ワーカー）、`sfsp-db-network`（`sfsp-db` 専用）、`sfsp-docker-net`（`sfsp-docker-proxy` 専用）は `internal: true` で、外へ出られません。ホストに公開しているポートは `frontend` の `3001:80` だけで、データベース・Redis・MinIOのポートは公開されていません。
     *   **Redisの認証:** Redisは `requirepass`（`REDIS_PASSWORD`）で保護しており、`.env` に値が無いと `docker compose` がエラーにします。同じネットワークのコンテナが、パスワード無しでスキャン完了イベントを偽造することはできません。
     *   **サービス間の認証（Zero Trust）:** `sfsp-api` の `/api/v1/*` は `X-SFSP-API-Key`、内部API（`/internal/*`）は `X-Internal-Key` が無いとアクセスできません。
-    *   **監視ダッシュボード:** 別のcomposeで起動し、`127.0.0.1:8090`（ループバック）にだけ公開します。全ルートでHTTP Basic認証を必須とし、Host・Originの確認も行います。
+    *   **監視ダッシュボード:** 別のcomposeで起動し、`127.0.0.1:8090`（ループバック）にだけ公開します。全ルートでHTTP Basic認証を必須とし、Host・Originの確認も行います。コンテナの再起動APIは持たず、操作できるのはMinIOのオブジェクト（アップロード・削除）だけです。
 
 ---
 
@@ -165,8 +165,8 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 このプロジェクトのセキュリティは、各コンポーネントの密な連携の上に成り立っています。変更を加える際は、以下の点を特に意識してください。
 
 *   **サンドボックス設定の変更は慎重に:** `backend/security/sfsp/internal/sandbox/docker.go`内のネットワーク遮断（`NetworkMode: none`）、`CapDrop`、リソース制限は、SFSPの安全性の根幹です。`sfsp-docker-proxy` の許可範囲を広げることも同様です。安易な変更は深刻な脆弱性を生む可能性があります。
-*   **サービス間契約の遵守:** Redisのキュー名やイベントのJSON構造、APIのレスポンス形式などは、サービス間の「契約」です。変更する場合は、関連するすべてのサービスで整合性を取る必要があります。キュー名とイベントの定義は `backend/shared/queue` と SFSP の `internal/queue`（`internal/model`）に二重にあるため、両方を直してください。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` します（`BRPOP` は使いません）。
-*   **機密情報の取り扱い:** 新しい秘密鍵やAPIキーを追加する場合は、必ず`.env`ファイルで管理し、コード内にハードコーディングしないでください。ドキュメントにも実際の値を書かないでください。
+*   **サービス間契約の遵守:** Redisのキュー名やイベントのJSON構造、APIのレスポンス形式などは、サービス間の「契約」です。変更する場合は、関連するすべてのサービスで整合性を取る必要があります。イベント（`backend/shared/event`）とモデル（`backend/shared/model`）はSFSPも同じものを使いますが、`sfsp:scan_queue` の名前と信頼性キューの操作は `backend/shared/queue` と SFSP の `internal/queue` に二重にあるため、両方を直してください。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` します（`BRPOP` は使いません）。
+*   **機密情報の取り扱い:** 新しい秘密鍵やAPIキーを追加する場合は、必ず`.env`ファイルで管理し、コード内にハードコーディングしないでください。使うサービスの `environment:` にだけ追加し、Dockerfileで `.env` をコピーしたり `env_file` で全体を渡したりしないでください。ドキュメントにも実際の値を書かないでください。
 *   **既知の未対応事項の確認:** 認可の無いMinIO直接配信（Nginxから配信するHLS・サムネイル・サブドメイン）や、`sfsp-docker-proxy` がリクエスト本文を検査しない点など、まだ残っている問題は `EditAI.md` の15.4にまとまっています。関連する箇所を変更するときは確認してください。
 
 このドキュメントが、Atomosideaのセキュリティを維持し、さらに強化していく上での一助となることを願っています。

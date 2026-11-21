@@ -123,8 +123,19 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         // JWTからのuserID取得 (sub, userID, user_id の優先順位でパース)
         const currentUserID = decoded.sub || decoded.userID || decoded.user_id || '';
 
-        // ★ 統合された users テーブル情報（/api/profile/me）を1つ取得するだけでOK
-        const profileRes = await axios.get('/api/profile/me');
+        // プロフィール（/api/profile/me）と、認証方式 provider を持つ auth-db の情報（/api/auth/me）を並行取得する。
+        // /api/auth/me は 401（トークン無効）のときだけ失敗扱いにし、それ以外の失敗では provider 不明のまま続行する。
+        const [profileRes, authMe] = await Promise.all([
+          axios.get('/api/profile/me'),
+          axios
+            .get<{ provider?: string }>('/api/auth/me')
+            .then((res) => res.data)
+            .catch((err: unknown) => {
+              if (axios.isAxiosError(err) && err.response?.status === 401) throw err;
+              console.warn('[AuthProvider] Failed to load auth info (provider):', err);
+              return null;
+            }),
+        ]);
         const profile = profileRes.data;
 
         const currentUser: User = {
@@ -132,7 +143,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           username: profile.username,
           isAdmin: !!(decoded.isAdmin || decoded.is_admin),
           iconUrl: profile.icon_url,
-          provider: profile.provider,
+          provider: authMe?.provider,
           status: profile.status,
           bio: profile.bio,
           backgroundImageUrl: profile.background_image_url,
@@ -193,6 +204,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   );
 };
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (context === undefined) {

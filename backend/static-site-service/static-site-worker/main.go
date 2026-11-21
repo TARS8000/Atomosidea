@@ -22,7 +22,6 @@ import (
 	"github.com/atmosidea/shared/event"
 	"github.com/atmosidea/shared/queue"
 	"github.com/go-redis/redis/v8"
-	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -91,11 +90,6 @@ func main() {
 	}
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
-
-	err = godotenv.Load()
-	if err != nil {
-		logger.Warnf("Error loading .env file, assuming production environment: %v", err)
-	}
 
 	maxSiteUploadBytes = envInt64("MAX_SITE_UPLOAD_BYTES", maxSiteUploadBytes)
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
@@ -323,56 +317,27 @@ func updateProcessingStatus(siteID, status, details string) error {
 	return err
 }
 
-// candidateKeys は clean-files 上のオブジェクトキーの候補を返す。
-func candidateKeys(ev event.ScanCompletionEvent) []string {
-	fileIDStr := fmt.Sprintf("%v", ev.FileID)
-	var keys []string
-	if fileIDStr != "" && fileIDStr != "<nil>" {
-		keys = append(keys, fileIDStr, fmt.Sprintf("%s/%s", fileIDStr, ev.Filename))
+// downloadCleanFile は clean-files 上のオブジェクト（キーは sfsp が保存する <file_id>）を f に書き込み、
+// 取得したキーを返す。limit を超えるオブジェクトは errLimitExceeded を返す。
+func downloadCleanFile(ctx context.Context, logPrefix string, ev event.ScanCompletionEvent, f *os.File, limit int64) (string, error) {
+	key := ev.FileID.String()
+	obj, err := sfspMinioClient.GetObject(ctx, sfspBucketName, key, minio.GetObjectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get %s: %w", key, err)
 	}
-	if ev.SHA256 != "" {
-		keys = append(keys, fmt.Sprintf("%s/%s", ev.SHA256, ev.Filename), ev.SHA256)
+	defer obj.Close()
+	n, err := io.CopyN(f, obj, limit+1)
+	if err == io.EOF {
+		err = nil
 	}
-	if ev.Filename != "" {
-		keys = append(keys, ev.Filename)
+	if err != nil {
+		return "", fmt.Errorf("download %s: %w", key, err)
 	}
-	return keys
-}
-
-// downloadFirst は候補キーを順に試し、最初に取得できたオブジェクトを f に書き込む。
-// limit を超えるオブジェクトは errLimitExceeded を返す。
-func downloadFirst(ctx context.Context, logPrefix string, keys []string, f *os.File, limit int64) (string, error) {
-	var lastErr error = errors.New("no candidate keys")
-	for _, key := range keys {
-		if err := f.Truncate(0); err != nil {
-			return "", err
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return "", err
-		}
-		obj, err := sfspMinioClient.GetObject(ctx, sfspBucketName, key, minio.GetObjectOptions{})
-		if err != nil {
-			lastErr = err
-			logger.Warnf("%s Failed to download with key (%s): %v", logPrefix, key, err)
-			continue
-		}
-		n, err := io.CopyN(f, obj, limit+1)
-		obj.Close()
-		if err == io.EOF {
-			err = nil
-		}
-		if err == nil && n > limit {
-			return key, errLimitExceeded
-		}
-		if err != nil {
-			lastErr = err
-			logger.Warnf("%s Failed to download with key (%s): %v", logPrefix, key, err)
-			continue
-		}
-		logger.Infof("%s Successfully downloaded %s from SFSP", logPrefix, key)
-		return key, nil
+	if n > limit {
+		return "", errLimitExceeded
 	}
-	return "", lastErr
+	logger.Infof("%s Successfully downloaded %s from SFSP", logPrefix, key)
+	return key, nil
 }
 
 // removeSitePrefix は失敗時に、途中までアップロードしたサイトのファイルを削除する。
@@ -459,7 +424,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 
 	_ = updateProcessingStatus(siteID, "processing", "クリーンなファイルをダウンロード中...")
 
-	downloadedKey, err := downloadFirst(ctx, logPrefix, candidateKeys(ev), tmpZip, maxSiteUploadBytes)
+	downloadedKey, err := downloadCleanFile(ctx, logPrefix, ev, tmpZip, maxSiteUploadBytes)
 	if err == errLimitExceeded {
 		return fail("failed", fmt.Sprintf("ZIP file exceeds the maximum size of %d bytes", maxSiteUploadBytes))
 	}
@@ -602,7 +567,7 @@ func handleThumbnailMessage(payload string) bool {
 		logger.Errorf("Error unmarshalling thumbnail event payload: %v", err)
 		return true
 	}
-	if ev.TargetService != "site-thumbnail" && ev.TargetService != "thumbnail" {
+	if ev.TargetService != "site-thumbnail" {
 		logger.Infof("Skipping event for TargetService '%s' (Job ID: %s), not a site thumbnail event.", ev.TargetService, ev.JobID)
 		return true
 	}
@@ -658,7 +623,7 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	downloadedKey, err := downloadFirst(ctx, logPrefix, candidateKeys(*ev), tmp, maxImageUploadBytes)
+	downloadedKey, err := downloadCleanFile(ctx, logPrefix, *ev, tmp, maxImageUploadBytes)
 	if err != nil {
 		logger.Errorf("%s Download thumbnail from SFSP failed: %v", logPrefix, err)
 		return clearThumbnailJob(siteID, jobID)

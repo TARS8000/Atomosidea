@@ -13,11 +13,8 @@ COPY . .
 # security ディレクトリに移動して go.mod を処理
 WORKDIR /app/backend/security/sfsp
 
-# 日本の高速プロキシを使用するように設定
-ENV GOPROXY=https://goproxy.io,direct
-
-# go.sum が無い時だけ go mod tidy を実行
-RUN test -f go.sum || go mod tidy
+# 公式プロキシを優先し、失敗したら goproxy.io、最後に直接取得する（"|" 区切りはどのエラーでも次に切り替える）
+ENV GOPROXY="https://proxy.golang.org|https://goproxy.io|direct"
 
 # パッケージをダウンロード (go.sum に基づいてダウンロードされる)
 RUN go mod download

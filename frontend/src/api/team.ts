@@ -13,16 +13,6 @@ export interface Team {
   _joined?: boolean;
 }
 
-export interface TeamPost {
-  id: string;
-  team_id: string;
-  author_id: string;
-  author_name: string;
-  title: string;
-  body: string;
-  created_at: string;
-}
-
 export interface TeamMember {
   user_id: string;
   role: string;
@@ -39,13 +29,6 @@ export interface JoinRequest {
   reviewed_by: string;
 }
 
-export interface TeamPermission {
-  is_public: boolean;
-  can_view: boolean;
-  can_post: boolean;
-  role: string;
-}
-
 // axios interceptor (AuthContext) が Authorization ヘッダーを自動付与するため、
 // ここでは相対パスのみを指定する。
 export const teamApi = {
@@ -57,12 +40,6 @@ export const teamApi = {
   update: (teamToken: string, data: { name?: string; description?: string; is_public?: boolean; auto_approve?: boolean; allow_member_invite?: boolean }) =>
     axios.patch(`/api/teams/${teamToken}`, data),
   deleteTeam: (teamToken: string) => axios.delete(`/api/teams/${teamToken}`),
-  permission: (teamToken: string) => axios.get<TeamPermission>(`/api/teams/${teamToken}/permission`),
-  listPosts: (teamToken: string) => axios.get<TeamPost[]>(`/api/teams/${teamToken}/content`),
-  getPost: (teamToken: string, postId: string) =>
-    axios.get<TeamPost>(`/api/teams/${teamToken}/content/${postId}`),
-  createPost: (teamToken: string, data: { title: string; body?: string }) =>
-    axios.post<TeamPost>(`/api/teams/${teamToken}/content`, data),
   listMembers: (teamToken: string) => axios.get<TeamMember[]>(`/api/teams/${teamToken}/members`),
   addMember: (teamToken: string, userId: string, role: string) =>
     axios.post(`/api/teams/${teamToken}/members`, { user_id: userId, role }),
@@ -78,8 +55,6 @@ export const teamApi = {
     axios.get<JoinRequest[]>(`/api/teams/${teamToken}/join-requests`),
   reviewJoinRequest: (teamToken: string, requestId: string, action: 'approve' | 'reject') =>
     axios.patch(`/api/teams/${teamToken}/join-requests/${requestId}`, {}, { params: { action } }),
-  cancelJoinRequest: (teamToken: string) =>
-    axios.delete(`/api/teams/${teamToken}/join-requests`),
 };
 
 export const TEAM_ROLE_RANK: Record<string, number> = { owner: 3, admin: 2, member: 1 };
@@ -157,11 +132,4 @@ export const CONTENT_LINKS = {
     detail: (id: string) => `/static-sites/${id}`,
     edit: (id: string) => `/edit-static-site/${id}`,
   },
-};
-
-// コンテンツ種別ごとのアップロードフォームのフィールド名
-export const CONTENT_UPLOAD_FIELDS = {
-  videos: { fileField: 'video', endpoint: '/api/videos/upload' },
-  games: { fileField: 'game', endpoint: '/api/games/upload' },
-  sites: { fileField: 'file', endpoint: '/api/static-sites/upload' },
 };

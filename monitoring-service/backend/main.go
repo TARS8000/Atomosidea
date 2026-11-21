@@ -29,34 +29,27 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// ... (他の構造体定義は変更なし)
 type ContainerStats struct {
 	CPUPercent float64 `json:"cpuPercent"`
 	MemUsage   float64 `json:"memUsage"`
 	MemLimit   float64 `json:"memLimit"`
 }
 
-type LogMessage struct {
-	ContainerID   string    `json:"containerId"`
-	ContainerName string    `json:"containerName"`
-	Timestamp     time.Time `json:"timestamp"`
-	Message       string    `json:"message"`
-	IsError       bool      `json:"isError"`
-}
-
 type ContainerInfo struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Image        string   `json:"image"`
-	Status       string   `json:"status"`
-	State        string   `json:"state"`
-	Health       string   `json:"health"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Image        string    `json:"image"`
+	Status       string    `json:"status"`
+	State        string    `json:"state"`
+	Health       string    `json:"health"`
 	Created      time.Time `json:"created"`
 	StartedAt    string    `json:"startedAt"`
 	Uptime       string    `json:"uptime"`
 	RestartCount int       `json:"restartCount"`
-	Networks     []string  `json:"networks"`
-	IsError      bool      `json:"isError"`
+	// compose のラベル由来（compose 外のコンテナは空）。フロントエンドのツリーと依存関係の表示に使う
+	Project   string   `json:"project"`
+	Service   string   `json:"service"`
+	DependsOn []string `json:"dependsOn"`
 }
 
 type TopologyNode struct {
@@ -66,10 +59,10 @@ type TopologyNode struct {
 }
 
 type VolumeInfo struct {
-	Name       string              `json:"name"`
-	Driver     string              `json:"driver"`
-	Mountpoint string              `json:"mountpoint"`
-	Labels     map[string]string   `json:"labels"`
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Mountpoint string            `json:"mountpoint"`
+	Labels     map[string]string `json:"labels"`
 }
 
 type MinioItem struct {
@@ -107,7 +100,7 @@ func hostnameOf(hostport string) string {
 
 // isTrustedRequest は Host が許可リストに含まれ、かつ Origin ヘッダーがある場合は
 // 同一ホストからのリクエストであることを確認する。
-// ダッシュボードはコンテナ再起動や MinIO の root 操作ができるため、他サイトのページからの
+// ダッシュボードは MinIO の root 操作（アップロード・削除）ができるため、他サイトのページからの
 // リクエスト（CSRF / クロスサイト WebSocket）を拒否する。
 func isTrustedRequest(r *http.Request) bool {
 	host := hostnameOf(r.Host)
@@ -124,8 +117,6 @@ func isTrustedRequest(r *http.Request) bool {
 	}
 	return strings.ToLower(u.Hostname()) == host
 }
-
-var errorKeywords = []string{"ERROR", "FATAL", "panic", "Exception", "failed", "denied", "level=error"}
 
 // ダッシュボードのログイン（HTTP Basic 認証）。MONITOR_USERNAME / MONITOR_PASSWORD（環境変数）と照合する。
 // どちらかが未設定なら全リクエストを拒否する（fail closed）。
@@ -194,10 +185,6 @@ func main() {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -209,19 +196,17 @@ func main() {
 
 	router.HandleFunc("/api/containers", getContainers(cli)).Methods("GET")
 	router.HandleFunc("/api/containers/stats", getContainerStats(cli)).Methods("GET")
-	router.HandleFunc("/api/containers/restart/{name}", restartContainer(cli)).Methods("POST", "OPTIONS")
 	router.HandleFunc("/api/connections/count", getActiveUserCount(cli)).Methods("GET")
 	router.HandleFunc("/api/topology", getTopology(cli)).Methods("GET")
 	router.HandleFunc("/api/volumes", listVolumes(cli)).Methods("GET")
 
-	// ルーティング修正: パス変数とクエリパラメーターの両方に対応
+	// ログのストリーミング（対象は ?container=<名前または ID>）
 	router.HandleFunc("/ws/logs", serveWs(cli)).Methods("GET")
-	router.HandleFunc("/ws/logs/{id}", serveWs(cli)).Methods("GET")
 
 	// MinIO API
-	router.HandleFunc("/api/minio/list/{containerName}", listMinioObjects(cli)).Methods("GET", "OPTIONS")
-	router.HandleFunc("/api/minio/upload/{containerName}", uploadMinioObject(cli)).Methods("POST", "OPTIONS")
-	router.HandleFunc("/api/minio/delete/{containerName}", deleteMinioObject(cli)).Methods("DELETE", "OPTIONS")
+	router.HandleFunc("/api/minio/list/{containerName}", listMinioObjects(cli)).Methods("GET")
+	router.HandleFunc("/api/minio/upload/{containerName}", uploadMinioObject(cli)).Methods("POST")
+	router.HandleFunc("/api/minio/delete/{containerName}", deleteMinioObject(cli)).Methods("DELETE")
 
 	log.Println("Monitoring backend started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
@@ -281,12 +266,22 @@ func getContainerStats(cli *client.Client) http.HandlerFunc {
 	}
 }
 
+// calculateCPUPercent は docker stats と同じ式で CPU 使用率を求める。
+// cgroup v2 では PercpuUsage が空になるため、OnlineCPUs を優先し、無ければ PercpuUsage の数、それも無ければ 1 とする。
 func calculateCPUPercent(v *types.StatsJSON) float64 {
 	cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage) - float64(v.PreCPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(v.CPUStats.SystemUsage) - float64(v.PreCPUStats.SystemUsage)
 
+	onlineCPUs := float64(v.CPUStats.OnlineCPUs)
+	if onlineCPUs == 0 {
+		onlineCPUs = float64(len(v.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if onlineCPUs == 0 {
+		onlineCPUs = 1
+	}
+
 	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		return (cpuDelta / systemDelta) * float64(len(v.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+		return (cpuDelta / systemDelta) * onlineCPUs * 100.0
 	}
 	return 0.0
 }
@@ -361,7 +356,8 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 			return
 		}
 
-		var containerInfos []ContainerInfo
+		// 0 件でも null ではなく [] を返す
+		containerInfos := make([]ContainerInfo, 0, len(containers))
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 
@@ -381,11 +377,12 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 					State:        c.State,
 					RestartCount: meta.restartCount,
 					Created:      createdTime,
-					Networks:     getContainerNetworks(cli, c.ID),
 					Health:       meta.health,
 					StartedAt:    meta.startedAt,
 					Uptime:       getContainerUptime(meta.startedAt),
-					IsError:      false,
+					Project:      c.Labels["com.docker.compose.project"],
+					Service:      c.Labels["com.docker.compose.service"],
+					DependsOn:    parseDependsOn(c.Labels["com.docker.compose.depends_on"]),
 				}
 				mu.Lock()
 				containerInfos = append(containerInfos, info)
@@ -397,6 +394,19 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(containerInfos)
 	}
+}
+
+// parseDependsOn は compose が付ける depends_on ラベル（"redis:service_started:false,minio:service_healthy:false" の形式）から
+// 依存先のサービス名だけを取り出す
+func parseDependsOn(label string) []string {
+	deps := []string{}
+	for _, entry := range strings.Split(label, ",") {
+		name, _, _ := strings.Cut(strings.TrimSpace(entry), ":")
+		if name != "" {
+			deps = append(deps, name)
+		}
+	}
+	return deps
 }
 
 func getContainerNetworks(cli *client.Client, id string) []string {
@@ -498,35 +508,9 @@ func listVolumes(cli *client.Client) http.HandlerFunc {
 	}
 }
 
-// コンテナ再起動処理
-func restartContainer(cli *client.Client) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		containerName := vars["name"]
-
-		timeout := 10
-		stopOptions := container.StopOptions{Timeout: &timeout}
-
-		err := cli.ContainerRestart(context.Background(), containerName, stopOptions)
-		if err != nil {
-			log.Printf("[Error] Failed to restart container %s: %v", containerName, err)
-			http.Error(w, fmt.Sprintf("Failed to restart container: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "Container restarted successfully"})
-	}
-}
-
 func serveWs(cli *client.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		containerTarget := vars["id"]
-		if containerTarget == "" {
-			containerTarget = r.URL.Query().Get("container")
-		}
-
+		containerTarget := r.URL.Query().Get("container")
 		if containerTarget == "" {
 			http.Error(w, "Container ID or Name is required", http.StatusBadRequest)
 			return
@@ -539,15 +523,11 @@ func serveWs(cli *client.Client) http.HandlerFunc {
 		}
 		defer conn.Close()
 
-		containerJSON, err := cli.ContainerInspect(context.Background(), containerTarget)
-		if err != nil {
+		if _, err := cli.ContainerInspect(context.Background(), containerTarget); err != nil {
 			log.Printf("Failed to inspect container %s: %v", containerTarget, err)
 			conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error inspecting container: %v", err)))
 			return
 		}
-		containerID := containerJSON.ID[:12]
-		containerName := strings.TrimPrefix(containerJSON.Name, "/")
-
 		options := container.LogsOptions{
 			ShowStdout: true,
 			ShowStderr: true,
@@ -566,36 +546,17 @@ func serveWs(cli *client.Client) http.HandlerFunc {
 		scanner := NewDockerLogScanner(reader)
 		for scanner.Scan() {
 			line := scanner.Text()
-			timestampStr := ""
 			messageContent := line
 
-			if len(line) >= 30 && line[23] == 'Z' {
-				timestampStr = line[:30]
-				messageContent = line[31:]
-			}
-
-			parsedTime, err := time.Parse(time.RFC3339Nano, timestampStr)
-			if err != nil {
-				parsedTime = time.Now()
-			}
-
-			isError := false
-			for _, keyword := range errorKeywords {
-				if strings.Contains(strings.ToLower(messageContent), strings.ToLower(keyword)) {
-					isError = true
-					break
+			// 先頭のタイムスタンプ（Timestamps: true で付与される）を取り除く
+			// 形式は "2006-01-02T15:04:05.000000000Z <本文>"。解析できたときだけ外す
+			if i := strings.IndexByte(line, ' '); i > 0 {
+				if _, err := time.Parse(time.RFC3339Nano, line[:i]); err == nil {
+					messageContent = line[i+1:]
 				}
 			}
 
-			msg := LogMessage{
-				ContainerID:   containerID,
-				ContainerName: containerName,
-				Timestamp:     parsedTime,
-				Message:       messageContent,
-				IsError:       isError,
-			}
-
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Message)); err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(messageContent)); err != nil {
 				break
 			}
 		}
@@ -786,7 +747,6 @@ func deleteMinioObject(cli *client.Client) http.HandlerFunc {
 type DockerLogScanner struct {
 	reader *bufio.Reader
 	text   string
-	err    error
 }
 
 func NewDockerLogScanner(reader io.Reader) *DockerLogScanner {
@@ -795,17 +755,13 @@ func NewDockerLogScanner(reader io.Reader) *DockerLogScanner {
 
 func (s *DockerLogScanner) Scan() bool {
 	header := make([]byte, 8)
-	_, err := io.ReadFull(s.reader, header)
-	if err != nil {
-		s.err = err
+	if _, err := io.ReadFull(s.reader, header); err != nil {
 		return false
 	}
 
 	payloadSize := binary.BigEndian.Uint32(header[4:8])
 	payload := make([]byte, payloadSize)
-	_, err = io.ReadFull(s.reader, payload)
-	if err != nil {
-		s.err = err
+	if _, err := io.ReadFull(s.reader, payload); err != nil {
 		return false
 	}
 
@@ -814,4 +770,3 @@ func (s *DockerLogScanner) Scan() bool {
 }
 
 func (s *DockerLogScanner) Text() string { return s.text }
-func (s *DockerLogScanner) Err() error   { return s.err }

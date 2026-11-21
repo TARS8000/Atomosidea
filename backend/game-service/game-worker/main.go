@@ -141,10 +141,7 @@ func main() {
 		logger.Fatalf("Unable to connect to Game MinIO: %v", err)
 	}
 
-	// Ensure the 'games' bucket exists and has the correct policy
-	if err := ensureBucket(ctx, gameMinioClient, gameBucketName); err != nil {
-		logger.Fatalf("Failed to ensure 'games' bucket: %v", err)
-	}
+	// 'games' バケットの作成と匿名ダウンロードの設定は minio-init が行う
 
 	sfspMinioClient, err = minio.New(sfspMinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(sfspMinioAccessKey, sfspMinioSecretKey, ""),
@@ -310,28 +307,14 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 	defer os.Remove(localZipPath)
 	defer os.RemoveAll(unzipPath)
 
-	fileIDStr := event.FileID.String()
-	candidateKeys := []string{
-		fileIDStr, // 1. FileID単体 (SFSP標準の保存パス)
-		fmt.Sprintf("%s/%s", fileIDStr, event.Filename), // 2. FileID/Filename
-	}
+	// sfsp はクリーンなファイルを clean-files の <file_id> に保存する
+	objectKey := event.FileID.String()
 
 	updateGameStatus(ctx, gameID, "processing", "クリーンなゲームファイルをダウンロード中...")
 
-	var downloadErr error
-	downloadSuccess := false
-	for _, objectKey := range candidateKeys {
-		logger.Infof("[GameID: %s] Trying download key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
-		downloadErr = sfspMinioClient.FGetObject(ctx, sfspBucketName, objectKey, localZipPath, minio.GetObjectOptions{})
-		if downloadErr == nil {
-			downloadSuccess = true
-			logger.Infof("[GameID: %s] Successfully downloaded file with key '%s'", gameID, objectKey)
-			break
-		}
-		logger.Warnf("[GameID: %s] Failed to download key '%s': %v", gameID, objectKey, downloadErr)
-	}
-	if !downloadSuccess {
-		return fail("Failed to download clean file from SFSP MinIO", downloadErr)
+	logger.Infof("[GameID: %s] Downloading key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
+	if err := sfspMinioClient.FGetObject(ctx, sfspBucketName, objectKey, localZipPath, minio.GetObjectOptions{}); err != nil {
+		return fail("Failed to download clean file from SFSP MinIO", err)
 	}
 
 	logger.Infof("[GameID: %s] Unzipping %s...", gameID, localZipPath)
@@ -355,8 +338,9 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 	nativeWidth, nativeHeight, err := extractNativeResolution(indexPath)
 	if err != nil {
 		logger.Warnf("[GameID: %s] WARNING: Could not extract native resolution: %v. Using defaults.", gameID, err)
-		nativeWidth = 960
-		nativeHeight = 600
+		// init.sql / ensureGameSchema の既定値と揃える
+		nativeWidth = 1280
+		nativeHeight = 720
 	}
 
 	logger.Infof("[GameID: %s] Modifying index.html...", gameID)
@@ -417,25 +401,12 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 
 	logger.Infof("[GameID: %s] Thumbnail is clean. Processing thumbnail...", gameID)
 
-	fileIDStr := event.FileID.String()
-	candidateKeys := []string{
-		fileIDStr,
-		fmt.Sprintf("%s/%s", fileIDStr, event.Filename),
-	}
-
-	var data []byte
-	var downloadErr error
-	for _, objectKey := range candidateKeys {
-		logger.Infof("[GameID: %s] Trying thumbnail download key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
-		data, downloadErr = downloadLimited(ctx, sfspBucketName, objectKey, maxThumbnailBytes)
-		if downloadErr == nil {
-			logger.Infof("[GameID: %s] Successfully downloaded thumbnail with key '%s'", gameID, objectKey)
-			break
-		}
-		logger.Warnf("[GameID: %s] Failed to download thumbnail key '%s': %v", gameID, objectKey, downloadErr)
-	}
-	if downloadErr != nil {
-		return fail("Download thumbnail from SFSP failed", downloadErr)
+	// sfsp はクリーンなファイルを clean-files の <file_id> に保存する
+	objectKey := event.FileID.String()
+	logger.Infof("[GameID: %s] Downloading thumbnail key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
+	data, err := downloadLimited(ctx, sfspBucketName, objectKey, maxThumbnailBytes)
+	if err != nil {
+		return fail("Download thumbnail from SFSP failed", err)
 	}
 
 	contentType := http.DetectContentType(data)
@@ -585,6 +556,9 @@ func uploadDirectory(ctx context.Context, localPath, remotePathPrefix string) er
 			case strings.HasSuffix(path, ".js.br"):
 				contentType = "application/javascript"
 				contentEncoding = "br"
+			case strings.HasSuffix(path, ".js.gz"):
+				contentType = "application/javascript"
+				contentEncoding = "gzip"
 			case strings.HasSuffix(path, ".js"):
 				contentType = "application/javascript"
 			case strings.HasSuffix(path, ".css"):
@@ -592,6 +566,9 @@ func uploadDirectory(ctx context.Context, localPath, remotePathPrefix string) er
 			case strings.HasSuffix(path, ".wasm.br"):
 				contentType = "application/wasm"
 				contentEncoding = "br"
+			case strings.HasSuffix(path, ".wasm.gz"):
+				contentType = "application/wasm"
+				contentEncoding = "gzip"
 			case strings.HasSuffix(path, ".wasm"):
 				contentType = "application/wasm"
 			case strings.HasSuffix(path, ".json"):
@@ -599,6 +576,9 @@ func uploadDirectory(ctx context.Context, localPath, remotePathPrefix string) er
 			case strings.HasSuffix(path, ".data.br"):
 				contentType = "application/octet-stream"
 				contentEncoding = "br"
+			case strings.HasSuffix(path, ".data.gz"):
+				contentType = "application/octet-stream"
+				contentEncoding = "gzip"
 			}
 
 			_, err = gameMinioClient.FPutObject(ctx, gameBucketName, remotePath, path, minio.PutObjectOptions{ContentType: contentType, ContentEncoding: contentEncoding})
@@ -716,26 +696,4 @@ func extractEntry(f *zip.File, fpath string, limit int64) (int64, error) {
 		return n, closeErr
 	}
 	return n, nil
-}
-
-func ensureBucket(ctx context.Context, client *minio.Client, bucketName string) error {
-	exists, err := client.BucketExists(ctx, bucketName)
-	if err != nil {
-		return fmt.Errorf("failed to check existence of bucket %s: %w", bucketName, err)
-	}
-	if !exists {
-		logger.Infof("Bucket %s does not exist, creating...", bucketName)
-		if err := client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{}); err != nil {
-			return fmt.Errorf("failed to create bucket %s: %w", bucketName, err)
-		}
-		logger.Infof("Bucket %s created successfully.", bucketName)
-	}
-
-	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::` + bucketName + `/*"]}]}`
-	if err := client.SetBucketPolicy(ctx, bucketName, policy); err != nil {
-		return fmt.Errorf("failed to set public policy for bucket %s: %w", bucketName, err)
-	}
-	logger.Infof("Public read policy set for bucket %s.", bucketName)
-
-	return nil
 }

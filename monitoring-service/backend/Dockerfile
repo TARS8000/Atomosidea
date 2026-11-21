@@ -6,8 +6,8 @@ RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
-# go.mod と go.sum をコピー（キャッシュと整合性を有効活用）
-COPY go.mod go.sum* ./
+# go.mod と go.sum をコピー（依存のダウンロードをレイヤーキャッシュし、go.sum で整合性を検証する）
+COPY go.mod go.sum ./
 
 ENV CGO_ENABLED=0
 
@@ -16,9 +16,6 @@ RUN go mod download
 
 # ソースコードをコピー
 COPY . .
-
-# 依存関係の整理（必要に応じて）
-RUN go mod tidy
 
 # アプリケーションをビルド
 RUN GOOS=linux go build -o /monitoring-backend .

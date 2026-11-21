@@ -39,11 +39,6 @@ type ScanResult struct {
 	ScannedAt time.Time       `json:"scanned_at"`
 }
 
-// FileUploadRequest is the request body for file upload API
-type FileUploadRequest struct {
-	File []byte `form:"file" binding:"required"`
-}
-
 // FileUploadResponse is the response body for file upload API
 type FileUploadResponse struct {
 	FileID uuid.UUID `json:"file_id"`

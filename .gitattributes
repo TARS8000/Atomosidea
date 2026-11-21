@@ -1,5 +1,7 @@
-# Shell scripts and Dockerfiles run inside Linux containers: CRLF breaks them (bad interpreter / stray ), so always keep LF
+# Shell scripts and Dockerfiles run inside Linux containers: CRLF breaks them (bad interpreter / stray CR), so always keep LF
 *.sh text eol=lf
 Dockerfile* text eol=lf
 # Windows batch files need CRLF (labels / goto can misbehave with LF)
 *.bat text eol=crlf
+# nginx configs are bind-mounted into Linux containers: keep LF
+*.conf text eol=lf

@@ -2,8 +2,8 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"database/sql" // <-- これを追加
@@ -23,7 +23,6 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/atmosidea/shared/config"
-	"github.com/atmosidea/shared/event"
 	"github.com/atmosidea/shared/queue"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -66,10 +65,8 @@ var teamTokenPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,24}$`)
 
 // teamPermission は team-service の GET /api/teams/<token>/permission の応答。
 type teamPermission struct {
-	IsPublic bool   `json:"is_public"`
-	CanView  bool   `json:"can_view"`
-	CanPost  bool   `json:"can_post"`
-	Role     string `json:"role"`
+	CanView bool `json:"can_view"`
+	CanPost bool `json:"can_post"`
 }
 
 // fetchTeamPermission は team-service に呼び出し元の権限を問い合わせる。
@@ -133,14 +130,15 @@ type Game struct {
 	ThumbnailURL       string     `json:"thumbnail_url"`
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 	UploaderID         string     `json:"uploader_id"`
-	UploaderName       string     `json:"uploader_name"`
 	TeamID             string     `json:"team_id"`
 	Scale              float32    `json:"scale"`
 	OffsetX            int        `json:"offset_x"`
 	OffsetY            int        `json:"offset_y"`
 	NativeWidth        int        `json:"native_width"`
 	NativeHeight       int        `json:"native_height"`
-	CreatedAt          time.Time  `json:"created_at"`
+	// ProcessingDetails は game-worker が書き込む進捗・失敗理由。投稿者（と管理者）にだけ返す。
+	ProcessingDetails *string   `json:"processing_details,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type AdjustPayload struct {
@@ -149,12 +147,11 @@ type AdjustPayload struct {
 	OffsetY int     `json:"offset_y"`
 }
 
+// SfspUploadResponse は sfsp-api の POST /api/v1/files の応答（ログと job_id の保存に使う分だけ）。
 type SfspUploadResponse struct {
-	FileID   string `json:"file_id"`
-	JobID    string `json:"job_id"`
-	Status   string `json:"status"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename"`
+	FileID string `json:"file_id"`
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
 }
 
 // VerificationResult はZIPファイルの検証結果とデバッグ情報を含みます
@@ -310,33 +307,6 @@ func submitToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 		return nil, fmt.Errorf("failed to decode SFSP response: %w", err)
 	}
 	return &out, nil
-}
-
-// republishIfClean は sfsp-api が既にクリーンと判定済みのファイルを返した場合に、
-// 完了イベントを自前で発行する（現行の sfsp-api は常に "queued" を返すので通常は何もしない）。
-func republishIfClean(resp *SfspUploadResponse, jobID uuid.UUID, filename, targetService string) {
-	if !strings.EqualFold(resp.Status, "clean") {
-		return
-	}
-	fileID, err := uuid.Parse(resp.FileID)
-	if err != nil {
-		logger.Errorf("Invalid File ID from SFSP for clean %s file: %v", targetService, err)
-		return
-	}
-	ev := event.ScanCompletionEvent{
-		JobID:         jobID,
-		FileID:        fileID,
-		FinalStatus:   "clean",
-		ScannedAt:     time.Now().UTC(),
-		SHA256:        resp.SHA256,
-		Filename:      filename,
-		TargetService: targetService,
-	}
-	if err := queue.EnqueueScanCompletionEvent(context.Background(), ev); err != nil {
-		logger.Errorf("CRITICAL: Failed to re-publish %s completion event for existing clean file: %v", targetService, err)
-	} else {
-		logger.Infof("Re-published %s completion event for existing clean file, job %s", targetService, jobID)
-	}
 }
 
 // ensureGameSchema は既存DBへの後方互換性のため、gamesテーブルを作成し、
@@ -619,13 +589,10 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
-	gameStatus := "scanning"
-	if strings.EqualFold(sfspRespData.Status, "clean") {
-		gameStatus = "processing"
-	}
+	// sfsp-api は常に "queued" を返し、スキャン結果は完了イベントで届く（status は INSERT 時の 'scanning' のまま）
 	if _, err := db.Exec(context.Background(),
-		"UPDATE games SET sfsp_job_id = $1, status = $2, updated_at = NOW() WHERE id = $3",
-		sfspJobID, gameStatus, gameID); err != nil {
+		"UPDATE games SET sfsp_job_id = $1, updated_at = NOW() WHERE id = $2",
+		sfspJobID, gameID); err != nil {
 		logger.Errorf("[GameID: %s] Error saving SFSP job ID: %v", gameID, err)
 		abort(http.StatusInternalServerError, "Failed to create game record")
 		return
@@ -651,20 +618,21 @@ func uploadGameHandler(c *gin.Context) {
 			abort(http.StatusInternalServerError, "Failed to create game record")
 			return
 		}
-		republishIfClean(thumbSfspResp, thumbJobID, thumbFilename, "game-thumbnail")
 	}
-
-	republishIfClean(sfspRespData, sfspJobID, gameFilename, "game")
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message": "Game upload accepted",
 		"gameId":  gameID,
-		"status":  gameStatus,
+		"status":  "scanning",
 	})
 }
 
-// wasm 内のキーワード探索で読む最大バイト数（展開後）。zip bomb 対策。
+// wasm 内のキーワード探索で読む最大バイト数（展開後）。zip bomb / gzip bomb / brotli bomb 対策。
+// 圧縮の有無に関わらず、展開後のバイト列をこの上限までしか読まない。
 const maxWasmScanBytes int64 = 512 << 20
+
+// Unity の wasm に含まれるキーワード
+var unityWasmKeywords = [][]byte{[]byte("il2cpp"), []byte("UnityEngine")}
 
 func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, error) {
 	result := &VerificationResult{}
@@ -675,17 +643,20 @@ func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, 
 	}
 
 	for _, f := range zipReader.File {
-		isWasm := strings.HasSuffix(f.Name, ".wasm")
-		isBrotli := strings.HasSuffix(f.Name, ".wasm.br")
-		isGzip := strings.HasSuffix(f.Name, ".wasm.gz") // .gz も考慮
-
-		if !(isWasm || isBrotli || isGzip) {
+		var compression string
+		switch {
+		case strings.HasSuffix(f.Name, ".wasm"):
+		case strings.HasSuffix(f.Name, ".wasm.br"):
+			compression = "br"
+		case strings.HasSuffix(f.Name, ".wasm.gz"):
+			compression = "gzip"
+		default:
 			continue
 		}
 		result.WasmFileFound = true
 		result.CheckedFile = f.Name
 
-		found, err := scanWasmForUnity(f, isBrotli)
+		found, err := scanWasmForUnity(f, compression)
 		if err != nil {
 			return nil, err
 		}
@@ -699,7 +670,9 @@ func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, 
 	return result, nil
 }
 
-func scanWasmForUnity(f *zip.File, isBrotli bool) (bool, error) {
+// scanWasmForUnity は zip 内の wasm（compression: "" / "br" / "gzip"）を展開しながら
+// Unity のキーワードを探す。
+func scanWasmForUnity(f *zip.File, compression string) (bool, error) {
 	rc, err := f.Open()
 	if err != nil {
 		return false, fmt.Errorf("failed to open wasm file in zip: %w", err)
@@ -707,25 +680,49 @@ func scanWasmForUnity(f *zip.File, isBrotli bool) (bool, error) {
 	defer rc.Close()
 
 	var reader io.Reader = rc
-	if isBrotli {
+	switch compression {
+	case "br":
 		reader = brotli.NewReader(rc)
+	case "gzip":
+		gz, err := gzip.NewReader(rc)
+		if err != nil {
+			return false, fmt.Errorf("failed to read gzip wasm file %s: %w", f.Name, err)
+		}
+		defer gz.Close()
+		reader = gz
 	}
-	// ここで .gz の解凍ロジックも追加可能
-	reader = io.LimitReader(reader, maxWasmScanBytes)
+	return containsUnityKeyword(io.LimitReader(reader, maxWasmScanBytes))
+}
 
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024) // 1MBのバッファ
-
-	for scanner.Scan() {
-		if bytes.Contains(scanner.Bytes(), []byte("il2cpp")) || bytes.Contains(scanner.Bytes(), []byte("UnityEngine")) {
-			return true, nil
+// containsUnityKeyword は r を固定サイズのチャンクで読み、unityWasmKeywords のいずれかを含むかを返す。
+// チャンクの境界をまたぐキーワードを見落とさないよう、前のチャンクの末尾を重ねて検索する。
+// （wasm はバイナリなので、改行区切りの bufio.Scanner だと長い行で ErrTooLong になりうる）
+func containsUnityKeyword(r io.Reader) (bool, error) {
+	overlap := 0
+	for _, kw := range unityWasmKeywords {
+		if len(kw)-1 > overlap {
+			overlap = len(kw) - 1
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return false, fmt.Errorf("error scanning wasm file: %w", err)
+	const chunkSize = 64 << 10
+	buf := make([]byte, overlap+chunkSize)
+	carry := 0
+	for {
+		n, err := io.ReadFull(r, buf[carry:])
+		window := buf[:carry+n]
+		for _, kw := range unityWasmKeywords {
+			if bytes.Contains(window, kw) {
+				return true, nil
+			}
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("error scanning wasm file: %w", err)
+		}
+		carry = copy(buf, window[len(window)-overlap:])
 	}
-	return false, nil
 }
 
 func listGamesHandler(c *gin.Context) {
@@ -802,9 +799,9 @@ func gameDetailsHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	var g Game
 	err := db.QueryRow(context.Background(),
-		`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), thumbnail_sfsp_job_id, user_id, COALESCE(team_id, ''), scale, offset_x, offset_y, native_width, native_height, created_at
+		`SELECT id, title, description, status, COALESCE(game_url, ''), COALESCE(thumbnail_url, ''), thumbnail_sfsp_job_id, user_id, COALESCE(team_id, ''), scale, offset_x, offset_y, native_width, native_height, processing_details, created_at
         FROM games
-        WHERE id = $1`, gameID).Scan(&g.ID, &g.Title, &g.Description, &g.Status, &g.GameURL, &g.ThumbnailURL, &g.ThumbnailSfspJobID, &g.UploaderID, &g.TeamID, &g.Scale, &g.OffsetX, &g.OffsetY, &g.NativeWidth, &g.NativeHeight, &g.CreatedAt)
+        WHERE id = $1`, gameID).Scan(&g.ID, &g.Title, &g.Description, &g.Status, &g.GameURL, &g.ThumbnailURL, &g.ThumbnailSfspJobID, &g.UploaderID, &g.TeamID, &g.Scale, &g.OffsetX, &g.OffsetY, &g.NativeWidth, &g.NativeHeight, &g.ProcessingDetails, &g.CreatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Game not found"})
@@ -841,8 +838,9 @@ func gameDetailsHandler(c *gin.Context) {
 			return
 		}
 	}
-	// 投稿者以外にはスキャンジョブの ID を見せない
+	// 投稿者以外にはスキャンジョブの ID や処理の詳細（内部情報）を見せない
 	g.ThumbnailSfspJobID = nil
+	g.ProcessingDetails = nil
 	c.JSON(http.StatusOK, g)
 }
 
@@ -924,8 +922,6 @@ func updateGameHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update game thumbnail"})
 		return
 	}
-
-	republishIfClean(thumbSfspResp, parsedThumbJobID, thumbFilename, "game-thumbnail")
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message": "Thumbnail upload accepted for scanning",

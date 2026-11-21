@@ -47,7 +47,7 @@
 | `POST` | `/oauth/exchange` | 不要 | OAuth ワンタイムコードの交換。コールバックで受け取ったコードをJWTに交換します。200 / 400（`code` 無し）/ 401（無効または期限切れ）。 | `{"code": "..."}` | `{"token": "jwt_token_string"}` |
 | `POST` | `/logout` | JWT | ログアウト。現在のセッションで使用しているJWTをRedisのブロックリストに追加し、無効化します。 | （なし） | `{"message": "Successfully logged out"}` |
 | `DELETE` | `/me` | JWT | アカウント削除。認証ユーザーのプロフィール（profile-service）、チームのメンバー情報（team-service）、プロフィール画像、動画、ゲーム、静的サイトを削除します。ローカルアカウントは行を削除し、Googleアカウントは `status` を `deleted_data` にします。使用中のトークンも無効化されます。一部の後始末に失敗しても 200 を返し、失敗した項目を `cleanupErrors` に入れます（その場合の `message` は「アカウントは削除されましたが、一部のデータの削除に失敗しました。」）。auth-db の更新に失敗した場合は 500。 | （なし） | `{"message": "アカウントデータが正常に削除されました。", "cleanupErrors": []}` |
-| `GET` | `/user/:userId` | 不要 | ユーザーの認証プロバイダ取得。指定したユーザーIDが `local` か `google` かを返します（UUID 形式でなければ 400、存在しなければ 404）。 | （なし） | `{"provider": "google"}` |
+| `GET` | `/me` | JWT | 自分のアカウント情報取得。auth-db にある認証ユーザー自身の情報を返します（フロントエンドは `provider` をアカウント削除ダイアログの文言の切り替えに使います）。`username` が未設定なら `null`。トークンが無効なら 401、行が無ければ 404。（以前あった認証不要の `GET /user/:userId` は削除されました） | （なし） | `{"id": "...", "email": "...", "username": "...", "provider": "local", "isAdmin": false, "status": "active"}` |
 
 ---
 
@@ -65,11 +65,10 @@
 | `PUT` | `` | JWT | プロフィール更新。認証ユーザーのユーザー名と自己紹介を更新し、`status` を `active` にします。 | `{"username": "New Name", "bio": "New Bio"}` | `{"message": "Profile updated successfully"}` |
 | `PUT` | `/icon` | JWT | アイコン更新。認証ユーザーのプロフィールアイコンをSFSPでスキャン後に更新します（202 で受け付け）。画像（JPEG・PNG・GIF・WebP）以外は 415、`MAX_IMAGE_UPLOAD_BYTES`（既定 10 MiB）超過は 413。 | `multipart/form-data`（key: `icon`） | `{"message": "Icon upload accepted for scanning", "job_id": "...", "status": "scanning"}` |
 | `PUT` | `/background` | JWT | 背景画像更新。認証ユーザーの背景画像をSFSPでスキャン後に更新します（202 で受け付け）。画像以外は 415、サイズ超過は 413。 | `multipart/form-data`（key: `background`） | `{"message": "Background upload accepted for scanning", "job_id": "...", "status": "scanning"}` |
-| `POST` | `/internal/create` | 内部 | 旧パス（移行用）。下記の内部用プロフィール作成と同じ処理ですが、Nginx が `/api/profile/internal/` を 404 にするため外部からは届きません。 | `{"user_id": "...", "username": "..."}` | `{"message": "Profile initialized successfully"}` |
 
 ### 内部専用エンドポイント（profile-service）
 
-`/api/profile` の外にある、サービス間専用のパスです。Nginx は転送しません。`X-Internal-Key` が `INTERNAL_API_KEY` と一致しない場合、または `INTERNAL_API_KEY` が未設定の場合は常に 403 です。
+`/api/profile` の外にある、サービス間専用のパスです。Nginx は転送しません（`/api/profile` の下には内部用のパスはありません。移行用に残していた旧パス `/api/profile/internal/create` は削除されました。Nginx は念のため `/api/profile/internal/` を 404 にしています）。`X-Internal-Key` が `INTERNAL_API_KEY` と一致しない場合、または `INTERNAL_API_KEY` が未設定の場合は常に 403 です。
 
 | メソッド | エンドポイント | 認証 | 説明 | リクエストボディ | レスポンス例 |
 |---|---|---|---|---|---|
@@ -106,7 +105,7 @@
 |---|---|---|---|---|---|
 | `POST` | `/upload` | JWT | ゲームアップロード。ゲームのzipファイルとメタデータを受け取り、スキャンと展開プロセスを開始します（202）。`title` は必須（無ければ 400）。Unity WebGL ビルドのzipでなければ 415、`MAX_GAME_UPLOAD_BYTES`（既定 1 GiB）超過は 413。サムネイルは画像のみ（415）で `MAX_IMAGE_UPLOAD_BYTES`（既定 10 MiB）まで。`team_id` を指定するとチームへの投稿になり、投稿権限が無ければ 403。 | `multipart/form-data`（keys: `game`、`thumbnail`、`title`、`description`、任意で `team_id`） | `{"message": "Game upload accepted", "gameId": "...", "status": "..."}` |
 | `GET` | `` | 不要 | ゲームリスト取得。公開済み（`status='public'`）のゲームリストを検索クエリ付きで取得します。`team` を指定しない場合は全体公開（`team_id` なし）のゲームのみで、`team=<token>` を指定するとそのチーム限定のゲームを返します（`can_view` が必要。無ければ 403、team-service に問い合わせられなければ 502）。 | （クエリ: `q=search_term`、`team=<token>`） | `[{"id": "...", "title": "...", ...}]` |
-| `GET` | `/:id` | 任意 | ゲーム詳細取得。指定したゲームのメタデータを取得します。投稿者本人と管理者は状態にかかわらず閲覧できます。それ以外は `public` のみ（それ以外は 404）で、`team_id` があるゲームは `can_view` が必要です（無ければ 403、team-service に問い合わせられなければ 502）。 | （なし） | `{"id": "...", "title": "...", ...}` |
+| `GET` | `/:id` | 任意 | ゲーム詳細取得。指定したゲームのメタデータを取得します。投稿者本人と管理者は状態にかかわらず閲覧できます。それ以外は `public` のみ（それ以外は 404）で、`team_id` があるゲームは `can_view` が必要です（無ければ 403、team-service に問い合わせられなければ 502）。投稿者本人と管理者には `thumbnail_sfsp_job_id` と `processing_details`（展開の進捗・失敗理由）も返します。投稿者名（`uploader_name`）は含みません。 | （なし） | `{"id": "...", "title": "...", ...}` |
 | `PUT` | `/:id` | JWT | ゲームメタデータ更新。指定したゲームのタイトル、説明、サムネイルを更新します。投稿者本人のみ（他は 403）。`thumbnail` を付けた場合はSFSPでスキャンし、202 で受け付けます。 | `multipart/form-data`（keys: `title`、`description`、`thumbnail`） | `{"message": "Game details updated successfully"}`（サムネイル付きの場合は 202 `{"message": "Thumbnail upload accepted for scanning", "job_id": "...", "status": "scanning"}`） |
 | `PUT` | `/adjust/:id` | JWT | ゲーム表示調整。ゲームの表示スケールとオフセットを更新します。投稿者本人のみ。 | `{"scale": 1.0, "offset_x": 0, "offset_y": 0}` | `{"message": "Adjustments saved successfully"}` |
 | `DELETE` | `/:id` | JWT | ゲーム削除。指定したゲームと関連するMinIO上のファイルをすべて削除します。投稿者または管理者のみ。 | （なし） | `{"message": "Game deleted successfully"}` |
@@ -123,8 +122,8 @@
 | メソッド | エンドポイント | 認証 | 説明 | リクエストボディ | レスポンス例 |
 |---|---|---|---|---|---|
 | `POST` | `/upload` | JWT | static-siteアップロード。サイトのzipファイルとメタデータを受け取り、スキャンと展開プロセスを開始します（202）。`title` は必須（無ければ 400）。zip以外は 415、`MAX_SITE_UPLOAD_BYTES`（既定 500 MiB）超過は 413。サムネイルは画像のみ（415）で `MAX_IMAGE_UPLOAD_BYTES`（既定 10 MiB）まで。`team_id` を指定するとチームへの投稿になり、投稿権限が無ければ 403。 | `multipart/form-data`（keys: `file`、`thumbnail`、`title`、`description`、任意で `team_id`） | `{"message": "Static site upload initiated for scanning", "siteId": "..."}` |
-| `GET` | `` | 不要 | static-siteリスト取得。公開済み（`status='public'`）のサイトリストを検索クエリ付きで取得します。`team` を指定しない場合は全体公開（`team_id` なし）のサイトのみで、`team=<token>` を指定するとそのチーム限定のサイトを返します（`can_view` が必要。無ければ 403）。 | （クエリ: `q=search_term`、`team=<token>`） | `[{"id": "...", "title": "...", ...}]` |
-| `GET` | `/:id` | 任意 | static-site詳細取得。指定したサイトのメタデータを取得します。投稿者本人と管理者は状態にかかわらず閲覧できます。それ以外は `public` かつ（`team_id` があれば）`can_view` のときだけで、見せられない場合は 404 を返します。 | （なし） | `{"id": "...", "title": "...", ...}` |
+| `GET` | `` | 不要 | static-siteリスト取得。公開済み（`status='public'`）のサイトリストを検索クエリ付きで取得します。`team` を指定しない場合は全体公開（`team_id` なし）のサイトのみで、`team=<token>` を指定するとそのチーム限定のサイトを返します（`can_view` が必要。無ければ 403、team-service に問い合わせられなければ 502）。 | （クエリ: `q=search_term`、`team=<token>`） | `[{"id": "...", "title": "...", ...}]` |
+| `GET` | `/:id` | 任意 | static-site詳細取得。指定したサイトのメタデータを取得します。投稿者本人と管理者は状態にかかわらず閲覧できます。それ以外は `public` かつ（`team_id` があれば）`can_view` のときだけで、見せられない場合は 404 を返します（team-service に問い合わせられなければ 502）。 | （なし） | `{"id": "...", "title": "...", ...}` |
 | `PUT` | `/:id` | JWT | static-siteメタデータ更新。指定したサイトのタイトルと説明を更新します。投稿者または管理者のみ（他は 403）。`thumbnail` を付けた場合はSFSPでスキャンし、202 で受け付けます。 | `multipart/form-data`（keys: `title`、`description`、任意で `thumbnail`） | `{"message": "Static site updated successfully"}`（サムネイル付きの場合は 202 `{"message": "Thumbnail upload accepted for scanning", "job_id": "...", "status": "scanning"}`） |
 | `DELETE` | `/:id` | JWT | static-site削除。指定したサイトと関連するMinIO上のファイルをすべて削除します。投稿者または管理者のみ。 | （なし） | `{"message": "Static site deleted successfully"}` |
 | `DELETE` | `/:id/thumbnail` | JWT | static-siteサムネイル削除。投稿者または管理者のみ。 | （なし） | `{"message": "Thumbnail deleted successfully"}` |
@@ -199,7 +198,7 @@
 
 | メソッド | エンドポイント | 認証 | 説明 | リクエストボディ | レスポンス例 |
 |---|---|---|---|---|---|
-| `POST` | `/files` | APIキー | ファイルスキャン依頼。各アップロードサービスからファイルを受け付け、スキャンジョブを作成・キューイングします（202）。`target_service` は `static-site`・`game`・`stream`・`profile`・`thumbnail`・`video-thumbnail`・`game-thumbnail`・`site-thumbnail` のいずれかで、それ以外は 400。1ファイルの上限は `SFSP_MAX_UPLOAD_BYTES`（既定 2 GiB-1）で、超過は 413。 | `multipart/form-data`（keys: `file`、`target_service`） | `{"file_id": "...", "job_id": "...", "status": "queued"}` |
+| `POST` | `/files` | APIキー | ファイルスキャン依頼。各アップロードサービスからファイルを受け付け、スキャンジョブを作成・キューイングします（202）。`target_service` は `static-site`・`game`・`stream`・`profile`・`video-thumbnail`・`game-thumbnail`・`site-thumbnail` のいずれかで、それ以外（旧い別名の `thumbnail` を含む）は 400。1ファイルの上限は `SFSP_MAX_UPLOAD_BYTES`（既定 2 GiB-1）で、超過は 413。 | `multipart/form-data`（keys: `file`、`target_service`） | `{"file_id": "...", "job_id": "...", "status": "queued"}` |
 | `GET` | `/jobs/:id` | APIキー | ジョブステータス確認。指定したジョブIDの現在の状態（`queued`、`running`、`completed` 等）を返します（ID 形式不正は 400、存在しなければ 404）。 | （なし） | `{"id": "...", "status": "running", ...}` |
 | `GET` | `/results/:id` | APIキー | スキャン結果取得。完了したジョブIDのスキャン結果（ClamAV、YARA 等）の詳細を返します。結果がまだ無い場合は 200 で `{"message": ..., "job_status": ...}` を返します。 | （なし） | `[{"scanner": "clamav", "result": "clean", ...}]` |
 | `GET` | `/health` | 不要 | ヘルスチェック。サービスの稼働状況を確認します（パスは `/api/v1` の外の `/health`）。 | （なし） | `{"status": "ok"}` |
@@ -215,16 +214,17 @@
 
 | メソッド | エンドポイント | 説明 |
 |---|---|---|
-| `GET` | `/containers` | 稼働中の全コンテナのリスト（ID、名前、状態 等）を取得します。 |
-| `GET` | `/containers/stats` | 全コンテナのCPU・メモリ使用率などの統計情報を取得します。 |
-| `POST` | `/containers/restart/{name}` | 指定した名前のコンテナを再起動します。 |
+| `GET` | `/containers` | 全コンテナのリスト（ID、名前、イメージ、状態、ヘルス、起動時刻、再起動回数 等）を取得します。接続ネットワークは含みません（`/topology` で取得）。 |
+| `GET` | `/containers/stats` | 稼働中の全コンテナのCPU・メモリ使用率などの統計情報を取得します（CPU% は cgroup v2 でも正しく計算）。 |
 | `GET` | `/topology` | 構成図用のデータ（コンテナの接続関係）を取得します。 |
 | `GET` | `/volumes` | Docker ボリュームの一覧を取得します。 |
 | `GET` | `/connections/count` | `atmosidea-frontend`のログを解析し、直近5分間のユニークIPアドレス数をカウントしてアクティブユーザー数を推定します。 |
 | `GET` | `/minio/list/{containerName}` | 指定したMinIOコンテナ内のバケットやオブジェクトを一覧表示します。（クエリ: `bucket`、`prefix`） |
 | `POST` | `/minio/upload/{containerName}` | 指定したMinIOコンテナのバケットにファイルをアップロードします。（クエリ: `bucket`、`prefix`） |
 | `DELETE` | `/minio/delete/{containerName}` | 指定したMinIOコンテナのバケットからオブジェクトを削除します。（クエリ: `bucket`、`key`） |
-| `GET` | `/ws/logs`、`/ws/logs/{id}` | `/api` の外のパス。WebSocket接続を確立し、指定したコンテナのログをリアルタイムにストリーミングします。（クエリ: `container`。`/ws/logs/{id}` ではコンテナIDをパスで指定） |
+| `GET` | `/ws/logs` | `/api` の外のパス。WebSocket接続を確立し、指定したコンテナのログ（先頭のタイムスタンプを除いた本文）をリアルタイムにストリーミングします。（クエリ: `container` = コンテナ名または ID） |
+
+コンテナの再起動 API（`POST /containers/restart/{name}`）とパス形式の `/ws/logs/{id}` は削除されました。ダッシュボードから操作できるのは MinIO のオブジェクトだけです。
 
 ---
 

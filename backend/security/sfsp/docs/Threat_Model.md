@@ -44,7 +44,7 @@ This document outlines the threat model for the Secure File Scanning Platform (S
 - **Threat**: An attacker gains access to sensitive information, such as scan results, other users' files, or system configuration.
 - **Mitigation**:
   - The MinIO buckets `raw-files`, `clean-files`, and `quarantine` are private (no anonymous access).
-  - Database credentials and other secrets are managed via environment variables, not hardcoded. `sfsp-worker` does not receive the whole `.env` file, and credentials are redacted from the logs.
+  - Database credentials and other secrets are managed via environment variables, not hardcoded. No service receives the whole `.env` file (there is no `env_file`, and `.env` is excluded from every image by `.dockerignore`): each container gets only the variables its code reads, and credentials are redacted from the logs. Known gap: `sfsp-api` / `sfsp-worker` connect to `sfsp-db` with the shared PostgreSQL superuser (`POSTGRES_USER`), and the `sfsp-api` (`raw-files`) and `sfsp-worker` clean (`clean-files` / `quarantine` / `raw-files`) MinIO policies grant `s3:*` on their buckets.
   - API endpoints require the API key to access job/result details.
   - The raw upload is deleted from `raw-files` after the final status is recorded and the completion event is published.
 
