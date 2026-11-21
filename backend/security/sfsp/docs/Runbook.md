@@ -13,12 +13,12 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
 1.  **Clone the repository**: `git clone <repo-url>`
 2.  **Copy environment file**: `cp .env.example .env` and fill in all required variables (PostgreSQL, MinIO, `REDIS_PASSWORD`, `SFSP_API_KEY`, `SFSP_WORKER_DB_PASSWORD`, `JWT_SECRET`, etc.). `docker compose` aborts if `REDIS_PASSWORD` or `SFSP_API_KEY` is unset, and `sfsp-api` refuses to start without `SFSP_API_KEY` (use a long random value of at least 32 characters). Replace every example value before production use.
 3.  **Build and start services**: `docker compose build && docker compose up -d`
-4.  **Verify services**: `docker compose ps` should show the SFSP services (`sfsp-api`, `sfsp-worker`, `sfsp-docker-proxy`, `sfsp-db`) and their dependencies (`minio`, `redis`) running. `sfsp-clamav-client` and `sfsp-yara-client` are build-only services that print a message and exit, and `minio-init` / `db-role-init` run once and exit; check them with `docker compose ps -a` and `docker images`.
+4.  **Verify services**: `docker compose ps` should show the SFSP services (`sfsp-api`, `sfsp-worker`, `sfsp-docker-guard`, `sfsp-docker-proxy`, `sfsp-db`) and their dependencies (`minio`, `redis`) running. `sfsp-clamav-client` and `sfsp-yara-client` are build-only services that print a message and exit, and `minio-init` / `db-role-init` run once and exit; check them with `docker compose ps -a` and `docker images`.
 5.  **Check API health**: `sfsp-api` is not published to the host (it listens on port 8080 inside the `internal` network `sfsp-isolated-net`; host port 8090 belongs to the monitoring dashboard). Run `docker compose exec sfsp-api wget -qO- http://localhost:8080/health`, which should return `{"status":"ok"}`. `/health` needs no key; every `/api/v1/*` request must carry the header `X-SFSP-API-Key` (the value of `SFSP_API_KEY`).
 
 ### Restarting Services
 
--   `docker compose restart sfsp-api sfsp-worker sfsp-docker-proxy sfsp-db minio`
+-   `docker compose restart sfsp-api sfsp-worker sfsp-docker-guard sfsp-docker-proxy sfsp-db minio`
 -   Or for all services: `docker compose restart`
 -   Restarting `sfsp-worker` is safe: jobs it had taken but not acknowledged stay in `sfsp:scan_queue:processing` and are moved back to `sfsp:scan_queue` at startup (`RecoverProcessing`).
 
@@ -34,8 +34,8 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
     -   Number of jobs in the Redis queues: waiting (`sfsp:scan_queue`), in progress (`sfsp:scan_queue:processing`, normally at most one), and dead-lettered (`sfsp:scan_queue:dead`, should be empty).
     -   CPU/Memory usage.
     -   Errors in logs (failed scans, sandbox issues).
--   **`sfsp-docker-proxy`**:
-    -   Container is running; errors or 403 responses from the proxy in the `sfsp-worker` logs.
+-   **`sfsp-docker-guard`** / **`sfsp-docker-proxy`**:
+    -   Containers are running; errors or 403 responses in the `sfsp-worker` logs. Every rejected request is logged by the guard as a `DENY` line (`docker compose logs sfsp-docker-guard`).
 -   **`sfsp-db`**:
     -   Connection count, query latency.
     -   Disk I/O, CPU, Memory usage.
@@ -70,9 +70,9 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
 
 -   **Symptom**: Jobs are stuck in "queued" status, `sfsp-worker` logs show no activity or errors.
 -   **Check**:
-    1.  **`sfsp-worker` logs**: `docker compose logs sfsp-worker`. Look for errors connecting to `sfsp-db`, `minio`, `redis`, or the Docker API (via `sfsp-docker-proxy`).
+    1.  **`sfsp-worker` logs**: `docker compose logs sfsp-worker`. Look for errors connecting to `sfsp-db`, `minio`, `redis`, or the Docker API (via `sfsp-docker-guard` and `sfsp-docker-proxy`).
     2.  **Redis queue**: Redis requires a password, so run `docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli LLEN sfsp:scan_queue'`. Do the same for `sfsp:scan_queue:processing` and `sfsp:scan_queue:dead`. If jobs are waiting but not processed, the worker might be stuck.
-    3.  **Docker connectivity**: The worker does not mount `/var/run/docker.sock`; it reaches Docker through `sfsp-docker-proxy` (`DOCKER_HOST=tcp://sfsp-docker-proxy:2375`, network `sfsp-docker-net`). Ensure the proxy is running (`docker compose ps sfsp-docker-proxy`). A 403 from the proxy means the requested Docker API endpoint is not allowed by the proxy settings in `docker-compose.yml`.
+    3.  **Docker connectivity**: The worker does not mount `/var/run/docker.sock`; it reaches Docker through `sfsp-docker-guard` (`DOCKER_HOST=tcp://sfsp-docker-guard:2375`, network `sfsp-docker-guard-net`), which forwards to `sfsp-docker-proxy` (network `sfsp-docker-net`). Ensure both are running (`docker compose ps sfsp-docker-guard sfsp-docker-proxy`). A 403 whose message starts with `sfsp-docker-guard:` was rejected by the guard (the reason is in its `DENY` log line); this happens if `internal/sandbox/docker.go` was changed without updating `backend/security/sfsp-docker-guard`, or if `SFSP_SCANNER_*_IMAGE` / `SFSP_SCAN_VOLUME_NAME` differ from the guard's `SFSP_GUARD_ALLOWED_IMAGES` / `SFSP_GUARD_SCAN_VOLUME`. A `too many sandboxes` 403 means 2 or more sandbox containers are running or 32 or more exist (`docker ps -a --filter label=app=sfsp-sandbox`); remove leftovers with `docker rm -f`, or raise `SFSP_GUARD_MAX_ACTIVE_SANDBOXES` / `SFSP_GUARD_MAX_SANDBOXES` in `.env`. Other 403s come from the proxy settings in `docker-compose.yml`.
     4.  **Sandbox image availability**: The worker never pulls images. Check that `sfsp-clamav-client` and `sfsp-yara-client` are built and available locally (`docker images`).
 -   **Solution**: Resolve connectivity issues. If the worker is stuck, restart it (unacknowledged jobs are recovered automatically). If sandbox images are missing, rebuild them (`docker compose build sfsp-clamav-client sfsp-yara-client`).
 
@@ -130,7 +130,7 @@ Refer to the main `README.md`, `EditAI.md` (sections 3.2, 7, 9.8, and 12), and `
 
 -   **Incident Response**: Refer to `backend/security/sfsp/docs/Incident_Guide.md`.
 -   **Vulnerability Management**: Regularly scan Docker images and dependencies for known vulnerabilities.
--   **Access Control**: Ensure only authorized personnel have access to the Docker host and `.env` files. Do not mount `/var/run/docker.sock` or `.env` into `sfsp-worker`; only `sfsp-docker-proxy` mounts the socket (read-only). Do not copy `.env` into any image or pass it with `env_file`; the root `.dockerignore` excludes `.env` / `.env.*` from the build context.
+-   **Access Control**: Ensure only authorized personnel have access to the Docker host and `.env` files. Do not mount `/var/run/docker.sock` or `.env` into `sfsp-worker`, and do not attach `sfsp-worker` to `sfsp-docker-net`; only `sfsp-docker-proxy` mounts the socket (read-only) and only `sfsp-docker-guard` talks to it. Do not copy `.env` into any image or pass it with `env_file`; the root `.dockerignore` excludes `.env` / `.env.*` from the build context.
 -   **Key Rotation**: To rotate `SFSP_API_KEY` or `REDIS_PASSWORD`, change it in `.env` and recreate every service that uses it (`docker compose up -d`). Callers of `sfsp-api` must send the new `X-SFSP-API-Key` value.
 
 ---

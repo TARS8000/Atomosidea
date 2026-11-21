@@ -97,7 +97,7 @@
 | | MinIO ×1 | オブジェクトストレージ（バケットとユーザーで分離） |
 | セキュリティ | ClamAV, YARA | アップロードのスキャン（Docker サンドボックス内） |
 | 動画 | FFmpeg | HLS 変換・サムネイル生成（`video-upload-api` 内で実行） |
-| 監視 | monitoring-service | Docker ソケット経由のダッシュボード（別 compose） |
+| 監視 | monitoring-service | 読み取り専用の Docker API プロキシ（mon-docker-proxy）経由のダッシュボード（別 compose） |
 
 ---
 
@@ -150,7 +150,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `backend-db-network`（`internal: true`） | auth-db, app-db, profile-db, team-db, db-role-init, auth-service, profile-service, team-service, mypage-service, 各アップロード API / ワーカー, sfsp-worker（app-db 用） |
 | `sfsp-isolated-net`（`internal: true`） | redis, minio, minio-init, 各アップロード API / ワーカー, profile-service, sfsp-api, sfsp-worker |
 | `sfsp-db-network`（`internal: true`） | sfsp-db, sfsp-api, sfsp-worker のみ |
-| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy, sfsp-worker のみ |
+| `sfsp-docker-guard-net`（`internal: true`） | sfsp-docker-guard, sfsp-worker のみ |
+| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy, sfsp-docker-guard のみ |
 
 - `internal: true` のネットワークは外へ出られない。Google OAuth など外部通信が必要なサービスは `atmosidea-network` にも参加させる。
 - ネットワーク定義を変えた後は `docker compose down` → `up -d` で作り直す必要がある（そのままだと「network needs to be recreated」で失敗する）。
@@ -193,7 +194,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用（`network_mode: none`。echo して終了） |
 | `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用（`network_mode: none`）。YARA ルール（`backend/security/sfsp/yara-rules/`）はこのイメージの `/etc/yara-rules` に焼き込まれる |
 | `sfsp-scan-volume-init` | sfsp-scan-volume-init | — | docker-compose.yml（`sfsp-yara-client` イメージを root で一時利用） | 起動のたびに 1 回だけ動き、スキャン用ボリューム `sfsp_temp_scan` の所有者を 10001 に揃える（非 root 化前に作られた既存ボリューム用）。`CHOWN` / `FOWNER` / `DAC_READ_SEARCH` のみ許可、ネットワークなし、読み取り専用ルート。`sfsp-worker` はこの完了を待つ |
-| `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | sfsp-worker 用の Docker API プロキシ。`CONTAINERS` / `IMAGES` / `POST` / `PING` / `VERSION` のみ許可 |
+| `sfsp-docker-guard` | sfsp-docker-guard | 2375 | `backend/security/sfsp-docker-guard/` | sfsp-worker と sfsp-docker-proxy の間の検査プロキシ（Go 標準ライブラリのみ）。`internal/sandbox/docker.go` が送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す。資源の上限は docker.go と同じ値ちょうど、/tmp の tmpfs は noexec に作り直す。サンドボックスは同時に 2 つ・停止済みを含めて 32 まで（`SFSP_GUARD_MAX_ACTIVE_SANDBOXES` / `SFSP_GUARD_MAX_SANDBOXES`）。許可するイメージ・スキャン用ボリュームは `SFSP_GUARD_ALLOWED_IMAGES` / `SFSP_GUARD_SCAN_VOLUME` |
+| `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | Docker API プロキシ（届くのは sfsp-docker-guard だけ）。`CONTAINERS` / `IMAGES` / `POST` / `PING` のみ許可 |
 | `db-role-init` | atmosidea-db-role-init | — | `backend/db-init/sync-role-passwords.sh` | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを `ALTER ROLE` する |
 | `auth-db` ほか DB | atmosidea-*-db / sfsp-db | 5432 | 各 `init.sql` | [5 章](#5-データベース) |
 | `redis` | atmosidea-redis | 6379 | — | [7 章](#7-redis-と共有パッケージshared) |
@@ -205,7 +207,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | サービス | コンテナ名 | ポート | 実装 |
 |---|---|---|---|
 | `mon-nginx` | mon-nginx | `127.0.0.1:8090:80` | `monitoring-service/nginx.conf` |
-| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットを `:ro` でマウント。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network` と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
+| `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットはマウントせず、`DOCKER_HOST=tcp://mon-docker-proxy:2375`。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network`・`mon-docker-net`（`internal: true`。mon-docker-proxy 用）と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
+| `mon-docker-proxy` | mon-docker-proxy | 2375 | `tecnativa/docker-socket-proxy:0.3.0`（compose で定義） | mon-backend 専用の読み取り専用 Docker API プロキシ。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD のみ（`POST=0`） |
 | `mon-frontend` | mon-frontend-builder | — | `monitoring-service/frontend/`（ビルドして `dist/` に出力するだけ） |
 
 ### 4.1. フロントエンドのルート（`frontend/src/App.tsx`）
@@ -837,10 +840,10 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 - `CapDrop: ALL` の下では clamav/clamav イメージの `/init`（chown を行う）が失敗する。Entrypoint を元に戻すとスキャン前に終了コード 1 で落ち、全ファイルが判定不能になる。
 - ウイルス定義は `sfsp-clamav-client` のビルド時に `freshclam` で更新する。サンドボックスはネットワークが無いので実行時には更新できない。定義を新しくするには `docker compose build --pull sfsp-clamav-client`。
 - sfsp-api と sfsp-worker は非 root（uid/gid 10001）で動く（`docker/api/Dockerfile`、`docker/worker/Dockerfile` の `USER 10001:10001`）。スキャン用ディレクトリ `/tmp/sfsp-scan` は 0755・10001 所有で、サンドボックスのスキャナー（`CapDrop: ALL`）が読めるようにしてある。既存の `sfsp_temp_scan` ボリュームは `sfsp-scan-volume-init` が毎回 chown する。
-- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy` 経由でサンドボックスを起動し（Docker SDK を使うので worker イメージに docker-cli は入っていない）、設定は compose の environment で明示的に渡す。`SFSP_CLAMAV_*` と `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` も `${VAR:-既定値}` の形で渡しているので、`.env` に書けば上書きできる（既定値は `internal/config/config.go` と同じ。`.env.example` にコメントアウトして列挙）。
+- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-guard:2375` で `sfsp-docker-guard` → `sfsp-docker-proxy` 経由でサンドボックスを起動し（Docker SDK を使うので worker イメージに docker-cli は入っていない）、設定は compose の environment で明示的に渡す。`SFSP_CLAMAV_*` と `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` も `${VAR:-既定値}` の形で渡しているので、`.env` に書けば上書きできる（既定値は `internal/config/config.go` と同じ。`.env.example` にコメントアウトして列挙）。
 - YARA ルールは `sfsp-yara-client` イメージの `/etc/yara-rules` に焼き込まれており、sfsp-worker 自身は読まない（worker イメージに yara は無く、`yara-rules` のマウントも 2026-10-29 に外した）。ルールを変えたら `docker compose build sfsp-yara-client`。
 - 使う Docker API: `_ping`、`GET /images/{name}/json`、`POST /containers/create`、`start`、`wait`、`logs`、`DELETE /containers/{name}`。イメージの pull はしない（ローカルに無ければ `failed`）。
-- プロキシはリクエスト本文（Privileged・Binds 等）を検査しないので、完全な隔離ではない（[15 章](#15-既知の問題未対応)）。
+- `sfsp-docker-proxy` はリクエスト本文（Privileged・Binds 等）を検査しないので、`sfsp-docker-guard`（`backend/security/sfsp-docker-guard`）が上の API だけを通し、コンテナ作成の本文を許可リストで作り直す（資源の上限は上の表の値ちょうど、`/tmp` は noexec に固定、同時に動くサンドボックスは 2 つまで）。上の設定や呼ぶ API を変えたら `sfsp-docker-guard` も直す。
 
 ### 12.3. ユーザーのコンテンツの配信
 
@@ -995,7 +998,7 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 | 重大度 | 問題 | 場所 |
 |---|---|---|
 | High | Nginx が MinIO に直接プロキシする経路（HLS `/api/videos/<id>/stream/*`、`/videos\|games\|static-sites/thumbnails/*`、サブドメイン `<id>.localhost`）に認可が無い。チーム限定・処理中のコンテンツも ID が分かれば取得できる（隔離済みファイルは公開バケットに置かれないので対象外）。`<img>`・hls.js・サブドメインには JWT が届かないため、署名付き URL か Cookie など別の仕組みが要る | `frontend/nginx.conf`、各バケットの匿名読み取りポリシー（game-worker の `ensureBucket` を含む。※ `ensureBucket` は 2026-10-29 に削除。現在は `minio-init` と profile-service の起動時処理が設定する） |
-| Medium | `sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる | `docker-compose.yml` |
+| Medium | ~~`sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる~~ **対応済み（2026-11-21）**: sfsp-worker と sfsp-docker-proxy の間に `sfsp-docker-guard` を置き、サンドボックスに必要なリクエストだけを本文まで検査して通す。sfsp-worker は sfsp-docker-proxy に直接つながらない | `docker-compose.yml`、`backend/security/sfsp-docker-guard/` |
 | Medium | ~~多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込み、アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取っている~~ **対応済み（2026-10-29）**: Dockerfile は `.env` をコピーせず、`.dockerignore` で `.env` / `.env.*` を除外。`env_file` を全サービスから削除し、各サービスはコードが読む変数だけを `environment:` で受け取る。**ただし DB の資格情報は下の「スーパーユーザー」の行のとおり残っている**（`.env` を含んでいた古いイメージは削除済み。今後 `docker compose build` で作るイメージには `.env` が入らない） | 各 `Dockerfile`、`docker-compose.yml`、`.dockerignore` |
 | Medium | `POSTGRES_PASSWORD` と MinIO の各キーは `.env.example` で公開済みの値のまま。変更するにはボリュームの作り直しが必要 | `.env` |
 | Low | Redis に job ID が無いまま `running` で止まった過去のスキャンジョブは回収されない | sfsp-worker |

@@ -31,7 +31,7 @@ const getLayer = (c) => {
   if (s === 'frontend' || s.endsWith('-frontend')) return 'frontend';
   if (s.endsWith('upload-api')) return 'upload';
   if (s.endsWith('-service')) return 'api';
-  if (s.endsWith('-init') || s.includes('docker-proxy')) return 'infra';
+  if (s.endsWith('-init') || s.includes('docker-proxy') || s.includes('docker-guard')) return 'infra';
   if (s.endsWith('-worker') || s === 'sfsp-api' || s.includes('clamav') || s.includes('yara')) return 'worker';
   if (s.endsWith('-db') || s === 'redis') return 'db';
   if (s.includes('minio') || s.includes('storage')) return 'storage';

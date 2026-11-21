@@ -5,7 +5,7 @@ This document outlines the threat model for the Secure File Scanning Platform (S
 ## 1. System Overview
 
 - **Purpose**: To scan untrusted files in an isolated environment.
-- **Key Components**: API (`sfsp-api`), Worker (`sfsp-worker`), Scanners (ClamAV, YARA), Sandbox (Docker), Docker API proxy (`sfsp-docker-proxy`), Queue (Redis), Database (PostgreSQL, `sfsp-db`), Storage (MinIO).
+- **Key Components**: API (`sfsp-api`), Worker (`sfsp-worker`), Scanners (ClamAV, YARA), Sandbox (Docker), Docker API request filter (`sfsp-docker-guard`), Docker API proxy (`sfsp-docker-proxy`), Queue (Redis), Database (PostgreSQL, `sfsp-db`), Storage (MinIO).
 
 ## 2. Security Objectives
 
@@ -22,7 +22,7 @@ This document outlines the threat model for the Secure File Scanning Platform (S
 - **Mitigation**:
   - All `/api/v1/*` endpoints of `sfsp-api` require the `X-SFSP-API-Key` header (compared in constant time). `sfsp-api` fails closed: it does not start without `SFSP_API_KEY`. The API is internal only and is not reachable through Nginx. End-user authentication is done by the calling services, not by `sfsp-api`.
   - Redis requires a password (`requirepass`), so a container on the same network cannot forge scan completion events without it.
-  - Internal service-to-service communication stays within Docker networks marked `internal: true` (`sfsp-isolated-net`, `sfsp-db-network`, `sfsp-docker-net`).
+  - Internal service-to-service communication stays within Docker networks marked `internal: true` (`sfsp-isolated-net`, `sfsp-db-network`, `sfsp-docker-guard-net`, `sfsp-docker-net`).
 
 ### Tampering
 
@@ -63,7 +63,7 @@ This document outlines the threat model for the Secure File Scanning Platform (S
 
 - **Threat**: A malicious file exploits a vulnerability in a scanner or the sandbox to gain control of the worker or host system. **(This is the most critical threat)**.
 - **Mitigation**:
-  - **Principle of Least Privilege**: The `sfsp-worker` container does not mount `/var/run/docker.sock` or `.env`. It reaches Docker only through `sfsp-docker-proxy` (`DOCKER_HOST=tcp://sfsp-docker-proxy:2375`), which allows only the container and image API endpoints needed by the sandbox. `sfsp-api` and `sfsp-worker` run as the non-root user `10001:10001`. Known gap: the proxy does not inspect request bodies (a compromised worker could still ask for a privileged container or host mounts).
+  - **Principle of Least Privilege**: The `sfsp-worker` container does not mount `/var/run/docker.sock` or `.env`. It reaches Docker only through `sfsp-docker-guard` (`DOCKER_HOST=tcp://sfsp-docker-guard:2375`), which forwards to `sfsp-docker-proxy`. The proxy filters by URL and method only; the guard allows only the requests the sandbox needs and inspects the container-create body (privileged mode, host-path binds, extra capabilities, devices, host namespaces, other images, exec, pull and operations on non-sandbox containers are rejected with 403). `sfsp-api` and `sfsp-worker` run as the non-root user `10001:10001`.
   - **Sandbox Isolation** (`internal/sandbox/docker.go`):
     - Containers are ephemeral: each one is removed explicitly after the scan (`AutoRemove` is off so that the logs can be read first).
     - `NetworkMode: none`: No network access from the sandbox.

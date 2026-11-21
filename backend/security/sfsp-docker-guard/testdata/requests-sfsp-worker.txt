@@ -1,0 +1,8 @@
+HEAD /_ping
+GET /v1.51/images/sfsp-yara-client:latest/json
+DELETE /v1.51/containers/sfsp-sandbox-yara-cde771ac-0607-47f0-8004-66295d7b2793?force=1
+POST /v1.51/containers/create?name=sfsp-sandbox-yara-cde771ac-0607-47f0-8004-66295d7b2793
+POST /v1.51/containers/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/start
+POST /v1.51/containers/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/wait?condition=not-running
+GET /v1.51/containers/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs?stderr=1&stdout=1&tail=
+DELETE /v1.51/containers/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?force=1
