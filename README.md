@@ -222,8 +222,9 @@ graph LR
 | `static-site-upload-api` | 8085 | 静的サイトのアップロード・一覧・詳細・編集・削除 | `backend/static-site-service/static-site-upload-api/` |
 | `static-site-worker` | — | スキャン済みサイト zip の展開・配置 | `backend/static-site-service/static-site-worker/` |
 | `sfsp-api` | 8080 | スキャン対象ファイルの受付とジョブ登録（`X-SFSP-API-Key` 必須） | `backend/security/sfsp/` |
-| `sfsp-worker` | — | ClamAV / YARA をサンドボックスで実行し、結果を各サービスへ通知（Docker 操作は `sfsp-docker-proxy` 経由） | `backend/security/sfsp/` |
-| `sfsp-docker-proxy` | 2375 | sfsp-worker 専用の Docker API プロキシ（コンテナの作成・起動・削除など必要な API だけ許可） | `tecnativa/docker-socket-proxy`（compose で定義） |
+| `sfsp-worker` | — | ClamAV / YARA をサンドボックスで実行し、結果を各サービスへ通知（Docker 操作は `sfsp-docker-guard` → `sfsp-docker-proxy` 経由） | `backend/security/sfsp/` |
+| `sfsp-docker-guard` | 2375 | sfsp-worker 専用の Docker API の検査プロキシ。サンドボックスの作成・操作に必要なリクエストだけを、コンテナ作成の本文まで検査して通す | `backend/security/sfsp-docker-guard/` |
+| `sfsp-docker-proxy` | 2375 | Docker API プロキシ（URL とメソッドでコンテナ・イメージの API だけ許可）。届くのは `sfsp-docker-guard` だけ | `tecnativa/docker-socket-proxy`（compose で定義） |
 | `sfsp-clamav-client` / `sfsp-yara-client` | — | スキャナーのイメージをビルドするだけのサービス（ネットワーク無し。YARA ルールは `sfsp-yara-client` のイメージに焼き込まれる） | `backend/security/sfsp/docker/` |
 | `auth-db` / `app-db` / `profile-db` / `team-db` / `sfsp-db` | 5432 | PostgreSQL | 各 `init.sql` |
 | `db-role-init` | — | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを設定 | `backend/db-init/sync-role-passwords.sh` |
@@ -554,7 +555,7 @@ Nginx からは公開されておらず、各サービスからのみ呼び出�
 | ネットワーク分離 | `atmosidea-network` 以外は `internal: true`。sfsp-db は専用ネットワーク。DB・Redis・MinIO はホストに公開しない |
 | Redis | `requirepass`（`REDIS_PASSWORD`）で保護 |
 | サービス間通信の認証 | sfsp-api は `X-SFSP-API-Key`、内部 API（`/internal/...`）は `X-Internal-Key` が必須。Nginx は `/internal` を 404 にする |
-| Docker ソケットの扱い | sfsp-worker は Docker ソケットを直接マウントせず、`sfsp-docker-proxy` 経由で必要な API だけを使う |
+| Docker ソケットの扱い | sfsp-worker は Docker ソケットを直接マウントせず、`sfsp-docker-guard`（リクエスト本文まで検査）→ `sfsp-docker-proxy` 経由でサンドボックスに必要な API だけを使う。監視ダッシュボードの `mon-backend` も読み取り専用の `mon-docker-proxy`（GET/HEAD だけ）経由 |
 | 秘密情報の配布 | `.env` はイメージに焼き込まない（`.dockerignore` で除外）。各コンテナには、そのサービスが使う環境変数だけを compose の `environment:` で渡す（`env_file` は使わない） |
 | アップロードの上限 | 各 API でサイズ上限（超過は 413）、zip の展開にも件数・サイズ・圧縮率などの上限（zip bomb 対策） |
 | 監視ダッシュボード | HTTP Basic 認証（`MONITOR_USERNAME` / `MONITOR_PASSWORD`）。127.0.0.1 のみに公開し、許可外のホスト・Origin のリクエストを拒否 |

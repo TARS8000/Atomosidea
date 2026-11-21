@@ -21,7 +21,8 @@ services:
   # （/_ping、/containers の一覧・inspect・stats・logs、/volumes の一覧）だけを通す。
   # POST=0 なので GET/HEAD 以外（コンテナの作成・exec・restart・stop・削除など）はすべて 403。ここに届くのは mon-backend だけ（mon-docker-net）。
   # 残る読み取り：/containers の GET はすべて通る（inspect の環境変数＝DB や MinIO の資格情報。mon-backend は MinIO の資格情報を
-  # ここから読むので、もともと必要）・ログ・archive / export でのファイルの読み取りなど）。書き込みはできない
+  # ここから読むので、もともと必要）・ログ・archive / export でのファイルの読み取りなど）。
+  # GET の /containers/{id}/attach/ws（WebSocket）も通るので、stdin_open のコンテナがあればその標準入力には書き込める（今は無い）
   mon-docker-proxy:
     image: tecnativa/docker-socket-proxy:0.3.0 # ルートの docker-compose.yml の sfsp-docker-proxy と同じ版
     container_name: mon-docker-proxy

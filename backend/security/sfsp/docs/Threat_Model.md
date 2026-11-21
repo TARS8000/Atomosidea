@@ -5,7 +5,7 @@ This document outlines the threat model for the Secure File Scanning Platform (S
 ## 1. System Overview
 
 - **Purpose**: To scan untrusted files in an isolated environment.
-- **Key Components**: API (`sfsp-api`), Worker (`sfsp-worker`), Scanners (ClamAV, YARA), Sandbox (Docker), Docker API proxy (`sfsp-docker-proxy`), Queue (Redis), Database (PostgreSQL, `sfsp-db`), Storage (MinIO).
+- **Key Components**: API (`sfsp-api`), Worker (`sfsp-worker`), Scanners (ClamAV, YARA), Sandbox (Docker), Docker API request filter (`sfsp-docker-guard`), Docker API proxy (`sfsp-docker-proxy`), Queue (Redis), Database (PostgreSQL, `sfsp-db`), Storage (MinIO).
 
 ## 2. Security Objectives
 

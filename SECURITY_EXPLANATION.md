@@ -136,7 +136,7 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 *   **読み取り専用マウント (`:ro`)**: スキャン対象のファイルは、名前付きボリューム `sfsp_temp_scan` を `/scan_target` に読み取り専用でマウントして渡し、スキャナーが元のファイルを変更することを防ぎます。
 *   **リソース制限**: コンテナにはメモリ（1.5GB）・CPU（1CPU）・プロセス数（PID 256）の制限と30分のタイムアウトが課され、リソースを過剰に消費する攻撃（ZIP爆弾などのDoS攻撃）やハングからシステム全体を保護します。これとは別に、`sfsp-worker` コンテナ自体にもメモリ2GBの制限があります。
 *   **スキャナーを直接 Entrypoint として実行**: イメージ側の初期化スクリプト（`/init`）は `chown` などを行い、`CapDrop: ALL` の下では失敗するため通さず、スキャナーのコマンドを直接実行します。判定は終了コードで行います。
-*   **Docker APIの経路**: `sfsp-worker` は `docker.sock` も `.env` も直接マウントしません。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy`（`tecnativa/docker-socket-proxy`）を経由し、コンテナとイメージに関するAPIだけを許可しています。ただしプロキシはリクエスト本文（`Privileged` や `Binds` など）を検査しないため、`sfsp-worker` が乗っ取られた場合の攻撃面を減らすものであり、完全な隔離ではありません（`EditAI.md` 15.4）。
+*   **Docker APIの経路**: `sfsp-worker` は `docker.sock` も `.env` も直接マウントしません。`DOCKER_HOST=tcp://sfsp-docker-guard:2375` で `sfsp-docker-guard` を経由し、そこから `sfsp-docker-proxy`（`tecnativa/docker-socket-proxy`）に届きます。プロキシは URL とメソッドでしか絞れないため、`sfsp-docker-guard`（`backend/security/sfsp-docker-guard`）が `internal/sandbox/docker.go` の送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直します（`Privileged`・ホストのパスのバインド・`CapAdd`・ホストの名前空間・許可外のイメージ・exec・pull・サンドボックス以外のコンテナの操作などは 403。資源の上限は `docker.go` と同じ値ちょうど、`/tmp` は noexec、同時に動くサンドボックスは 2 つまで）。`sfsp-worker` は `sfsp-docker-proxy` に直接つながっていません。
 
 ### 3.2. アプリケーションの脆弱性対策
 
@@ -153,10 +153,10 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 *   **環境変数の管理:** データベースのパスワード、JWTの秘密鍵、外部APIキーなどの機密情報は、すべて`.env`ファイルで管理されます。このファイルは`.gitignore`に含まれており、Gitリポジトリにコミットされることはありません。DBロールのパスワードはSQLに書かず、`db-role-init` が `.env` の値で `ALTER ROLE` します。なお `.env.example` の値は公開済みなので、本番では必ず変更してください。`.env` はDockerイメージに入れません（Dockerfileはコピーせず、`.dockerignore` が `.env` / `.env.*` を除外します）。各コンテナには `.env` 全体ではなく、`docker-compose.yml` の `environment:` に書いた、そのサービスが使う変数だけが渡ります（`env_file` は使いません）。例えば `INTERNAL_API_KEY` は auth-service・profile-service・team-service だけ、`SFSP_API_KEY` は sfsp-api とそれを呼ぶサービスだけが持ちます。ただし app-db などはアプリ用ロールが無く、多くのサービスが `POSTGRES_USER` / `POSTGRES_PASSWORD`（スーパーユーザー）で接続している点は残っています（`EditAI.md` 15.4）。
 *   **Dockerセキュリティ:**
     *   **最小イメージの利用:** 各サービスのDockerイメージは、`alpine`などの軽量なベースイメージを基に構築され、攻撃対象領域を削減しています。
-    *   **ネットワーク分離:** 外向き通信ができるのは `atmosidea-network` だけです。それ以外の `backend-db-network`（アプリ用DB群）、`sfsp-isolated-net`（Redis・MinIO・`sfsp-api`・アップロードAPI/ワーカー）、`sfsp-db-network`（`sfsp-db` 専用）、`sfsp-docker-net`（`sfsp-docker-proxy` 専用）は `internal: true` で、外へ出られません。ホストに公開しているポートは `frontend` の `3001:80` だけで、データベース・Redis・MinIOのポートは公開されていません。
+    *   **ネットワーク分離:** 外向き通信ができるのは `atmosidea-network` だけです。それ以外の `backend-db-network`（アプリ用DB群）、`sfsp-isolated-net`（Redis・MinIO・`sfsp-api`・アップロードAPI/ワーカー）、`sfsp-db-network`（`sfsp-db` 専用）、`sfsp-docker-guard-net`（`sfsp-worker` と `sfsp-docker-guard` のみ）、`sfsp-docker-net`（`sfsp-docker-guard` と `sfsp-docker-proxy` のみ）、監視側の `mon-docker-net`（`mon-backend` と `mon-docker-proxy` のみ）は `internal: true` で、外へ出られません。ホストに公開しているポートは `frontend` の `3001:80` だけで、データベース・Redis・MinIOのポートは公開されていません。
     *   **Redisの認証:** Redisは `requirepass`（`REDIS_PASSWORD`）で保護しており、`.env` に値が無いと `docker compose` がエラーにします。同じネットワークのコンテナが、パスワード無しでスキャン完了イベントを偽造することはできません。
     *   **サービス間の認証（Zero Trust）:** `sfsp-api` の `/api/v1/*` は `X-SFSP-API-Key`、内部API（`/internal/*`）は `X-Internal-Key` が無いとアクセスできません。
-    *   **監視ダッシュボード:** 別のcomposeで起動し、`127.0.0.1:8090`（ループバック）にだけ公開します。全ルートでHTTP Basic認証を必須とし、Host・Originの確認も行います。コンテナの再起動APIは持たず、操作できるのはMinIOのオブジェクト（アップロード・削除）だけです。
+    *   **監視ダッシュボード:** 別のcomposeで起動し、`127.0.0.1:8090`（ループバック）にだけ公開します。全ルートでHTTP Basic認証を必須とし、Host・Originの確認も行います。コンテナの再起動APIは持たず、操作できるのはMinIOのオブジェクト（アップロード・削除）だけです。`mon-backend` は `docker.sock` をマウントせず、読み取り専用の `mon-docker-proxy`（`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけ）経由で Docker を参照します。ただし `/containers` の GET はすべて通るので、`mon-backend` が乗っ取られると、各コンテナの inspect（環境変数の資格情報を含む）・ログ・archive / export によるファイルの読み取りはできます。またGET の `/containers/{id}/attach/ws`（WebSocket）も通るので、標準入力を開いた（`stdin_open: true` の）コンテナがあれば、その標準入力に書き込めてしまう（今の compose にそのようなコンテナは無い）。
 
 ---
 
@@ -164,9 +164,9 @@ JWTをURLに載せません。`auth-service` は、Cookieに保存した `state`
 
 このプロジェクトのセキュリティは、各コンポーネントの密な連携の上に成り立っています。変更を加える際は、以下の点を特に意識してください。
 
-*   **サンドボックス設定の変更は慎重に:** `backend/security/sfsp/internal/sandbox/docker.go`内のネットワーク遮断（`NetworkMode: none`）、`CapDrop`、リソース制限は、SFSPの安全性の根幹です。`sfsp-docker-proxy` の許可範囲を広げることも同様です。安易な変更は深刻な脆弱性を生む可能性があります。
+*   **サンドボックス設定の変更は慎重に:** `backend/security/sfsp/internal/sandbox/docker.go`内のネットワーク遮断（`NetworkMode: none`）、`CapDrop`、リソース制限は、SFSPの安全性の根幹です。`sfsp-docker-guard` の許可リスト（`backend/security/sfsp-docker-guard/main.go`）や `sfsp-docker-proxy` の許可範囲を広げることも同様です。`docker.go` のコンテナ設定や Docker API の呼び方を変えたら、`sfsp-docker-guard` も合わせて直してください（資源の上限が食い違うと `go test` の `TestLimitsMatchSandboxDockerGo` が落ちます）。安易な変更は深刻な脆弱性を生む可能性があります。
 *   **サービス間契約の遵守:** Redisのキュー名やイベントのJSON構造、APIのレスポンス形式などは、サービス間の「契約」です。変更する場合は、関連するすべてのサービスで整合性を取る必要があります。イベント（`backend/shared/event`）とモデル（`backend/shared/model`）はSFSPも同じものを使いますが、`sfsp:scan_queue` の名前と信頼性キューの操作は `backend/shared/queue` と SFSP の `internal/queue` に二重にあるため、両方を直してください。完了イベントは `DequeueReliable` で取り出し、終端状態を記録してから `Ack` します（`BRPOP` は使いません）。
 *   **機密情報の取り扱い:** 新しい秘密鍵やAPIキーを追加する場合は、必ず`.env`ファイルで管理し、コード内にハードコーディングしないでください。使うサービスの `environment:` にだけ追加し、Dockerfileで `.env` をコピーしたり `env_file` で全体を渡したりしないでください。ドキュメントにも実際の値を書かないでください。
-*   **既知の未対応事項の確認:** 認可の無いMinIO直接配信（Nginxから配信するHLS・サムネイル・サブドメイン）や、`sfsp-docker-proxy` がリクエスト本文を検査しない点など、まだ残っている問題は `EditAI.md` の15.4にまとまっています。関連する箇所を変更するときは確認してください。
+*   **既知の未対応事項の確認:** 認可の無いMinIO直接配信（Nginxから配信するHLS・サムネイル・サブドメイン）など、まだ残っている問題は `EditAI.md` の15.4にまとまっています。関連する箇所を変更するときは確認してください。
 
 このドキュメントが、Atomosideaのセキュリティを維持し、さらに強化していく上での一助となることを願っています。

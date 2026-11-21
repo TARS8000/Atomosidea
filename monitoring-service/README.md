@@ -14,7 +14,7 @@
 |---|---|---|
 | `mon-nginx` | `nginx:alpine` | `127.0.0.1:8090`→80。静的フロントを`auth_request`による認証付きで配信し、`/api/`（REST のみ）と`/ws`（WebSocket の Upgrade ヘッダーを転送）を`mon-backend:8080`へプロキシ。`client_max_body_size 32m`（MinIO へのアップロード用。既定の 1MB だと 413 になる） |
 | `mon-backend` | `golang:1.25-alpine`（マルチステージビルド） | `mon-docker-proxy` 経由でコンテナ一覧・統計・MinIO操作・WebSocketログストリーミングを提供。全ルートでHost/Origin検証とHTTP Basic認証を行う。内部ポート8080 |
-| `mon-docker-proxy` | `tecnativa/docker-socket-proxy:0.3.0` | `mon-backend` 専用の読み取り専用 Docker API プロキシ（`docker.sock` を `:ro` でマウントするのはこれだけ）。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけを通し、`POST=0`（コンテナの作成・exec・restart・stop・削除などは 403）。ログの追従が切れないよう HAProxy のタイムアウトを 24 時間にしている |
+| `mon-docker-proxy` | `tecnativa/docker-socket-proxy:0.3.0` | `mon-backend` 専用の読み取り専用 Docker API プロキシ（`docker.sock` を `:ro` でマウントするのはこれだけ）。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけを通し、`POST=0`（コンテナの作成・exec・restart・stop・削除などは 403）。ただし `/containers` の GET はすべて通るので、inspect（環境変数）・ログ・archive / export でのファイルの読み取りはでき、GET の `/containers/{id}/attach/ws`（WebSocket）も通るので、標準入力を開いた（`stdin_open: true` の）コンテナがあれば、その標準入力に書き込めてしまう（今の compose にそのようなコンテナは無い）。ログの追従が切れないよう HAProxy のタイムアウトを 24 時間にしている |
 | `mon-frontend`（コンテナ名`mon-frontend-builder`） | `node:20-alpine` | `npm run build`で`./frontend/dist`へ出力して終了（ビルド専用、稼働しない） |
 
 ### 依存関係
@@ -210,7 +210,7 @@ monitoring-service/
 ## 補足
 
 - 監視サービスは任意サービス。メインのフロントエンド（`http://localhost:3001`）とは独立して起動する（ただし、メインのスタックが作成するネットワークに接続する）。
-- Dockerソケットへの直接アクセスとMinIOへの直接書き込みを含むため、開発・運用環境向けの機能。ホストのループバックのみに公開し、HTTP Basic認証とHost/Origin検証で保護しているが、インターネットへの公開は想定していない。なお、ソケットを`:ro`でマウントしても Docker API の操作自体は制限されない（読み取り専用になるのはソケットファイルだけ）。
+- Docker API の参照（`mon-docker-proxy` 経由）とMinIOへの直接書き込みを含むため、開発・運用環境向けの機能。ホストのループバックのみに公開し、HTTP Basic認証とHost/Origin検証で保護しているが、インターネットへの公開は想定していない。なお、ソケットを`:ro`でマウントしても Docker API の操作自体は制限されない（読み取り専用になるのはソケットファイルだけ）ため、`mon-backend` にはソケットをマウントせず、GET/HEAD だけを通す `mon-docker-proxy` を使っている（`/containers` の GET は全部通る点は上のとおり）。
 - 画面は以前、コンテナをカードでグリッドに並べ、ネットワークの共有から接続線を引くレイヤーマップだった。カードや見出しの重なり、他プロジェクトのコンテナによる横幅の増加、ほぼ全ペアを結ぶ接続線で読みにくかったため、ツリー＋詳細ペインに置き換えた。
 - エラー検出閾値（10秒間に5件）とerrorキーワード一覧は`frontend/src/App.jsx`だけにある（以前`backend/main.go`にあった`errorKeywords` / `isError`は画面の判定に使われていなかったため削除した。バックエンドは本文をそのまま送るだけ）。
 - mon-backend は CORS ヘッダーを返さず、OPTIONS（プリフライト）も扱わない（UI は同じ mon-nginx から配信される同一オリジン）。

@@ -840,10 +840,10 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 - `CapDrop: ALL` の下では clamav/clamav イメージの `/init`（chown を行う）が失敗する。Entrypoint を元に戻すとスキャン前に終了コード 1 で落ち、全ファイルが判定不能になる。
 - ウイルス定義は `sfsp-clamav-client` のビルド時に `freshclam` で更新する。サンドボックスはネットワークが無いので実行時には更新できない。定義を新しくするには `docker compose build --pull sfsp-clamav-client`。
 - sfsp-api と sfsp-worker は非 root（uid/gid 10001）で動く（`docker/api/Dockerfile`、`docker/worker/Dockerfile` の `USER 10001:10001`）。スキャン用ディレクトリ `/tmp/sfsp-scan` は 0755・10001 所有で、サンドボックスのスキャナー（`CapDrop: ALL`）が読めるようにしてある。既存の `sfsp_temp_scan` ボリュームは `sfsp-scan-volume-init` が毎回 chown する。
-- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-proxy:2375` で `sfsp-docker-proxy` 経由でサンドボックスを起動し（Docker SDK を使うので worker イメージに docker-cli は入っていない）、設定は compose の environment で明示的に渡す。`SFSP_CLAMAV_*` と `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` も `${VAR:-既定値}` の形で渡しているので、`.env` に書けば上書きできる（既定値は `internal/config/config.go` と同じ。`.env.example` にコメントアウトして列挙）。
+- sfsp-worker は Docker ソケットも `.env` もマウントしない。`DOCKER_HOST=tcp://sfsp-docker-guard:2375` で `sfsp-docker-guard` → `sfsp-docker-proxy` 経由でサンドボックスを起動し（Docker SDK を使うので worker イメージに docker-cli は入っていない）、設定は compose の environment で明示的に渡す。`SFSP_CLAMAV_*` と `SFSP_MAX_EXTRACTED_BYTES` / `SFSP_MAX_ZIP_*` も `${VAR:-既定値}` の形で渡しているので、`.env` に書けば上書きできる（既定値は `internal/config/config.go` と同じ。`.env.example` にコメントアウトして列挙）。
 - YARA ルールは `sfsp-yara-client` イメージの `/etc/yara-rules` に焼き込まれており、sfsp-worker 自身は読まない（worker イメージに yara は無く、`yara-rules` のマウントも 2026-10-29 に外した）。ルールを変えたら `docker compose build sfsp-yara-client`。
 - 使う Docker API: `_ping`、`GET /images/{name}/json`、`POST /containers/create`、`start`、`wait`、`logs`、`DELETE /containers/{name}`。イメージの pull はしない（ローカルに無ければ `failed`）。
-- プロキシはリクエスト本文（Privileged・Binds 等）を検査しないので、完全な隔離ではない（[15 章](#15-既知の問題未対応)）。
+- `sfsp-docker-proxy` はリクエスト本文（Privileged・Binds 等）を検査しないので、`sfsp-docker-guard`（`backend/security/sfsp-docker-guard`）が上の API だけを通し、コンテナ作成の本文を許可リストで作り直す（資源の上限は上の表の値ちょうど、`/tmp` は noexec に固定、同時に動くサンドボックスは 2 つまで）。上の設定や呼ぶ API を変えたら `sfsp-docker-guard` も直す。
 
 ### 12.3. ユーザーのコンテンツの配信
 
