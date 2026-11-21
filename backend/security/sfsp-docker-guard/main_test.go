@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -34,7 +35,9 @@ type fakeDocker struct {
 	createBody []byte
 	// GET /containers/json が返すコンテナ（作成のたびに State: created で 1 つ足す）
 	listed    []fakeContainer
-	listError bool // GET /containers/json を 500 にする
+	listError bool          // GET /containers/json を 500 にする
+	listDelay time.Duration // GET /containers/json の返事を遅らせる（上流が固まったとき）
+	onStart   func(*fakeDocker)
 	created   int
 }
 
@@ -59,6 +62,13 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(p, "/_ping"):
 		w.Write([]byte("OK"))
 	case strings.HasSuffix(p, "/containers/json"):
+		if f.listDelay > 0 {
+			select {
+			case <-time.After(f.listDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if f.listError {
@@ -85,6 +95,13 @@ func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(p, "/json") && strings.Contains(p, "/containers/"):
 		w.WriteHeader(404)
 		w.Write([]byte(`{"message":"No such container"}`))
+	case strings.HasSuffix(p, "/start"):
+		f.mu.Lock()
+		if f.onStart != nil {
+			f.onStart(f)
+		}
+		f.mu.Unlock()
+		w.WriteHeader(200) // 既存のテストに合わせて 200（本物の Docker は 204）
 	case strings.HasSuffix(p, "/wait"):
 		w.Write([]byte(`{"StatusCode":0}`))
 	default:
@@ -438,7 +455,7 @@ func TestTmpfsOptionsForced(t *testing.T) {
 			t.Errorf("%q: forwarded %q, want %q", in, got.HostConfig.Tmpfs, want)
 		}
 	}
-	for _, s := range []string{"1g", "513m", "536870913", "1G", "50%", "", "m", "-1"} {
+	for _, s := range []string{"1g", "513m", "536870913", "1G", "50%", "", "m", "-1", "999999999999g", "999999999999k", "999999999999"} {
 		if _, err := safeTmpfsOpts("size=" + s); err == nil {
 			t.Errorf("size=%s accepted", s)
 		}
@@ -456,8 +473,10 @@ func TestCreateSandboxLimit(t *testing.T) {
 	}{
 		{"none", nil, 201},
 		{"one orphan running", []fakeContainer{running}, 201},
-		{"two running", []fakeContainer{running, sandboxIn("created")}, 403},
+		{"two running", []fakeContainer{running, running}, 403},
 		{"paused and restarting count", []fakeContainer{sandboxIn("paused"), sandboxIn("restarting")}, 403},
+		// 作っただけ（created）の残りはスキャンを止めない（start のときに数える）
+		{"created leftovers do not count as running", []fakeContainer{sandboxIn("created"), sandboxIn("created"), running}, 201},
 		{"exited do not count as running", []fakeContainer{exited, exited, exited, sandboxIn("dead")}, 201},
 		{"total limit", repeat(exited, defaultMaxSandboxes), 403},
 		{"below total limit", repeat(exited, defaultMaxSandboxes-1), 201},
@@ -494,13 +513,15 @@ func TestCreateSandboxLimit(t *testing.T) {
 	}
 }
 
-// 同時に来た作成も、数えてから作るまでを直列にするので上限を超えない
+// 同時に来た作成も、数えてから作るまでを直列にするので上限（停止済みを含めた数）を超えない。
+// created は「動いている」に数えないので、作成を止めるのは maxTotal（動かすのを止めるのは start の検査）
 func TestCreateSandboxLimitConcurrent(t *testing.T) {
 	f, srv := setup(t)
 	var wg sync.WaitGroup
-	codes := make(chan int, 20)
+	n := defaultMaxSandboxes + 8
+	codes := make(chan int, n)
 	body := marshal(t, realCreate(t))
-	for i := 0; i < 20; i++ {
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -519,8 +540,75 @@ func TestCreateSandboxLimitConcurrent(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if ok != defaultMaxActiveSandboxes || f.created != defaultMaxActiveSandboxes {
-		t.Errorf("created %d (forwarded %d), want %d", ok, f.created, defaultMaxActiveSandboxes)
+	if ok != defaultMaxSandboxes || f.created != defaultMaxSandboxes {
+		t.Errorf("created %d (forwarded %d), want %d", ok, f.created, defaultMaxSandboxes)
+	}
+}
+
+// 同時に来た start も直列にするので、動いているものは maxActive を超えない
+func TestStartSandboxLimitConcurrent(t *testing.T) {
+	f, srv := setup(t)
+	// 作っただけのサンドボックスが 10 個。start されたら running にする
+	for i := 0; i < 10; i++ {
+		f.listed = append(f.listed, fakeContainer{ID: sandboxID, State: "created", Labels: map[string]string{"app": "sfsp-sandbox"}})
+	}
+	f.onStart = func(f *fakeDocker) { // f.mu を持って呼ばれる
+		for i := range f.listed {
+			if f.listed[i].State == "created" {
+				f.listed[i].State = "running"
+				f.listed[i].ID = fmt.Sprintf("%064x", i+100) // start した当のコンテナとは別のものとして数えさせる
+				return
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	codes := make(chan int, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- do(t, srv, "POST", "/v1.51/containers/"+sandboxID+"/start", "").StatusCode
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	ok := 0
+	for c := range codes {
+		if c == 200 {
+			ok++
+		} else if c != 403 {
+			t.Errorf("got %d", c)
+		}
+	}
+	if ok != defaultMaxActiveSandboxes {
+		t.Errorf("started %d, want %d", ok, defaultMaxActiveSandboxes)
+	}
+}
+
+// 上流が固まっても、数える問い合わせは countTimeout で諦めて 502 を返し、ロックを持ち続けない
+func TestCountSandboxesTimeout(t *testing.T) {
+	f := &fakeDocker{listDelay: 2 * time.Second}
+	up := httptest.NewServer(f)
+	t.Cleanup(up.Close)
+	g, err := newGuard(up.URL, []string{"sfsp-clamav-client:latest", "sfsp-yara-client:latest"}, "sfsp_temp_scan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.countTimeout = 100 * time.Millisecond
+	srv := httptest.NewServer(g)
+	t.Cleanup(srv.Close)
+	start := time.Now()
+	if resp := do(t, srv, "POST", "/v1.51/containers/create?name="+sbName, marshal(t, realCreate(t))); resp.StatusCode != 502 {
+		t.Errorf("got %d, want 502", resp.StatusCode)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %v, want about countTimeout", d)
+	}
+	f.mu.Lock()
+	created := f.created
+	f.mu.Unlock()
+	if created != 0 {
+		t.Errorf("forwarded create after timeout")
 	}
 }
 

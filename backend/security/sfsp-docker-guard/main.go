@@ -30,8 +30,11 @@
 // /tmp の tmpfs は、送られたオプションによらず rw,noexec,nosuid,nodev,size=<上限以下> で作り直す。
 //
 // サンドボックスの数にも上限がある（DoS 対策）。作成と start の前に、ラベル app=sfsp-sandbox のコンテナを上流で数え、
-// 動いている（exited・dead 以外の）ものが SFSP_GUARD_MAX_ACTIVE_SANDBOXES（既定 2）以上、
+// 動いている（running・paused・restarting の）ものが SFSP_GUARD_MAX_ACTIVE_SANDBOXES（既定 2）以上、
 // または停止済みを含めて SFSP_GUARD_MAX_SANDBOXES（既定 32）以上なら 403 にする。
+// created（作っただけで start していない）は資源を使わないので「動いている」には数えない。sfsp-worker が create と start の
+// 間で落ちて created が残っても、それだけでスキャンが止まらないようにするため。動かすには start が要り、start の前にも数える。
+// 数える問い合わせには countTimeout（30 秒）を付け、上流が固まってもロックを持ち続けないようにする。
 // sfsp-worker は 1 つだけで、ジョブを 1 つずつ処理し、ClamAV → YARA の順にサンドボックスを 1 つずつ動かして毎回消す
 // （internal/worker/worker.go の StartWorker・processJob。同時に動くのは 1 つ）ので、2 は 2 倍の余裕
 // （sfsp-worker が落ちて動いたまま残ったものが 1 つあっても止まらない）。
@@ -48,6 +51,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -143,8 +147,9 @@ type guard struct {
 	images   map[string]bool // サンドボックスに使ってよいイメージ
 	scanBind string          // 唯一許すバインド（"<スキャン用の名前付きボリューム>:/scan_target:ro"）
 
-	maxActive int // 同時に動いて（exited・dead 以外で）よいサンドボックスの数
-	maxTotal  int // 停止済みを含めて存在してよいサンドボックスの数
+	maxActive    int           // 同時に動いて（running・paused・restarting で）よいサンドボックスの数
+	maxTotal     int           // 停止済みを含めて存在してよいサンドボックスの数
+	countTimeout time.Duration // サンドボックスを数える問い合わせのタイムアウト
 	// 数えてから作る・start するまでを直列にする（先頭のコメントを参照）
 	limitMu sync.Mutex
 }
@@ -159,11 +164,12 @@ func newGuard(upstream string, images []string, scanVolume string) (*guard, erro
 		return nil, fmt.Errorf("scan volume must be a named volume: %q", scanVolume)
 	}
 	g := &guard{
-		upstream:  u,
-		images:    map[string]bool{},
-		scanBind:  scanVolume + ":" + scanTarget + ":ro",
-		maxActive: defaultMaxActiveSandboxes,
-		maxTotal:  defaultMaxSandboxes,
+		upstream:     u,
+		images:       map[string]bool{},
+		scanBind:     scanVolume + ":" + scanTarget + ":ro",
+		maxActive:    defaultMaxActiveSandboxes,
+		maxTotal:     defaultMaxSandboxes,
+		countTimeout: 30 * time.Second,
 		client: &http.Client{
 			// ContainerWait はスキャンが終わるまで（最長 30 分）返らないので、全体のタイムアウトは付けない。
 			// 呼び出し元が切断すると r.Context() が取り消され、上流へのリクエストも止まる
@@ -276,8 +282,10 @@ func (g *guard) checkSandboxCount(w http.ResponseWriter, r *http.Request, versio
 }
 
 // countSandboxes は上流の GET /containers/json?all=1&filters={"label":["app=sfsp-sandbox"]} でサンドボックスを数え、
-// 動いている（exited・dead 以外の）数と、停止済みを含めた数を返す
+// 動いている（running・paused・restarting の）数と、停止済みを含めた数を返す
 func (g *guard) countSandboxes(ctx context.Context, version, exclude string) (active, total int, err error) {
+	ctx, cancel := context.WithTimeout(ctx, g.countTimeout)
+	defer cancel()
 	filters, _ := json.Marshal(map[string][]string{"label": {sandboxLabelKey + "=" + sandboxLabelValue}})
 	u := *g.upstream
 	u.Path = version + "/containers/json"
@@ -308,7 +316,8 @@ func (g *guard) countSandboxes(ctx context.Context, version, exclude string) (ac
 			continue
 		}
 		total++
-		if c.State != "exited" && c.State != "dead" {
+		switch c.State {
+		case "running", "paused", "restarting":
 			active++
 		}
 	}
@@ -492,15 +501,12 @@ func parseTmpfsSize(v string) (int64, error) {
 		return 0, fmt.Errorf("tmpfs size %q is not allowed", v)
 	}
 	n, _ := strconv.ParseInt(m[1], 10, 64)
-	switch strings.ToLower(m[2]) {
-	case "k":
-		n <<= 10
-	case "m":
-		n <<= 20
-	case "g":
-		n <<= 30
+	shift := map[string]uint{"": 0, "k": 10, "m": 20, "g": 30}[strings.ToLower(m[2])]
+	// ずらす前に確かめる（12 桁の g などで int64 があふれないように）
+	if n > math.MaxInt64>>shift {
+		return 0, fmt.Errorf("tmpfs size %q is too large", v)
 	}
-	return n, nil
+	return n << shift, nil
 }
 
 func sandboxLabels(v any) (map[string]string, error) {
