@@ -150,7 +150,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `backend-db-network`（`internal: true`） | auth-db, app-db, profile-db, team-db, db-role-init, auth-service, profile-service, team-service, mypage-service, 各アップロード API / ワーカー, sfsp-worker（app-db 用） |
 | `sfsp-isolated-net`（`internal: true`） | redis, minio, minio-init, 各アップロード API / ワーカー, profile-service, sfsp-api, sfsp-worker |
 | `sfsp-db-network`（`internal: true`） | sfsp-db, sfsp-api, sfsp-worker のみ |
-| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy, sfsp-worker のみ |
+| `sfsp-docker-guard-net`（`internal: true`） | sfsp-docker-guard, sfsp-worker のみ |
+| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy, sfsp-docker-guard のみ |
 
 - `internal: true` のネットワークは外へ出られない。Google OAuth など外部通信が必要なサービスは `atmosidea-network` にも参加させる。
 - ネットワーク定義を変えた後は `docker compose down` → `up -d` で作り直す必要がある（そのままだと「network needs to be recreated」で失敗する）。
@@ -193,7 +194,8 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 | `sfsp-clamav-client` | sfsp-clamav-client-builder | — | `backend/security/sfsp/docker/clamav-client/` | ClamAV イメージ（`sfsp-clamav-client:latest`）のビルド専用（`network_mode: none`。echo して終了） |
 | `sfsp-yara-client` | sfsp-yara-client-builder | — | `backend/security/sfsp/docker/yara-client/` | YARA イメージ（`sfsp-yara-client:latest`）のビルド専用（`network_mode: none`）。YARA ルール（`backend/security/sfsp/yara-rules/`）はこのイメージの `/etc/yara-rules` に焼き込まれる |
 | `sfsp-scan-volume-init` | sfsp-scan-volume-init | — | docker-compose.yml（`sfsp-yara-client` イメージを root で一時利用） | 起動のたびに 1 回だけ動き、スキャン用ボリューム `sfsp_temp_scan` の所有者を 10001 に揃える（非 root 化前に作られた既存ボリューム用）。`CHOWN` / `FOWNER` / `DAC_READ_SEARCH` のみ許可、ネットワークなし、読み取り専用ルート。`sfsp-worker` はこの完了を待つ |
-| `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | sfsp-worker 用の Docker API プロキシ。`CONTAINERS` / `IMAGES` / `POST` / `PING` / `VERSION` のみ許可 |
+| `sfsp-docker-guard` | sfsp-docker-guard | 2375 | `backend/security/sfsp-docker-guard/` | sfsp-worker と sfsp-docker-proxy の間の検査プロキシ（Go 標準ライブラリのみ）。`internal/sandbox/docker.go` が送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す。許可するイメージ・スキャン用ボリュームは `SFSP_GUARD_ALLOWED_IMAGES` / `SFSP_GUARD_SCAN_VOLUME` |
+| `sfsp-docker-proxy` | sfsp-docker-proxy | 2375 | `tecnativa/docker-socket-proxy`（compose で定義） | Docker API プロキシ（届くのは sfsp-docker-guard だけ）。`CONTAINERS` / `IMAGES` / `POST` / `PING` のみ許可 |
 | `db-role-init` | atmosidea-db-role-init | — | `backend/db-init/sync-role-passwords.sh` | 起動のたびに 1 回だけ動き、`.env` の値で DB ロールのパスワードを `ALTER ROLE` する |
 | `auth-db` ほか DB | atmosidea-*-db / sfsp-db | 5432 | 各 `init.sql` | [5 章](#5-データベース) |
 | `redis` | atmosidea-redis | 6379 | — | [7 章](#7-redis-と共有パッケージshared) |
@@ -995,7 +997,7 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 | 重大度 | 問題 | 場所 |
 |---|---|---|
 | High | Nginx が MinIO に直接プロキシする経路（HLS `/api/videos/<id>/stream/*`、`/videos\|games\|static-sites/thumbnails/*`、サブドメイン `<id>.localhost`）に認可が無い。チーム限定・処理中のコンテンツも ID が分かれば取得できる（隔離済みファイルは公開バケットに置かれないので対象外）。`<img>`・hls.js・サブドメインには JWT が届かないため、署名付き URL か Cookie など別の仕組みが要る | `frontend/nginx.conf`、各バケットの匿名読み取りポリシー（game-worker の `ensureBucket` を含む。※ `ensureBucket` は 2026-10-29 に削除。現在は `minio-init` と profile-service の起動時処理が設定する） |
-| Medium | `sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる | `docker-compose.yml` |
+| Medium | ~~`sfsp-docker-proxy` はリクエスト本文を検査しないため、sfsp-worker が乗っ取られると Privileged コンテナやホストのマウントを作れる~~ **対応済み（2026-11-21）**: sfsp-worker と sfsp-docker-proxy の間に `sfsp-docker-guard` を置き、サンドボックスに必要なリクエストだけを本文まで検査して通す。sfsp-worker は sfsp-docker-proxy に直接つながらない | `docker-compose.yml`、`backend/security/sfsp-docker-guard/` |
 | Medium | ~~多くの Dockerfile が `COPY --from=builder /app/.env ./.env` で `.env` をイメージに焼き込み、アプリ側サービスは `env_file: .env` で全サービスの秘密情報を受け取っている~~ **対応済み（2026-10-29）**: Dockerfile は `.env` をコピーせず、`.dockerignore` で `.env` / `.env.*` を除外。`env_file` を全サービスから削除し、各サービスはコードが読む変数だけを `environment:` で受け取る。**ただし DB の資格情報は下の「スーパーユーザー」の行のとおり残っている**（`.env` を含んでいた古いイメージは削除済み。今後 `docker compose build` で作るイメージには `.env` が入らない） | 各 `Dockerfile`、`docker-compose.yml`、`.dockerignore` |
 | Medium | `POSTGRES_PASSWORD` と MinIO の各キーは `.env.example` で公開済みの値のまま。変更するにはボリュームの作り直しが必要 | `.env` |
 | Low | Redis に job ID が無いまま `running` で止まった過去のスキャンジョブは回収されない | sfsp-worker |

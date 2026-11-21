@@ -123,7 +123,7 @@ docker compose --env-file ../.env -f docker-compose.monitoring.yml up -d --build
 | Frontend | `frontend` または `-frontend` で終わる | `frontend` |
 | Upload | `upload-api` で終わる | `game-upload-api` |
 | API | `-service` で終わる | `auth-service` / `profile-service` / `team-service` / `mypage-service` |
-| Init/Infra | `-init` で終わる、または `docker-proxy` を含む | `db-role-init` / `minio-init` / `sfsp-docker-proxy` |
+| Init/Infra | `-init` で終わる、または `docker-proxy` / `docker-guard` を含む | `db-role-init` / `minio-init` / `sfsp-docker-proxy` / `sfsp-docker-guard` |
 | Worker | `-worker` で終わる、`sfsp-api`、`clamav` / `yara` を含む | `game-worker` / `sfsp-api` / `sfsp-worker` |
 | DB/Cache | `-db` で終わる、または `redis` | `auth-db` / `app-db` / `sfsp-db` / `redis` |
 | Storage | `minio` / `storage` を含む | `minio` |

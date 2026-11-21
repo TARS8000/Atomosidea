@@ -151,6 +151,7 @@ graph LR
     subgraph SFSP[SFSP: マルウェアスキャン]
         SApi[sfsp-api]
         SWk[sfsp-worker]
+        DGuard[sfsp-docker-guard]
         DProxy[sfsp-docker-proxy]
         Sandbox[ClamAV / YARA<br/>サンドボックス]
     end
@@ -166,7 +167,7 @@ graph LR
     VUp & GUp & SUp & Profile -->|ファイル送信| SApi
     SApi -->|ジョブ| Redis
     Redis --> SWk
-    SWk -->|Docker API| DProxy --> Sandbox
+    SWk -->|Docker API| DGuard --> DProxy --> Sandbox
     SWk -->|完了イベント| Redis
     Redis --> VUp & GW & SW & Profile & VW
     API & Workers --> PG
@@ -188,7 +189,8 @@ graph LR
 | `backend-db-network`（`internal: true`） | auth-db、app-db、profile-db、team-db、db-role-init と、それを使うサービス（sfsp-worker は app-db の読み取り用） | アプリ用 DB 接続 |
 | `sfsp-isolated-net`（`internal: true`） | sfsp-api、sfsp-worker、Redis、MinIO、minio-init、各アップロード API / ワーカー、profile-service | SFSP 関連の通信 |
 | `sfsp-db-network`（`internal: true`） | sfsp-db、sfsp-api、sfsp-worker のみ | sfsp-db 専用 |
-| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy、sfsp-worker のみ | スキャナー起動用の Docker API プロキシ専用 |
+| `sfsp-docker-guard-net`（`internal: true`） | sfsp-docker-guard、sfsp-worker のみ | sfsp-worker から Docker API の検査プロキシ（sfsp-docker-guard）への接続専用 |
+| `sfsp-docker-net`（`internal: true`） | sfsp-docker-proxy、sfsp-docker-guard のみ | スキャナー起動用の Docker API プロキシ専用（sfsp-worker は直接つながない） |
 
 `internal: true` のネットワークは外部に出られません。ネットワーク定義を変えた後は `docker compose down` → `up -d` で作り直してください（そのままだと「network needs to be recreated」で失敗します）。
 ### 技術スタック

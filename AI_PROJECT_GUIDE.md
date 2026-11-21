@@ -142,7 +142,8 @@
 | `sfsp-api` | ファイル受け付け（`X-SFSP-API-Key` 必須）・`raw-files` への保存・ジョブキューイング（SHA256は記録するだけで重複排除はしない） |
 | `sfsp-worker` | zipを上限付きで展開し、ClamAV/YARAでスキャン（Docker Sandbox内） |
 | `sfsp-clamav-client` / `sfsp-yara-client` | スキャナイメージのビルド専用（起動後すぐ終了する） |
-| `sfsp-docker-proxy` | `sfsp-worker` 用のDocker APIプロキシ。`docker.sock` を直接渡さないための中継 |
+| `sfsp-docker-guard` | `sfsp-worker` と `sfsp-docker-proxy` の間に置く検査プロキシ（`backend/security/sfsp-docker-guard`）。サンドボックスの作成・操作に必要なリクエストだけを、コンテナ作成の本文まで検査して通す |
+| `sfsp-docker-proxy` | Docker APIプロキシ。`docker.sock` を直接渡さないための中継（届くのは `sfsp-docker-guard` だけ） |
 
 ### 5.4. インフラ
 | 種別 | 内容 |
@@ -230,7 +231,7 @@ upload-api ──POST /api/v1/files（X-SFSP-API-Key 付き）──▶ sfsp-api
                     （game / static-site / stream / profile / *-thumbnail など）
 ```
 
-🔑 **なぜこんなにも分離しているか:** マルウェアを処理するため、スキャンに関わるサービスを専用ネットワークに分けています。`sfsp-isolated-net`・`sfsp-db-network`・`sfsp-docker-net` はすべて `internal: true`（外向き通信なし）で、sfsp-db は sfsp-api と sfsp-worker だけ、Docker APIプロキシは sfsp-worker だけが到達できます。ただし `sfsp-isolated-net` には、スキャン依頼を出すアップロードAPI・workerや Redis・MinIO も参加しています（完全に独立した島ではありません）。スキャナーを実際に動かすサンドボックスのコンテナだけが `NetworkMode: none`（ネットワークなし）です。
+🔑 **なぜこんなにも分離しているか:** マルウェアを処理するため、スキャンに関わるサービスを専用ネットワークに分けています。`sfsp-isolated-net`・`sfsp-db-network`・`sfsp-docker-guard-net`・`sfsp-docker-net` はすべて `internal: true`（外向き通信なし）で、sfsp-db は sfsp-api と sfsp-worker だけ、Docker APIは sfsp-worker が `sfsp-docker-guard`（本文まで検査）経由でだけ使えます。ただし `sfsp-isolated-net` には、スキャン依頼を出すアップロードAPI・workerや Redis・MinIO も参加しています（完全に独立した島ではありません）。スキャナーを実際に動かすサンドボックスのコンテナだけが `NetworkMode: none`（ネットワークなし）です。
 
 ---
 
@@ -290,7 +291,7 @@ AIが変更を行う際、特に注意すべき**プロジェクト固有の制�
 
 ### 8.3. SFSPサンドボックス
 - スキャナーのコンテナは `NetworkMode: none`（ネットワークなし）、`CapDrop: ALL`、`no-new-privileges`、スキャン対象ボリュームは `:ro` マウント、リソース制限（メモリ1.5GB・CPU 1・PID 256・30分のタイムアウト。ZIP爆弾等のDoS対策）。
-- `sfsp-worker` はDockerソケットも `.env` も直接マウントせず、`sfsp-docker-proxy` 経由でサンドボックスを起動する。ただしプロキシはリクエスト本文を検査しないため、完全な隔離ではない。
+- `sfsp-worker` はDockerソケットも `.env` も直接マウントせず、`sfsp-docker-guard` → `sfsp-docker-proxy` 経由でサンドボックスを起動する。`sfsp-docker-proxy` は URL とメソッドでしか絞れないため、`sfsp-docker-guard` が `internal/sandbox/docker.go` の送るリクエストだけを通し、コンテナ作成の本文は許可した項目だけで作り直す（Privileged・ホストのパスのバインド・exec・pull・ほかのコンテナの操作などは 403）。`docker.go` のコンテナ設定や Docker API の呼び方を変えたら `sfsp-docker-guard` も合わせて直す。
 
 🔑 **AIの対応**: 認証・認可・sandbox関連を変更する際は、上記トレードオフを踏まえた上で。理解せずに変更すると脆弱性を持ち込むためです。
 

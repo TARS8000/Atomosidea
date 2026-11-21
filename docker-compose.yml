@@ -724,10 +724,10 @@ services:
       - sfsp-db-network # sfsp-db
 
   # sfsp-worker に Docker ソケットを直接渡さないためのプロキシ。
-  # サンドボックスに必要な API（/containers, /images, /_ping, /version）だけを許可し、
+  # サンドボックスに必要な API（/containers, /images, /_ping）だけを許可し、
   # /exec・volumes・networks・build・swarm・system などは拒否する。
-  # 注意: リクエスト本文（Privileged や Binds など）は検査せず、/containers/{id}/exec も CONTAINERS に含まれるため、
-  # 完全な隔離ではない（sfsp-worker が乗っ取られた場合の攻撃面を減らすためのもの）
+  # リクエスト本文（Privileged や Binds など）は検査しないので、sfsp-worker からは直接つながず、
+  # 本文まで検査する sfsp-docker-guard を間に置く。ここに届くのは sfsp-docker-guard だけ（sfsp-docker-net）
   sfsp-docker-proxy:
     image: tecnativa/docker-socket-proxy:0.3.0
     container_name: sfsp-docker-proxy
@@ -743,7 +743,7 @@ services:
       IMAGES: 1 # ImageInspect / ImagePull（イメージが無いとき）
       POST: 1 # GET/HEAD 以外（create, start, wait, delete, pull）を許可
       PING: 1
-      VERSION: 1 # API バージョンのネゴシエーション
+      VERSION: 0 # 不要（docker クライアントの API バージョンのネゴシエーションは /_ping だけを使う）
       EVENTS: 0
       INFO: 0
       EXEC: 0
@@ -770,6 +770,38 @@ services:
       - no-new-privileges:true
     networks:
       - sfsp-docker-net
+
+  # sfsp-worker と sfsp-docker-proxy の間に置く、Docker API のリクエスト本文まで検査するプロキシ（backend/security/sfsp-docker-guard）。
+  # sfsp-worker の internal/sandbox/docker.go が送るリクエストだけを通す：/_ping、許可したイメージの inspect、
+  # スキャン用ボリュームを読み取り専用・ネットワーク無し・CapDrop ALL・no-new-privileges・読み取り専用ルート・資源制限付きの
+  # sfsp-sandbox-* コンテナの作成と、そのコンテナの start / wait / logs / 削除。それ以外（Privileged・ホストのパスのバインド・
+  # exec・archive・pull・ほかのコンテナの操作など）は 403。詳しくは backend/security/sfsp-docker-guard/main.go の先頭
+  sfsp-docker-guard:
+    build:
+      context: ./backend/security/sfsp-docker-guard
+    container_name: sfsp-docker-guard
+    restart: always
+    environment:
+      SFSP_GUARD_UPSTREAM: http://sfsp-docker-proxy:2375
+      # sfsp-worker の SFSP_SCANNER_CLAMAV_IMAGE / SFSP_SCANNER_YARA_IMAGE / SFSP_SCAN_VOLUME_NAME と揃える
+      # （スキャン用ボリュームは下の volumes で name: sfsp_temp_scan と固定しているので、compose のプロジェクト名に依らない）
+      SFSP_GUARD_ALLOWED_IMAGES: "${SFSP_SCANNER_CLAMAV_IMAGE:-sfsp-clamav-client:latest},${SFSP_SCANNER_YARA_IMAGE:-sfsp-yara-client:latest}"
+      SFSP_GUARD_SCAN_VOLUME: sfsp_temp_scan
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    depends_on:
+      sfsp-docker-proxy:
+        condition: service_started
+    networks:
+      - sfsp-docker-net # sfsp-docker-proxy
+      - sfsp-docker-guard-net # sfsp-worker
 
   sfsp-worker:
     build:
@@ -800,7 +832,7 @@ services:
         condition: service_completed_successfully
       db-role-init:
         condition: service_completed_successfully
-      sfsp-docker-proxy:
+      sfsp-docker-guard:
         condition: service_started
       sfsp-scan-volume-init:
         condition: service_completed_successfully
@@ -819,8 +851,8 @@ services:
       SFSP_MINIO_USE_SSL: "false"
 
       <<: [*redis-env, *redis-url-env]
-      # Docker API は sfsp-docker-proxy 経由（sandbox/docker.go は client.FromEnv で DOCKER_HOST を読む）
-      DOCKER_HOST: tcp://sfsp-docker-proxy:2375
+      # Docker API は sfsp-docker-guard → sfsp-docker-proxy 経由（sandbox/docker.go は client.FromEnv で DOCKER_HOST を読む）
+      DOCKER_HOST: tcp://sfsp-docker-guard:2375
       SFSP_SCANNER_CLAMAV_IMAGE: "${SFSP_SCANNER_CLAMAV_IMAGE:-sfsp-clamav-client:latest}"
       SFSP_SCANNER_YARA_IMAGE: "${SFSP_SCANNER_YARA_IMAGE:-sfsp-yara-client:latest}"
       SFSP_SCANNER_YARA_RULES_PATH: "${SFSP_SCANNER_YARA_RULES_PATH:-/etc/yara-rules/general.yar}"
@@ -850,7 +882,7 @@ services:
       - sfsp-isolated-net # redis, minio
       - backend-db-network # app-db（sfsp_worker ロール、読み取り専用）
       - sfsp-db-network # sfsp-db
-      - sfsp-docker-net # sfsp-docker-proxy
+      - sfsp-docker-guard-net # sfsp-docker-guard（sfsp-docker-proxy には直接つながない）
 
   # sfsp-worker（uid/gid 10001 の非 root）が sfsp_temp_scan に書けるようにする 1 回限りの初期化。
   # 空の名前付きボリュームはイメージ側の所有者（10001）で作られるが、非 root 化前に作られた既存ボリュームは root 所有のままなので chown で揃える。
@@ -925,10 +957,15 @@ networks:
     driver: bridge
     name: sfsp-db-network
     internal: true
-  # sfsp-docker-proxy 専用（sfsp-worker のみ）
+  # sfsp-docker-proxy 専用（sfsp-docker-guard のみ）
   sfsp-docker-net:
     driver: bridge
     name: sfsp-docker-net
+    internal: true
+  # sfsp-docker-guard 専用（sfsp-worker のみ）
+  sfsp-docker-guard-net:
+    driver: bridge
+    name: sfsp-docker-guard-net
     internal: true
 
 volumes:
