@@ -1,3 +1,5 @@
+// Package config は SFSP（sfsp-api / sfsp-worker）の設定を環境変数から読み込み、
+// ログ出力用に認証情報を伏せるヘルパーを提供する。
 package config
 
 import (
@@ -12,6 +14,7 @@ import (
 	"github.com/spf13/viper"
 )
 
+// サイズ単位と、ClamAV が扱えるサイズの上限値。
 const (
 	MiB = int64(1024 * 1024)
 	GiB = 1024 * MiB
@@ -23,10 +26,12 @@ const (
 	ClamAVMaxSupportedScanSize = 4000 * MiB
 )
 
-// Config holds all application-wide configurations
+// Config は SFSP 全体で使う設定値を保持する。
 type Config struct {
+	// sfsp-db への接続文字列（SFSP_DATABASE_URL）
 	DatabaseURL string
 
+	// MinIO の接続情報とバケット名
 	MinIO struct {
 		// Raw MinIO (ダウンロード用)
 		RawEndpoint        string
@@ -46,6 +51,7 @@ type Config struct {
 		}
 	}
 
+	// スキャナー用コンテナのイメージ名と YARA ルールファイルのパス
 	Scanner struct {
 		ClamAVImage   string
 		YARAImage     string
@@ -74,15 +80,18 @@ type Config struct {
 		MaxZipDepth       int   // SFSP_MAX_ZIP_DEPTH: zip 内のディレクトリ階層の上限
 	}
 
+	// sfsp-api の待ち受けポートと API キー
 	API struct {
 		Port string
 		Key  string // SFSP_API_KEY: /api/v1/* に必須の X-SFSP-API-Key
 	}
 }
 
-// LoadConfig loads configuration from environment variables.
+// LoadConfig は環境変数から設定を読み込み、未設定の項目にはデフォルト値を補う。
 // カレントディレクトリに .env があれば補助的に読み込むが、無くても動作する（環境変数が優先）。
+// 現状はエラーを返すことはない（不正な数値はログを出してデフォルト値を使う）。
 func LoadConfig() (config Config, err error) {
+	// 1. 環境変数と .env（存在する場合のみ）を読み込み元にする
 	viper.AutomaticEnv()
 	if _, statErr := os.Stat(".env"); statErr == nil {
 		viper.SetConfigFile(".env")
@@ -91,6 +100,7 @@ func LoadConfig() (config Config, err error) {
 		}
 	}
 
+	// 2. 接続情報などの文字列設定を読み込む
 	config.DatabaseURL = viper.GetString("SFSP_DATABASE_URL")
 
 	// Raw MinIO 接続情報の読み込み
@@ -126,7 +136,7 @@ func LoadConfig() (config Config, err error) {
 	config.API.Port = viper.GetString("SFSP_API_PORT")
 	config.API.Key = strings.TrimSpace(viper.GetString("SFSP_API_KEY"))
 
-	// デフォルト値の設定
+	// 3. デフォルト値の設定
 	if config.MinIO.Buckets.RawFiles == "" {
 		config.MinIO.Buckets.RawFiles = "raw-files"
 	}
@@ -149,7 +159,7 @@ func LoadConfig() (config Config, err error) {
 		config.Scanner.YARARulesPath = "/etc/yara-rules/general.yar"
 	}
 
-	// ClamAV の上限（既定はサポートされる最大値）
+	// 4. ClamAV の上限（既定はサポートされる最大値）
 	config.ClamAV.MaxFileSize = clampInt64("SFSP_CLAMAV_MAX_FILESIZE", getInt64("SFSP_CLAMAV_MAX_FILESIZE", ClamAVMaxSupportedFileSize), 1, ClamAVMaxSupportedFileSize)
 	config.ClamAV.MaxScanSize = clampInt64("SFSP_CLAMAV_MAX_SCANSIZE", getInt64("SFSP_CLAMAV_MAX_SCANSIZE", ClamAVMaxSupportedScanSize), 1, ClamAVMaxSupportedScanSize)
 	config.ClamAV.MaxFiles = int(getInt64("SFSP_CLAMAV_MAX_FILES", 100000))
@@ -158,7 +168,7 @@ func LoadConfig() (config Config, err error) {
 	config.ClamAV.MaxScanTimeMs = getInt64("SFSP_CLAMAV_MAX_SCANTIME_MS", 25*60*1000) // サンドボックスの 30 分より短く
 	config.ClamAV.PCREMaxFileSize = clampInt64("SFSP_CLAMAV_PCRE_MAX_FILESIZE", getInt64("SFSP_CLAMAV_PCRE_MAX_FILESIZE", ClamAVMaxSupportedFileSize), 1, ClamAVMaxSupportedFileSize)
 
-	// アップロード・展開の上限
+	// 5. アップロード・展開の上限
 	config.Limits.MaxUploadBytes = getInt64("SFSP_MAX_UPLOAD_BYTES", ClamAVMaxSupportedFileSize)
 	config.Limits.MaxExtractedBytes = getInt64("SFSP_MAX_EXTRACTED_BYTES", 4*GiB)
 	config.Limits.MaxZipEntries = int(getInt64("SFSP_MAX_ZIP_ENTRIES", 20000))
@@ -178,6 +188,8 @@ func LoadConfig() (config Config, err error) {
 	return config, nil
 }
 
+// getInt64 は環境変数 key を int64 として読み込む。未設定なら def を返し、
+// 数値として解釈できない値や 0 以下の値の場合はログを出して def を返す。
 func getInt64(key string, def int64) int64 {
 	s := strings.TrimSpace(viper.GetString(key))
 	if s == "" {
@@ -191,6 +203,7 @@ func getInt64(key string, def int64) int64 {
 	return v
 }
 
+// clampInt64 は v を [min, max] の範囲に収めて返す。max を超えた場合のみ key 名付きでログを出す。
 func clampInt64(key string, v, min, max int64) int64 {
 	if v < min {
 		return min
@@ -202,9 +215,10 @@ func clampInt64(key string, v, min, max int64) int64 {
 	return v
 }
 
-// ResolveRedisAddr returns the Redis address to use. REDIS_URL (e.g. redis://:<pw>@redis:6379)
-// takes precedence over addr. If the resulting value is a URL without a password and
-// password is non-empty, the password is injected so that ParseURL-based clients authenticate.
+// ResolveRedisAddr は使用する Redis の接続先を返す。環境変数 REDIS_URL（例: redis://:<pw>@redis:6379）が
+// あれば addr より優先し、どちらも空なら "redis:6379" を使う。
+// 結果がパスワードを含まない URL で、password が空でない場合は URL にパスワードを埋め込む。
+// URL 形式では shared/queue が ParseURL を使い REDIS_PASSWORD を参照しないため、こうしないと認証できない。
 func ResolveRedisAddr(addr, password string) string {
 	if u := strings.TrimSpace(os.Getenv("REDIS_URL")); u != "" {
 		addr = u
@@ -230,10 +244,11 @@ func ResolveRedisAddr(addr, password string) string {
 	return parsed.String()
 }
 
+// dsnPasswordRe は key=value 形式の DSN から password=... の値部分（引用符付きも含む）を探す正規表現。
 var dsnPasswordRe = regexp.MustCompile(`(?i)(password\s*=\s*)('[^']*'|\S+)`)
 
-// RedactURL hides credentials in a DSN / URL so that it can be logged safely.
-// Works for URL form (scheme://user:pw@host) and key=value form (password=...).
+// RedactURL は DSN / URL に含まれる認証情報を伏せ、安全にログ出力できる形にする。
+// URL 形式（scheme://user:pw@host）と key=value 形式（password=...）の両方に対応する。
 func RedactURL(s string) string {
 	if strings.Contains(s, "://") {
 		if u, err := url.Parse(s); err == nil {
@@ -251,8 +266,9 @@ func RedactURL(s string) string {
 	return dsnPasswordRe.ReplaceAllString(s, "${1}xxxxx")
 }
 
-// RedactString replaces every occurrence of the given secrets in s with "xxxxx".
-// Use it on error messages that may embed a DSN.
+// RedactString は s に含まれる secrets（DSN / URL）をそれぞれ RedactURL で伏せた形に置き換え、
+// さらに URL から取り出したパスワード単体の出現箇所も "xxxxx" に置き換える。
+// DSN が埋め込まれている可能性のあるエラーメッセージに対して使う。
 func RedactString(s string, secrets ...string) string {
 	for _, sec := range secrets {
 		if sec == "" {
@@ -268,7 +284,8 @@ func RedactString(s string, secrets ...string) string {
 	return s
 }
 
-// Retry function for connecting to external services
+// Retry は外部サービスへの接続処理 fn を最大 attempts 回まで試行する。
+// 失敗するたびに sleep だけ待ち、待ち時間を2倍にして再帰的に再試行する（指数バックオフ）。
 func Retry(attempts int, sleep time.Duration, fn func() error) error {
 	if err := fn(); err != nil {
 		if attempts--; attempts > 0 {

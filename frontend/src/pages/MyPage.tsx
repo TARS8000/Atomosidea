@@ -12,6 +12,7 @@ import PublicIcon from '@mui/icons-material/Public';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import CopyIcon from '@mui/icons-material/ContentCopy';
 
+// マイページに表示するコンテンツ 1 件（/api/my/* の結果に種別を付けたもの）。
 interface Content {
   id: string;
   title: string;
@@ -26,6 +27,7 @@ interface Content {
   entry_point_path?: string;
 }
 
+// /api/profile/:id から取得するプロフィール。
 interface Profile {
   username: string;
   bio: string;
@@ -33,6 +35,9 @@ interface Profile {
   background_image_url: string;
 }
 
+/**
+ * マイページ。自分のプロフィールと投稿したコンテンツを表示し、編集・調整・削除の操作を提供する。
+ */
 const MyPage = () => {
   const { token, user, isLoading: isAuthLoading } = useAuth();
   const navigate = useNavigate();
@@ -45,11 +50,15 @@ const MyPage = () => {
   const [error, setError] = useState('');
   const [tabIndex, setTabIndex] = useState(0);
   const [isBioDialogOpen, setIsBioDialogOpen] = useState(false);
+  // 自己紹介が 3 行分の表示枠からはみ出しているか（「さらに表示」ボタンの表示判定）
   const [isBioOverflowing, setIsBioOverflowing] = useState(false);
   const bioRef = useRef<HTMLParagraphElement>(null);
+  // UserID をコピーした直後かどうか（ボタンのツールチップ切り替え用）
   const [copiedId, setCopiedId] = useState(false);
+  // 静的サイトを配信するドメイン（ビルド時の環境変数。未設定なら localhost）
   const staticSiteDomain = import.meta.env.VITE_STATIC_SITE_DOMAIN || 'localhost';
 
+  // 認証情報の読み込み完了後に、プロフィールと自分のコンテンツ一覧を並行取得する。
   useEffect(() => {
     const fetchData = async () => {
       if (!token || !user || user.userID === undefined) return;
@@ -62,12 +71,14 @@ const MyPage = () => {
         ]);
         setProfile(profileRes.data);
         
+        // 種別を付け、全種別をまとめて新しい順に並べる
         const videoData: Content[] = (videosRes.data || []).map((v: any) => ({ ...v, type: 'video' }));
         const gameData: Content[] = (gamesRes.data || []).map((g: any) => ({ ...g, type: 'game' }));
         const staticSiteData: Content[] = (staticSitesRes.data || []).map((s: any) => ({ ...s, type: 'static-site' }));
 
         const combinedContents = [...videoData, ...gameData, ...staticSiteData].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         
+        // 投稿者名・アイコン（自分のプロフィール）と、サムネが無い場合の既定画像を付ける
         const enrich = (content: Content) => ({
           ...content,
           uploader_name: profileRes.data.username || 'Unknown',
@@ -88,14 +99,18 @@ const MyPage = () => {
     if (!isAuthLoading && user) fetchData();
   }, [isAuthLoading, user, token]);
 
+  // プロフィール表示後に、自己紹介が表示枠からはみ出しているかを判定する。
   useEffect(() => {
     if (bioRef.current) {
       setIsBioOverflowing(bioRef.current.scrollHeight > bioRef.current.clientHeight);
     }
   }, [profile]);
 
+  // タブ切り替えのハンドラ。
   const handleTabChange = (_: React.SyntheticEvent, newValue: number) => setTabIndex(newValue);
 
+  // UserID をクリップボードにコピーし、1.5 秒間「コピーしました」を表示する。
+  // Clipboard API が使えない場合（非 HTTPS など）は textarea と execCommand で代替する。
   const handleCopyUserId = async () => {
     if (!user) return;
     try {
@@ -112,9 +127,12 @@ const MyPage = () => {
     setTimeout(() => setCopiedId(false), 1500);
   };
 
+  // 確認後にコンテンツを削除し、成功したら各一覧から取り除く。
+  // 失敗すると error が設定され、ページ全体がエラー表示に切り替わる。
   const handleDelete = async (type: 'video' | 'game' | 'static-site', id: string) => {
     if (window.confirm(`本当にこの${type === 'video' ? '動画' : type === 'game' ? 'ゲーム' : '静的サイト'}を削除しますか？`)) {
       try {
+        // 種別ごとの削除 API（動画だけパスの形が異なる）
         const urlMap = {
           video: `/api/videos/delete/${id}`,
           game: `/api/games/${id}`,
@@ -133,14 +151,18 @@ const MyPage = () => {
     }
   };
 
+  // 認証読み込み中・未ログイン・エラー時は、一覧の代わりに状態を表示する。
   if (isAuthLoading) return <CircularProgress />;
   if (!user) return <Alert severity="error">このページを表示するにはログインが必要です。</Alert>;
   if (error) return <Alert severity="error">{error}</Alert>;
 
+  // コンテンツのカードを並べる。静的サイトは公開 URL を新しいタブで開き、それ以外は詳細ページへ遷移する。
   const renderContentCards = (contentArray: Content[]) => (
     <Grid container spacing={2} justifyContent="flex-start">
       {contentArray.map((content) => {
         const isStaticSite = content.type === 'static-site';
+        // 静的サイトは http://<サイトID>.<ドメイン>:3001/<エントリーポイント> で開く。
+        // /api/my/static-sites は entry_point_path を返さないため、実際には常に index.html になる。
         const linkUrl = isStaticSite 
           ? `http://${content.id}.${staticSiteDomain}:3001/${content.entry_point_path || 'index.html'}`
           : `/${content.type}s/${content.id}`;
@@ -180,6 +202,7 @@ const MyPage = () => {
               <Box sx={{ position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(100, 100, 100, 0.7)', borderRadius: 1, p: '2px 4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 {content.type === 'video' ? <VideocamIcon sx={{ fontSize: 18, color: 'white' }} /> : content.type === 'game' ? <SportsEsportsIcon sx={{ fontSize: 18, color: 'white' }} /> : <PublicIcon sx={{ fontSize: 18, color: 'white' }} />}
               </Box>
+              {/* 操作ボタン。カード全体がリンクのため、preventDefault でカードの遷移を止めてから処理する */}
               <CardActions sx={{ justifyContent: 'flex-end' }}>
                 {content.type === 'video' && (
                   <>
@@ -210,18 +233,21 @@ const MyPage = () => {
 
   return (
     <Container>
+      {/* プロフィール（背景画像・アイコン・名前・自己紹介・UserID） */}
       {profile && (
         <Paper sx={{ mb: 4, boxShadow: 3, borderRadius: 3, overflow: 'hidden' }}>
           <Box sx={{ height: { xs: 120, sm: 160 }, width: '100%', backgroundSize: 'cover', backgroundPosition: 'center', backgroundImage: `url(${profile.background_image_url || '/default-background.jpg'})`, backgroundColor: 'grey.300', borderBottom: `2px solid ${theme.palette.grey[400]}` }} />
           <Box sx={{ px: 3, pb: 3, pt: 7, bgcolor: 'background.paper', position: 'relative' }}>
             <Avatar src={profile.icon_url || '/default-icon.png'} sx={{ width: 100, height: 100, position: 'absolute', top: -50, left: 24, border: `4px solid ${theme.palette.background.paper}`, bgcolor: theme.palette.grey[400], boxShadow: `0 0 0 2px ${theme.palette.grey[400]}` }} />
             <Typography variant="h4" component="h1" fontWeight="bold">{profile.username}</Typography>
+{/* 自己紹介は 3 行まで表示し、はみ出す場合は「さらに表示」で全文のダイアログを開く */}
 {profile.bio && (
                <Box sx={{ mt: 2 }}>
                  <Typography ref={bioRef} variant="h6" color="text.secondary" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: '1.5em', maxHeight: '4.5em', overflow: 'hidden' }}>{profile.bio}</Typography>
                  {isBioOverflowing && <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}><MuiButton onClick={() => setIsBioDialogOpen(true)} size="small" sx={{ mt: 0.5, textTransform: 'none', padding: 0, fontWeight: 'bold' }}>さらに表示</MuiButton></Box>}
                </Box>
              )}
+             {/* UserID の表示とコピーボタン */}
              <Box sx={{ mt: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                <Box>
                  <Typography variant="caption" color="text.secondary" display="block">UserID</Typography>
@@ -234,6 +260,7 @@ const MyPage = () => {
            </Box>
         </Paper>
       )}
+      {/* 自己紹介の全文を表示するダイアログ */}
       <Dialog open={isBioDialogOpen} onClose={() => setIsBioDialogOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle>{profile?.username}の自己紹介</DialogTitle>
         <DialogContent><Typography sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{profile?.bio}</Typography></DialogContent>

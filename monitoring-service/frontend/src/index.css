@@ -1,16 +1,119 @@
+/* --- HUD（SF 風）の基本設定 --- */
+:root {
+  --hud-cyan: #22d3ee;
+  --hud-bg: #020617;
+  --hud-font-display: 'Orbitron', 'Noto Sans JP', 'Yu Gothic UI', sans-serif;
+  --hud-font-ui: 'Rajdhani', 'Noto Sans JP', 'Yu Gothic UI', 'Segoe UI', sans-serif;
+  --hud-font-mono: 'Share Tech Mono', 'Consolas', ui-monospace, monospace;
+}
+
 html, body, #root {
   margin: 0;
   padding: 0;
   width: 100%;
   height: 100%;
   overflow: hidden;
+  background: var(--hud-bg);
   color: #e2e8f0; /* slate-200 */
-  font-family: 'Inter', 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Oxygen',
-  'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-  sans-serif;
+  font-family: var(--hud-font-ui);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+.hud-font-display { font-family: var(--hud-font-display); }
+.hud-font-ui { font-family: var(--hud-font-ui); }
+.hud-font-mono { font-family: var(--hud-font-mono); }
+
+/* 文字の発光 */
+.hud-glow { text-shadow: 0 0 8px rgba(34, 211, 238, 0.55); }
+
+/* 背景: 中央の淡い光 + 太いグリッド（120px）。文字の邪魔にならないよう薄くする */
+.hud-bg {
+  background-color: var(--hud-bg);
+  background-image:
+    radial-gradient(ellipse at 50% 30%, rgba(14, 165, 233, 0.09), transparent 65%),
+    linear-gradient(rgba(34, 211, 238, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 120px 120px, 120px 120px;
+}
+
+/* 画面の周辺減光（クリックは透過する）。走査線は文字が読みにくくなるため入れない */
+.hud-overlay {
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 65%, rgba(0, 0, 0, 0.4));
+}
+
+/* 上から下へゆっくり通り過ぎるスキャン光（親は position: relative にする）。ごく淡くする */
+.hud-sweep::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 120px;
+  top: -120px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, rgba(34, 211, 238, 0.025) 80%, rgba(34, 211, 238, 0.06) 98%, transparent);
+  animation: hud-sweep 12s linear infinite;
+  z-index: 0;
+}
+@keyframes hud-sweep { to { top: 100%; } }
+
+/* 角を斜めに切ったパネル（右上と左下） */
+.hud-cut { clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px)); }
+.hud-cut-sm { clip-path: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px)); }
+
+/* 四隅の L 字の括弧。--c で色、--l で長さを変えられる（background-color とは併用できる） */
+.hud-corners {
+  --c: rgba(34, 211, 238, 0.75);
+  --l: 10px;
+  background-image:
+    linear-gradient(var(--c), var(--c)), linear-gradient(var(--c), var(--c)),
+    linear-gradient(var(--c), var(--c)), linear-gradient(var(--c), var(--c)),
+    linear-gradient(var(--c), var(--c)), linear-gradient(var(--c), var(--c)),
+    linear-gradient(var(--c), var(--c)), linear-gradient(var(--c), var(--c));
+  background-repeat: no-repeat;
+  background-size:
+    var(--l) 1px, 1px var(--l), var(--l) 1px, 1px var(--l),
+    var(--l) 1px, 1px var(--l), var(--l) 1px, 1px var(--l);
+  background-position:
+    left top, left top, right top, right top,
+    left bottom, left bottom, right bottom, right bottom;
+}
+
+/* フローチャートのカード。枠の色は --frame（ホバー時は明るくする） */
+.hud-node-frame { background: var(--frame); transition: background 0.15s; }
+.hud-node:hover .hud-node-frame { background: rgba(103, 232, 249, 0.9); }
+
+/* 選択時のロックオン（括弧が外から縮んで止まる） */
+@keyframes hud-lock { from { opacity: 0; transform: scale(1.25); } to { opacity: 1; transform: scale(1); } }
+.hud-lock { animation: hud-lock 0.25s ease-out; }
+
+/* 異常時の赤い発光の脈動 */
+@keyframes hud-alert {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(244, 63, 94, 0.5)); }
+  50% { filter: drop-shadow(0 0 9px rgba(244, 63, 94, 0.85)); }
+}
+.hud-alert { animation: hud-alert 1.4s ease-in-out infinite; }
+
+/* 点滅（カーソル・警告ランプ） */
+@keyframes hud-blink { 50% { opacity: 0; } }
+.hud-blink { animation: hud-blink 1s steps(1) infinite; }
+
+/* ログ出力中のイコライザー */
+@keyframes hud-eq { 0%, 100% { height: 3px; } 50% { height: 10px; } }
+.hud-eq { animation: hud-eq 0.6s ease-in-out infinite; }
+
+/* 列見出しの間の流れを示す矢印（順に点灯する） */
+@keyframes hud-chevron { 0%, 100% { opacity: 0.15; } 40% { opacity: 1; } }
+.hud-chevron { animation: hud-chevron 1.5s ease-in-out infinite; }
+
+/* ロゴの外周リング */
+@keyframes hud-spin { to { transform: rotate(360deg); } }
+.hud-spin-slow { animation: hud-spin 12s linear infinite; transform-origin: center; }
+
+/* 詳細ペインが右から入ってくる */
+@keyframes hud-slide { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.hud-slide-in { animation: hud-slide 0.2s ease-out; }
 
 /* --- Custom Scrollbar --- */
 ::-webkit-scrollbar {
@@ -18,12 +121,12 @@ html, body, #root {
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: rgba(30, 41, 59, 0.5); /* slate-800/50 */
+  background: rgba(8, 47, 73, 0.35); /* cyan-950 系 */
 }
 ::-webkit-scrollbar-thumb {
-  background: #475569; /* slate-600 */
+  background: rgba(34, 211, 238, 0.3);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #64748b; /* slate-500 */
+  background: rgba(34, 211, 238, 0.55);
 }

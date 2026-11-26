@@ -3,6 +3,7 @@ module game-worker
 go 1.25
 
 require (
+	github.com/andybalholm/brotli v1.1.0
 	github.com/atmosidea/shared v0.0.0-00010101000000-000000000000
 	github.com/jackc/pgx/v5 v5.5.5
 	github.com/minio/minio-go/v7 v7.0.63

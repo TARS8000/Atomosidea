@@ -18,7 +18,9 @@ COPY . .
 RUN npm run build
 
 # Production stage
-FROM nginx:stable-alpine
+# 版を固定する（stable-alpine のままだと、手元・サーバーに残った古いイメージが --build でも使われ続ける）。
+# 1.30.7 は NGINX2Root（CVE-2026-123007 ほか 4 件）の修正版。上げるときはこの行を変える
+FROM nginx:1.30.7-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/nginx.conf
 EXPOSE 80

@@ -40,7 +40,8 @@ const (
 const (
 	dequeueTimeout = 5 * time.Second // BRPOPLPUSH のブロック時間（ctx のキャンセルを確認するため有限にする）
 	maxJobAttempts = 5               // 終端状態にできなかったジョブを再試行する回数。超えたら :dead へ
-	retryBackoff   = 10 * time.Second
+	// retryBackoff は再試行で元のキューへ戻す前に待つ時間
+	retryBackoff = 10 * time.Second
 )
 
 // 終端状態（この状態を DB に記録し、完了イベントを publish したらキューから Ack する）
@@ -59,6 +60,7 @@ var terminalStatuses = map[string]bool{
 // ジョブが終端状態になり完了イベントを publish した後に Ack（LREM）する。
 // 起動時に processing に残っているもの（前回のクラッシュ分）を RecoverProcessing で戻す。
 func StartWorker(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, logger *zap.SugaredLogger) {
+	// 1. スキャナーを動かす Docker サンドボックスとキュー接続を準備する
 	sb, err := sandbox.NewDockerSandbox(logger)
 	if err != nil {
 		logger.Fatalf("Failed to create Docker sandbox: %v", err)
@@ -83,6 +85,8 @@ func StartWorker(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, lo
 		logger.Warn("appDB is nil. Cleanup watcher will not start.")
 	}
 
+	// 2. メインループ: ジョブを取り出して処理し、結果に応じて Ack / 再投入 / デッドレターを行う。
+	// attempts はペイロードごとの失敗回数（プロセス内のみで保持し、再起動でリセットされる）
 	attempts := map[string]int{}
 	for {
 		if ctx.Err() != nil {
@@ -104,6 +108,7 @@ func StartWorker(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, lo
 			continue
 		}
 
+		// UUID として解釈できないペイロードは再試行しても直らないので Ack して捨てる
 		jobID, err := uuid.Parse(strings.TrimSpace(payload))
 		if err != nil {
 			logger.Errorf("Invalid job ID received from queue: %q, error: %v (discarding)", payload, err)
@@ -139,6 +144,7 @@ func StartWorker(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, lo
 			delete(attempts, payload)
 			continue
 		}
+		// 上限未満なら待機してから元のキューへ戻す
 		logger.Warnf("Job %s did not reach a terminal status (attempt %d/%d); requeueing in %s", jobID, attempts[payload], maxJobAttempts, retryBackoff)
 		sleepCtx(ctx, retryBackoff)
 		if ctx.Err() != nil {
@@ -159,6 +165,7 @@ func ackJob(logger *zap.SugaredLogger, payload string) {
 	}
 }
 
+// sleepCtx は d だけ待つ。ctx がキャンセルされたら即座に戻る。
 func sleepCtx(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -168,6 +175,8 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
+// cleanupStaleScanDirs は scanBaseDir 直下に残っている "job-" で始まる一時ディレクトリを削除する。
+// ベースディレクトリが読めない（存在しない等）場合は何もしない。
 func cleanupStaleScanDirs(logger *zap.SugaredLogger) {
 	entries, err := os.ReadDir(scanBaseDir)
 	if err != nil {
@@ -189,6 +198,7 @@ func cleanupStaleScanDirs(logger *zap.SugaredLogger) {
 // 定期クリーンアップ (app-db の public ステータス監視 ＆ 消去) ロジック
 // =========================================================================
 
+// cleanupJobInfo はクリーンアップ対象（clean 判定済み・未クリーンアップ）のジョブとファイルの情報。
 type cleanupJobInfo struct {
 	jobID         uuid.UUID
 	fileID        uuid.UUID
@@ -198,6 +208,7 @@ type cleanupJobInfo struct {
 	storagePath   string // MinIO上の保存パス
 }
 
+// startCleanupWatcher は 30 秒ごとに runCleanupBatch を実行し、ctx がキャンセルされるまで続ける。
 func startCleanupWatcher(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, logger *zap.SugaredLogger) {
 	logger.Info("Starting cleanup watcher loop (checking app-db status for 'public' every 30s)...")
 	ticker := time.NewTicker(30 * time.Second)
@@ -216,6 +227,9 @@ func startCleanupWatcher(ctx context.Context, cfg config.Config, appDB *pgxpool.
 	}
 }
 
+// runCleanupBatch は clean 判定済みで未クリーンアップのジョブを最大 50 件取得し、
+// それぞれ executeCleanupTask で app-db の公開状態を確認して clean-files から削除する。
+// 個々のジョブの失敗はログに出すだけで、バッチ全体のエラーにはしない。
 func runCleanupBatch(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, logger *zap.SugaredLogger) error {
 	// 1. sfsp-db から「スキャン成功 (clean) かつ 未クリーンアップ」のジョブを取得
 	query := `
@@ -257,6 +271,9 @@ func runCleanupBatch(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool
 	return nil
 }
 
+// executeCleanupTask は 1 件のジョブについて、app-db 上の対応レコードの status が 'public' になっていれば
+// clean-files バケットのオブジェクトを削除し、sfsp-db に is_cleaned_up = TRUE を記録する。
+// レコードが無い・未公開の場合は何もせず nil を返し、次回のバッチで再確認する。
 func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.Pool, logger *zap.SugaredLogger, job cleanupJobInfo) error {
 	var query string
 
@@ -306,6 +323,8 @@ func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.P
 	}
 
 	// 'public' が確認できたため clean-files バケットからオブジェクトを物理削除
+	// storage_path は "<バケット>/<キー>" 形式で保存されているため、バケット名の接頭辞を外してキーにする
+	// （登録時は raw-files のパスなので RawFiles の接頭辞も外す）。空ならファイル ID をキーとする
 	cleanBucket := cfg.MinIO.Buckets.CleanFiles
 	objectName := job.storagePath
 	objectName = strings.TrimPrefix(objectName, cleanBucket+"/")
@@ -337,6 +356,7 @@ func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.P
 	return nil
 }
 
+// =========================================================================
 // ジョブ処理本体
 // =========================================================================
 
@@ -350,6 +370,7 @@ func executeCleanupTask(ctx context.Context, cfg config.Config, appDB *pgxpool.P
 //     （clean-files / quarantine へのアップロードは同じキーへの上書き）
 //   - raw-files の削除は終端状態の記録と publish の後に行うので、途中で落ちても再処理に必要なファイルは残る
 func processJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger, sb sandbox.Sandbox, jobID uuid.UUID) bool {
+	// 1. ジョブの現在状態を読み込む（存在しないジョブは捨てる）
 	var fileID uuid.UUID
 	var status string
 	var details *string
@@ -366,6 +387,7 @@ func processJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogge
 		return false
 	}
 
+	// 2. 対応するファイルのメタデータを読み込む
 	file, err := loadFile(ctx, fileID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// target_service が分からないので完了イベントは送れない
@@ -377,6 +399,7 @@ func processJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogge
 		return false
 	}
 
+	// 3. すでに終端状態なら、未 publish の場合だけイベントを送り直す
 	if terminalStatuses[status] {
 		if publishedAt != nil {
 			logger.Infof("Job %s already finished with status %s and its completion event was published; nothing to do", jobID, status)
@@ -403,6 +426,7 @@ func processJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogge
 		return false
 	}
 
+	// 4. スキャンを実行し、結果を終端状態として確定させる
 	jobStatus, processingDetails, ok := scanFile(ctx, cfg, logger, sb, jobID, file)
 	if !ok {
 		return false
@@ -410,7 +434,8 @@ func processJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogge
 	return finalize(ctx, cfg, logger, jobID, file, jobStatus, processingDetails, true)
 }
 
-// failJob は再試行回数を超えたジョブを failed として確定させる（まだ終端状態でない場合のみ）
+// failJob は再試行回数を超えたジョブを failed として確定させる（まだ終端状態でない場合のみ）。
+// 確定と完了イベントの publish に成功したら true を返す。すでに終端状態の場合や DB の読み込みに失敗した場合は false。
 func failJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger, jobID uuid.UUID, reason string) bool {
 	var fileID uuid.UUID
 	var status string
@@ -427,6 +452,7 @@ func failJob(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger, 
 	return finalize(ctx, cfg, logger, jobID, file, "failed", reason, true)
 }
 
+// loadFile は files テーブルから fileID のメタデータを読み込む。存在しない場合は pgx.ErrNoRows を返す。
 func loadFile(ctx context.Context, fileID uuid.UUID) (model.File, error) {
 	var file model.File
 	err := database.DB.QueryRow(ctx,
@@ -437,6 +463,7 @@ func loadFile(ctx context.Context, fileID uuid.UUID) (model.File, error) {
 
 // finalize は終端状態を記録し、完了イベントを publish し、raw-files を削除する。
 // 終端状態の記録と publish に成功したら true（= Ack してよい）。
+// setStatus が false のときは、すでに DB に記録済みの状態を使い、状態の更新は行わない。
 func finalize(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger, jobID uuid.UUID, file model.File, status, details string, setStatus bool) bool {
 	if ctx.Err() != nil {
 		// シャットダウン中に起きた失敗を終端状態として記録しない
@@ -449,6 +476,7 @@ func finalize(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 		}
 	}
 
+	// 下流サービスへ通知する完了イベントを組み立てて publish する
 	completionEvent := event.ScanCompletionEvent{
 		JobID:         jobID,
 		FileID:        file.ID,
@@ -483,6 +511,7 @@ func deleteRaw(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger
 	}
 }
 
+// safeExtRe は一時ファイル名に残してよい拡張子（ドット + 英数字 1〜10 文字）にマッチする。
 var safeExtRe = regexp.MustCompile(`^\.[A-Za-z0-9]{1,10}$`)
 
 // localInputName はダウンロード先のファイル名を返す。ユーザーのファイル名はパスに使わない
@@ -497,12 +526,14 @@ func localInputName(filename string) string {
 
 // scanFile はファイルをダウンロード・展開・スキャンし、結果のバケットへアップロードする。
 // ok=false は一時的な失敗（再試行する）。
+// ok=true のとき jobStatus は clean / malicious / suspicious / failed / invalid のいずれか。
 func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger, sb sandbox.Sandbox, jobID uuid.UUID, file model.File) (jobStatus string, processingDetails string, ok bool) {
 	logger.Infof("FileType from DB for file %s (job %s): %s", file.ID, jobID, file.FileType)
 
 	rawBucket := cfg.MinIO.Buckets.RawFiles
 	objectName := file.ID.String()
 
+	// 1. 作業用の一時ディレクトリを用意する
 	// /tmp/sfsp-scan ディレクトリが存在しない場合は作成
 	if err := os.MkdirAll(scanBaseDir, 0755); err != nil {
 		logger.Errorf("Failed to create base scan directory %s for job %s: %v", scanBaseDir, jobID, err)
@@ -525,6 +556,7 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 		return "", "", false
 	}
 
+	// 2. raw-files からファイルをダウンロードする（見つからなければ再試行せず failed で確定）
 	downloadPath := filepath.Join(tempDir, localInputName(file.Filename))
 
 	logger.Infof("Downloading file %s from MinIO bucket %s for job %s", objectName, rawBucket, jobID)
@@ -546,6 +578,7 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 	scanPath := downloadPath
 	jobStatus = "" // 空 = まだ未確定（スキャンする）
 
+	// 3. ファイル種別ごとの前処理。zip は安全に展開して構造（Unity WebGL / 静的サイト）を検証する
 	switch file.FileType {
 	case "zip":
 		logger.Infof("Processing ZIP file for job %s", jobID)
@@ -578,6 +611,8 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 				processingDetails = fmt.Sprintf("Failed to unzip file: %v", err)
 			}
 		} else {
+			// 展開済みの中身を探索するときの走査件数の上限（エントリ数上限から余裕を持たせて算出）
+			// Unity WebGL のルートを優先して探し、無ければ静的サイトのルートを探す。どちらも 1 つだけのときに有効とする
 			statLimit := cfg.Limits.MaxZipEntries*2 + 16
 			unityRoots, unityErr := findUnityWebGLRoot(unzipDir, statLimit, logger)
 			if unityErr != nil {
@@ -622,6 +657,7 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 		processingDetails = "Other file type scan."
 	}
 
+	// 4. 前処理で状態が確定していなければ、ClamAV と YARA をサンドボックスで実行して結果を保存する
 	if jobStatus == "" {
 		clamAVScanner := scanner.NewClamAVScanner(cfg.Scanner.ClamAVImage, scanner.ClamAVLimits{
 			MaxFileSize:     cfg.ClamAV.MaxFileSize,
@@ -664,6 +700,7 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 		}
 	}
 
+	// 5. 判定結果に応じて clean-files または quarantine へ保存する（failed / invalid はどこにも保存しない）
 	// 異インスタンス間での CopyObject 回避のため、ローカルファイルから対象バケットへアップロードする。
 	// 失敗した場合は一時的な障害とみなして再試行する（raw-files はまだ削除していない）
 	switch jobStatus {
@@ -682,6 +719,8 @@ func scanFile(ctx context.Context, cfg config.Config, logger *zap.SugaredLogger,
 	return jobStatus, processingDetails, true
 }
 
+// updateJobStatus は scan_jobs の status・processing_details・updated_at を更新する。
+// details は省略可能で、省略時は processing_details を空文字にする。
 func updateJobStatus(ctx context.Context, jobID uuid.UUID, status string, logger *zap.SugaredLogger, details ...string) error {
 	detailMsg := ""
 	if len(details) > 0 {
@@ -694,6 +733,8 @@ func updateJobStatus(ctx context.Context, jobID uuid.UUID, status string, logger
 	return err
 }
 
+// saveScanResult はスキャナー 1 つ分の結果を scan_results に保存する。
+// rawOutput が nil の場合は空のマップを保存する。保存失敗はログに出すだけで呼び出し元には返さない。
 func saveScanResult(ctx context.Context, jobID uuid.UUID, scannerName, result, details string, rawOutput *map[string]any, logger *zap.SugaredLogger) {
 	if rawOutput == nil {
 		rawOutput = &map[string]any{}
@@ -707,7 +748,8 @@ func saveScanResult(ctx context.Context, jobID uuid.UUID, scannerName, result, d
 	}
 }
 
-// determineOverallStatus は両方のスキャナーが明示的に clean のときだけ clean を返す
+// determineOverallStatus は両方のスキャナーが明示的に clean のときだけ clean を返す。
+// 優先順位は malicious（ClamAV のみ） > suspicious（どちらか） > clean（両方） で、それ以外（error 等）は failed とする
 func determineOverallStatus(clamavRes, yaraRes scanner.ScanResult) string {
 	if clamavRes.Result == "malicious" {
 		return "malicious"
@@ -730,6 +772,7 @@ type unzipPolicyError struct{ msg string }
 
 func (e *unzipPolicyError) Error() string { return e.msg }
 
+// policyErrorf は書式付きメッセージで unzipPolicyError を生成する。
 func policyErrorf(format string, a ...any) error {
 	return &unzipPolicyError{msg: fmt.Sprintf(format, a...)}
 }
@@ -746,6 +789,7 @@ type errWriter struct {
 	err error
 }
 
+// Write は下位の Writer に書き込み、エラーが起きたら e.err に記録する。
 func (e *errWriter) Write(p []byte) (int, error) {
 	n, err := e.w.Write(p)
 	if err != nil {
@@ -785,9 +829,11 @@ func unzip(src, dest string, cfg config.Config) error {
 
 	cleanDest := filepath.Clean(dest)
 	seen := make(map[string]bool, len(r.File))
+	// total は実際に書き出した合計バイト数
 	var total int64
 
 	for _, f := range r.File {
+		// エントリ名を検証し、展開先ディレクトリの外を指すパス（Zip Slip）を拒否する
 		name := f.Name
 		if name == "" || strings.ContainsRune(name, 0) {
 			return policyErrorf("invalid entry name %q", name)
@@ -826,6 +872,7 @@ func unzip(src, dest string, cfg config.Config) error {
 		}
 		seen[rel] = true
 
+		// 圧縮率が極端に高いエントリは zip bomb とみなして拒否する
 		if f.UncompressedSize64 > ratioCheckThreshold {
 			if f.CompressedSize64 == 0 || f.UncompressedSize64/f.CompressedSize64 > uint64(lim.MaxZipRatio) {
 				return policyErrorf("entry %q has a suspicious compression ratio (%d -> %d bytes, limit %dx)", name, f.CompressedSize64, f.UncompressedSize64, lim.MaxZipRatio)
@@ -835,6 +882,7 @@ func unzip(src, dest string, cfg config.Config) error {
 		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
 			return &unzipIOError{err: err}
 		}
+		// O_EXCL で既存ファイルの上書きを防ぎ、seen で検出できなかった重複も既存エラーとして拒否する
 		out, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 		if err != nil {
 			if os.IsExist(err) {
@@ -849,6 +897,7 @@ func unzip(src, dest string, cfg config.Config) error {
 			return err
 		}
 
+		// 残りの許容量（合計上限と 1 エントリ上限の小さい方）より 1 バイト多く読み、超過を検出する
 		remaining := lim.MaxExtractedBytes - total
 		if remaining > lim.MaxZipEntryBytes {
 			remaining = lim.MaxZipEntryBytes
@@ -862,6 +911,7 @@ func unzip(src, dest string, cfg config.Config) error {
 		if n > remaining {
 			return policyErrorf("archive exceeds extraction limits while extracting %q", name)
 		}
+		// 書き込み側のエラーは I/O 障害、読み出し側のエラー（壊れた zip 等）はそのまま返す
 		if copyErr != nil && copyErr != io.EOF {
 			if ew.err != nil {
 				return &unzipIOError{err: ew.err}
@@ -875,6 +925,9 @@ func unzip(src, dest string, cfg config.Config) error {
 	return nil
 }
 
+// findUnityWebGLRoot は baseDir 以下を走査し、index.html と Build を両方含むディレクトリを
+// Unity WebGL ビルドのルート候補としてすべて返す。
+// 走査件数が maxFilesToStat を超えるとエラーを返し、maxExploreDepth 以上の深さのディレクトリには入らない。
 func findUnityWebGLRoot(baseDir string, maxFilesToStat int, logger *zap.SugaredLogger) ([]string, error) {
 	var unityRoots []string
 	filesStatCount := 0
@@ -921,6 +974,8 @@ func findUnityWebGLRoot(baseDir string, maxFilesToStat int, logger *zap.SugaredL
 	return unityRoots, nil
 }
 
+// findStaticSiteRoot は baseDir 以下を走査し、index.html を含むディレクトリを静的サイトのルート候補としてすべて返す。
+// 走査件数と深さの制限は findUnityWebGLRoot と同じ。
 func findStaticSiteRoot(baseDir string, maxFilesToStat int, logger *zap.SugaredLogger) ([]string, error) {
 	var staticSiteRoots []string
 	filesStatCount := 0

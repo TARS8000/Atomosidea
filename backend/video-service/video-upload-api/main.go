@@ -25,6 +25,7 @@ import (
 	"github.com/atmosidea/shared/config"
 	"github.com/atmosidea/shared/event"
 	"github.com/atmosidea/shared/queue"
+	"github.com/atmosidea/shared/ratelimit"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
@@ -37,23 +38,34 @@ import (
 	"go.uber.org/zap"
 )
 
+// video-upload-api は動画のアップロードを受け付け、SFSP（ファイルスキャン）に送ったうえで、
+// スキャン完了イベントを受けて HLS へ変換し、動画用 MinIO へ配置するサービス。
+//
+// 以下はプロセス全体で共有する設定値・接続・状態。main で環境変数から初期化する。
 var (
-	db                   *pgxpool.Pool
-	jwtSecret            []byte
-	uploadDir            string
-	sfspApiUrl           string
-	sfspApiKey           string
+	// db は app-db（PostgreSQL）への接続プール。
+	db *pgxpool.Pool
+	// jwtSecret は JWT（HS256）の検証に使う共有鍵。
+	jwtSecret []byte
+	// uploadDir は変換ジョブの作業ディレクトリを作る親ディレクトリ（UPLOAD_DIR）。
+	uploadDir string
+	// sfspApiUrl / sfspApiKey は sfsp-api の URL と API キー。
+	sfspApiUrl string
+	sfspApiKey string
+	// sfspCleanMinioClient / sfspCleanBucketName はスキャン済み（クリーン）ファイルを置く SFSP 側 MinIO とそのバケット。
 	sfspCleanMinioClient *minio.Client
 	sfspCleanBucketName  string
-	videoMinioClient     *minio.Client
-	videoBucketName      = "videos"
+	// videoMinioClient / videoBucketName は HLS とサムネイルの配信元になる動画用 MinIO とそのバケット。
+	videoMinioClient *minio.Client
+	videoBucketName  = "videos"
 	// maxVideoUploadBytes は動画ファイル本体の上限（MAX_VIDEO_UPLOAD_BYTES、既定 1 GiB）。
 	maxVideoUploadBytes = int64(1 << 30)
 	// ffmpegSem は同時に実行する変換ジョブ（= ffmpeg）の数を FFMPEG_MAX_CONCURRENCY に制限する。
 	ffmpegSem chan struct{}
 	// ffmpegTimeout は ffmpeg 1 回の実行に許す最大時間（FFMPEG_TIMEOUT、既定 2h）。
-	ffmpegTimeout         = 2 * time.Hour
-	logger                *zap.SugaredLogger
+	ffmpegTimeout = 2 * time.Hour
+	logger        *zap.SugaredLogger
+	// allowedVideoMimeTypes は先頭 512 バイトから判定した MIME タイプのうち、受け付けるもの。
 	allowedVideoMimeTypes = map[string]bool{
 		"video/mp4":        true,
 		"video/webm":       true,
@@ -61,6 +73,7 @@ var (
 		"video/x-msvideo":  true,
 		"video/x-matroska": true,
 	}
+	// teamServiceURL はチーム投稿権限を問い合わせる team-service のベース URL（末尾の / は除去済み）。
 	teamServiceURL string
 
 	// jobs は処理中の変換ジョブのキャンセル関数（動画 ID がキー）。削除ハンドラーが呼ぶ。
@@ -71,13 +84,14 @@ var (
 // multipartOverhead は動画ファイル以外のフォーム（title / description / team_id と境界）に許す余裕。
 const multipartOverhead = 1 << 20
 
-// teamAccessCheck calls the team-service permission endpoint to verify that the
-// caller is allowed to post to the given team. Returns true if posting is allowed.
-// A missing/empty team_id is treated as a public post (always allowed).
+// teamAccessCheck は team-service の権限エンドポイントに問い合わせ、呼び出し元が指定チームへ投稿できるかを確認する。
+// 投稿できる場合に true を返す。team_id が空なら全体公開の投稿として常に許可する。
+// 通信失敗・200 以外の応答・応答の解析失敗はすべて拒否（false）として扱う（fail closed）。
 func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	if teamToken == "" {
 		return true
 	}
+	// 呼び出し元の Authorization ヘッダーをそのまま転送し、本人の権限で判定させる。
 	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", teamServiceURL+"/api/teams/"+url.PathEscape(teamToken)+"/permission", nil)
 	if err != nil {
 		logger.Errorf("teamAccessCheck: failed to create request: %v", err)
@@ -107,14 +121,21 @@ func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	return body.CanPost
 }
 
+// videos.status に入る動画の状態。scanning と processing 以外は終端状態として扱う。
 const (
-	StatusScanning    = "scanning"
-	StatusProcessing  = "processing"
-	StatusPublic      = "public"
-	StatusError       = "error"
+	// StatusScanning は SFSP のスキャン結果待ち。
+	StatusScanning = "scanning"
+	// StatusProcessing はスキャン済みで HLS 変換の待機中・実行中。
+	StatusProcessing = "processing"
+	// StatusPublic は変換が完了し公開済み。
+	StatusPublic = "public"
+	// StatusError は変換などの処理に失敗した状態。
+	StatusError = "error"
+	// StatusQuarantined はスキャンで malicious / suspicious と判定され隔離された状態。
 	StatusQuarantined = "quarantined"
 )
 
+// SfspUploadResponse は sfsp-api の POST /api/v1/files の応答本文。
 type SfspUploadResponse struct {
 	FileID string `json:"file_id"`
 	JobID  string `json:"job_id"`
@@ -122,6 +143,7 @@ type SfspUploadResponse struct {
 	SHA256 string `json:"sha256"`
 }
 
+// generateRandomID は暗号論的乱数 5 バイトから 10 文字の 16 進文字列（videos.id 用）を生成する。
 func generateRandomID() (string, error) {
 	bytes := make([]byte, 5)
 	if _, err := rand.Read(bytes); err != nil {
@@ -130,7 +152,7 @@ func generateRandomID() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-// envInt64 / envInt / envDuration は環境変数を読み、未設定・不正・0 以下なら既定値を返す。
+// envInt64 は環境変数を int64 として読み、未設定・不正・0 以下なら警告を出して既定値を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -144,6 +166,7 @@ func envInt64(name string, def int64) int64 {
 	return n
 }
 
+// envDuration は環境変数を time.Duration（例: "90m"）として読み、未設定・不正・0 以下なら警告を出して既定値を返す。
 func envDuration(name string, def time.Duration) time.Duration {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -157,7 +180,8 @@ func envDuration(name string, def time.Duration) time.Duration {
 	return d
 }
 
-// safeExt は拡張子を英数字だけ（最大 10 文字）に制限して返す。条件を満たさなければ空文字。
+// safeExt は拡張子を英数字だけ（最大 10 文字）に制限し、小文字にして返す。条件を満たさなければ空文字。
+// ユーザー由来のファイル名をローカルパスに混ぜないための処置（パストラバーサル対策）。
 func safeExt(filename string) string {
 	ext := filepath.Ext(filepath.Base(filename))
 	if len(ext) < 2 || len(ext) > 11 {
@@ -204,6 +228,8 @@ func postFileToSFSP(ctx context.Context, r io.Reader, filename, targetService st
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 
+	// 書き込み側の goroutine。HTTP クライアントが pr を読むのに合わせて本文を生成し、
+	// 終了時（エラー時を含む）に pw を閉じて読み取り側へ EOF またはエラーを伝える。
 	go func() {
 		err := func() error {
 			if err := mw.WriteField("target_service", targetService); err != nil {
@@ -223,12 +249,14 @@ func postFileToSFSP(ctx context.Context, r io.Reader, filename, targetService st
 
 	req, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
+		// 読み取り側を閉じて、書き込み goroutine が pw への書き込みで止まったまま残らないようにする。
 		pr.CloseWithError(err)
 		return nil, 0, "", fmt.Errorf("failed to create SFSP request: %w", err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	setSFSPAuth(req)
 
+	// 大きな動画の転送を見込み、タイムアウトは長め（30 分）に取る。
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -237,6 +265,7 @@ func postFileToSFSP(ctx context.Context, r io.Reader, filename, targetService st
 	}
 	defer resp.Body.Close()
 
+	// 応答本文は 1 MiB までに制限して読み、2xx 以外ならエラーとして本文ごと返す。
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, resp.StatusCode, "", fmt.Errorf("failed to read SFSP response: %w", err)
@@ -251,6 +280,8 @@ func postFileToSFSP(ctx context.Context, r io.Reader, filename, targetService st
 	return &data, resp.StatusCode, string(respBytes), nil
 }
 
+// ensureDatabaseExists は DATABASE_URL が指すデータベースが無ければ、管理用の postgres DB に接続して作成する。
+// 対象が空または postgres の場合は何もしない。
 func ensureDatabaseExists(databaseUrl string) error {
 	config, err := pgxpool.ParseConfig(databaseUrl)
 	if err != nil {
@@ -262,6 +293,7 @@ func ensureDatabaseExists(databaseUrl string) error {
 		return nil
 	}
 
+	// 同じホスト・認証情報で、既定の postgres データベースへ接続する DSN を組み立てる。
 	adminDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=postgres sslmode=disable",
 		config.ConnConfig.Host,
 		config.ConnConfig.Port,
@@ -282,6 +314,7 @@ func ensureDatabaseExists(databaseUrl string) error {
 
 	if !exists {
 		logger.Infof("Database '%s' does not exist. Creating...", targetDB)
+		// CREATE DATABASE はプレースホルダーを使えないため、識別子として " をエスケープして埋め込む。
 		_, err = adminDB.Exec(fmt.Sprintf("CREATE DATABASE \"%s\"", strings.ReplaceAll(targetDB, "\"", "\"\"")))
 		if err != nil {
 			return fmt.Errorf("failed to create database '%s': %w", targetDB, err)
@@ -334,7 +367,10 @@ func initTables(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// main は設定を読み込み、DB・Redis・2 つの MinIO に接続したうえで、
+// スキャン完了イベントを処理するワーカーを起動し、:8080 で HTTP API を提供する。
 func main() {
+	// 1. ロガーを初期化する
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -342,6 +378,7 @@ func main() {
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
 
+	// 2. 環境変数から設定を読み込む（必須項目が欠けていれば起動を中止する）
 	ctx := context.Background()
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 	if len(jwtSecret) == 0 {
@@ -360,6 +397,7 @@ func main() {
 	}
 	teamServiceURL = strings.TrimRight(teamServiceURL, "/")
 
+	// アップロード上限と ffmpeg の同時実行数・タイムアウトを決める。
 	maxVideoUploadBytes = envInt64("MAX_VIDEO_UPLOAD_BYTES", 1<<30)
 	ffmpegSem = make(chan struct{}, int(envInt64("FFMPEG_MAX_CONCURRENCY", 2)))
 	ffmpegTimeout = envDuration("FFMPEG_TIMEOUT", 2*time.Hour)
@@ -387,11 +425,14 @@ func main() {
 		logger.Fatalf("Failed to create upload directory: %v", err)
 	}
 
+	// 共通設定（Redis 接続情報など）を読み込む。
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// 3. データベースを用意して接続する（起動直後の DB 未準備に備え、それぞれ最大 5 回再試行する）
+	// ここで失敗し続けても中止せず、続く接続処理の結果で判断する。
 	for i := 0; i < 5; i++ {
 		err = ensureDatabaseExists(databaseUrl)
 		if err == nil {
@@ -422,10 +463,12 @@ func main() {
 		logger.Fatalf("Failed to initialize database tables: %v", err)
 	}
 
+	// 4. Redis に接続する（イベントキューとトークン失効リストに使う）
 	if err := queue.ConnectRedis(cfg, logger); err != nil {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 5. SFSP のクリーンファイル用 MinIO と、動画配信用 MinIO のクライアントを作る
 	sfspCleanMinioClient, err = minio.New(sfspCleanMinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(sfspCleanMinioAccessKey, sfspCleanMinioSecretKey, ""),
 		Secure: sfspCleanMinioUseSSL,
@@ -453,7 +496,7 @@ func main() {
 	}
 	logger.Info("Successfully connected to Video MinIO!")
 
-	// 前回の異常終了で Ack されずに残ったイベントを本来のキューへ戻してから消費を始める。
+	// 6. 前回の異常終了で Ack されずに残ったイベントを本来のキューへ戻してから消費を始める。
 	if n, err := queue.RecoverProcessing(ctx, queue.StreamCompletionQueue); err != nil {
 		logger.Errorf("Failed to recover unacknowledged events from %s: %v", queue.ProcessingQueueName(queue.StreamCompletionQueue), err)
 	} else if n > 0 {
@@ -462,24 +505,41 @@ func main() {
 
 	go videoWorker(ctx)
 
+	// 7. ルーティングを設定して HTTP サーバーを起動する（/api 配下はすべて JWT 認証が必要）
+	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
+	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
+	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
 	r := gin.Default()
 	r.MaxMultipartMemory = 32 << 20
 
 	api := r.Group("/api")
 	api.Use(authMiddleware())
 	{
-		api.POST("/videos/upload", uploadHandler)
+		api.POST("/videos/upload", uploadLimitMiddleware(uploadLimits), uploadHandler)
 		api.DELETE("/videos/:id", deleteHandler)
 		api.DELETE("/videos/:id/thumbnail", deleteThumbnailHandler)
 	}
 
 	logger.Info("INFO: Video Upload service starting on port 8080")
-	if err := r.Run(":8080"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（大きなアップロードを受けるので本文の読み取りは長めに許す）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		logger.Fatalf("Failed to run server: %v", err)
 	}
 }
 
+// uploadHandler は POST /api/videos/upload を処理する。動画を検証して SFSP へスキャン依頼し、
+// videos に初期レコードを作って 202 Accepted を返す。変換はスキャン完了イベントを受けた videoWorker が行う。
 func uploadHandler(c *gin.Context) {
+	// 1. 認証済みユーザーの ID を取り出す
 	uploaderIDStr := c.GetString("userID")
 	if uploaderIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user session"})
@@ -492,6 +552,7 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 2. サイズ上限を確認する（Content-Length で早期に弾き、本文自体も上限で打ち切る）
 	tooLarge := gin.H{"error": fmt.Sprintf("File is too large. The maximum size is %d bytes.", maxVideoUploadBytes)}
 	if c.Request.ContentLength > maxVideoUploadBytes+multipartOverhead {
 		c.JSON(http.StatusRequestEntityTooLarge, tooLarge)
@@ -516,6 +577,7 @@ func uploadHandler(c *gin.Context) {
 		}
 	}()
 
+	// 3. 動画ファイルを取り出し、ファイル単体のサイズを確認する
 	file, header, err := c.Request.FormFile("video")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Video file is required"})
@@ -528,6 +590,8 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 4. 先頭 512 バイトから実際の MIME タイプを判定する（クライアント申告の Content-Type は信用しない）
+	// 判定後は SFSP へ全体を送るため、読み取り位置を先頭へ戻す。
 	buffer := make([]byte, 512)
 	n, err := io.ReadFull(file, buffer)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -545,6 +609,7 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 5. フォーム項目を取り出し、チーム指定があれば投稿権限を確認する
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 	teamID := c.PostForm("team_id")
@@ -554,6 +619,7 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 6. SFSP へファイルを送ってスキャンを依頼する（接続できない場合は 503、それ以外の失敗は 500）
 	originalFilename := displayFilename(header.Filename)
 
 	sfspRespData, sfspStatus, sfspBody, err := postFileToSFSP(c.Request.Context(), file, originalFilename, "stream")
@@ -576,6 +642,7 @@ func uploadHandler(c *gin.Context) {
 		sfspRespData.Status,
 	)
 
+	// 7. 動画 ID を採番し、SFSP のジョブ ID を検証する
 	videoID, err := generateRandomID()
 	if err != nil {
 		logger.Errorf("Error generating random ID: %v", err)
@@ -595,6 +662,8 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 8. 初期状態を決める。通常は scanning から始めるが、SFSP が 200 かつ status=clean を返した場合は
+	// 既存のクリーンファイルとみなし、スキャン待ちを飛ばして processing から始める。
 	videoStatus := StatusScanning
 	processingDetails := "セキュリティスキャン待機中..."
 	if sfspStatus == http.StatusOK && strings.ToLower(sfspRespData.Status) == "clean" {
@@ -602,6 +671,7 @@ func uploadHandler(c *gin.Context) {
 		processingDetails = "セキュリティスキャン完了 (既存クリーンファイル)。動画変換待機中..."
 	}
 
+	// 9. videos に初期レコードを作る。team_id が空なら NULL（全体公開）として保存する。
 	teamIDVal := interface{}(teamID)
 	if teamID == "" {
 		teamIDVal = nil
@@ -615,6 +685,8 @@ func uploadHandler(c *gin.Context) {
 		return
 	}
 
+	// 10. 既存クリーンファイルの場合はスキャンが走らない想定のため、完了イベントをこちらで作り直して
+	// キューに積み、videoWorker に変換させる。積めなかった場合はログのみで、応答は成功のまま返す。
 	if videoStatus == StatusProcessing {
 		fileID, err := uuid.Parse(sfspRespData.FileID)
 		if err != nil {
@@ -648,6 +720,7 @@ func uploadHandler(c *gin.Context) {
 
 // videoWorker は sfsp:completed:stream を BRPOPLPUSH で取り出し（処理中リストへ退避）、
 // DB が終端状態（public / error / quarantined など）になってから Ack する。
+// 取り出しエラー時は 5 秒待って再試行し、ctx が終了していれば戻る。
 func videoWorker(ctx context.Context) {
 	logger.Info("Video Worker started. Waiting for scan completion events...")
 	q := queue.StreamCompletionQueue
@@ -670,6 +743,7 @@ func videoWorker(ctx context.Context) {
 	}
 }
 
+// ackStream は処理済みのイベントを処理中リストから取り除く。失敗してもログに残すだけにする。
 func ackStream(payload string) {
 	if err := queue.Ack(context.Background(), queue.StreamCompletionQueue, payload); err != nil {
 		logger.Errorf("Failed to ack event on %s: %v", queue.StreamCompletionQueue, err)
@@ -677,6 +751,7 @@ func ackStream(payload string) {
 }
 
 // findVideoByJob は sfsp_job_id に一致する動画を探す。スキャンが INSERT より先に終わる競合に備え、少し待って再試行する。
+// 見つからない場合のみ 2 秒間隔で最大 10 回試し、それ以外のエラーは即座に返す。
 func findVideoByJob(ctx context.Context, jobID uuid.UUID) (videoID, status string, err error) {
 	const attempts = 10
 	for i := 1; i <= attempts; i++ {
@@ -691,9 +766,13 @@ func findVideoByJob(ctx context.Context, jobID uuid.UUID) (videoID, status strin
 	return
 }
 
+// handleStreamEvent はスキャン完了イベント 1 件を処理する。処理を続けても意味がないイベント
+// （壊れた JSON・対象外・該当動画なし・重複）は Ack して捨て、clean なら変換に進む。
+// DB 更新に失敗した場合は Ack せず、次回起動時の回収に任せる。
 func handleStreamEvent(payload string) {
 	ctx := context.Background()
 
+	// 1. イベントを解析し、動画向けか確認する
 	var ev event.ScanCompletionEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 		logger.Errorf("ERROR: Unmarshalling event payload (dropping): %v", err)
@@ -707,6 +786,7 @@ func handleStreamEvent(payload string) {
 		return
 	}
 
+	// 2. 対応する動画レコードを探す
 	videoID, status, err := findVideoByJob(ctx, ev.JobID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -719,12 +799,14 @@ func handleStreamEvent(payload string) {
 		return
 	}
 
+	// 3. 既に終端状態なら重複イベントとして捨てる
 	if status != StatusScanning && status != StatusProcessing {
 		logger.Infof("[VideoID: %s] Already in terminal status '%s'. Dropping duplicate event.", videoID, status)
 		ackStream(payload)
 		return
 	}
 
+	// 4. clean 以外ならスキャン結果を状態に記録して終える（malicious / suspicious は quarantined、それ以外は結果の文字列のまま）
 	if ev.FinalStatus != "clean" {
 		logger.Infof("[VideoID: %s] Scan result is '%s'. Aborting processing.", videoID, ev.FinalStatus)
 		finalStatus := ev.FinalStatus
@@ -737,24 +819,27 @@ func handleStreamEvent(payload string) {
 		return
 	}
 
+	// 5. clean なら変換する。終端状態まで進めた場合（または動画が削除済みの場合）のみ Ack する。
 	if processVideoAsync(videoID, ev.FileID.String(), ev.Filename) {
 		ackStream(payload)
 	}
 }
 
-// registerJob / unregisterJob / cancelJob は処理中ジョブのキャンセル登録簿を操作する。
+// registerJob は動画 ID に対応する変換ジョブのキャンセル関数を登録簿に登録する。
 func registerJob(videoID string, cancel context.CancelFunc) {
 	jobsMu.Lock()
 	defer jobsMu.Unlock()
 	jobs[videoID] = cancel
 }
 
+// unregisterJob は変換ジョブの終了時に登録簿から取り除く。
 func unregisterJob(videoID string) {
 	jobsMu.Lock()
 	defer jobsMu.Unlock()
 	delete(jobs, videoID)
 }
 
+// cancelJob は処理中の変換ジョブがあればキャンセルして true を返す。無ければ false を返す。
 func cancelJob(videoID string) bool {
 	jobsMu.Lock()
 	defer jobsMu.Unlock()
@@ -813,6 +898,7 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		return updateVideoStatus(bg, videoID, StatusError, details) == nil
 	}
 
+	// 1. ffmpeg の同時実行枠を確保する（待機中に削除されたら後始末して終える）
 	_ = updateVideoStatus(bg, videoID, StatusProcessing, "動画変換の順番待ち...")
 	select {
 	case ffmpegSem <- struct{}{}:
@@ -827,6 +913,7 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		return true
 	}
 
+	// 2. 作業ディレクトリを用意する
 	// ユーザーのファイル名はローカルのパスに使わない。ジョブごとに一意な作業ディレクトリを作る。
 	workDir, err := os.MkdirTemp(uploadDir, "job-"+videoID+"-")
 	if err != nil {
@@ -836,8 +923,11 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 
 	tempVideoPath := filepath.Join(workDir, "input"+safeExt(filename))
 
+	// 3. SFSP のクリーン用 MinIO から動画をダウンロードする
 	_ = updateVideoStatus(bg, videoID, StatusProcessing, "クリーンな動画ファイルをダウンロード中...")
 
+	// クリーン用バケット内のキー形式として考えられる候補を順に試し、最初に取得できたものを使う。
+	// どれも無ければバケットを fileID の接頭辞で走査する。これを最大 5 回（5 秒間隔）繰り返す。
 	candidateKeys := []string{
 		fileIDStr,
 		fmt.Sprintf("%s/%s", fileIDStr, filename),
@@ -896,6 +986,7 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		return fail(fmt.Sprintf("Failed to download clean file from SFSP Clean MinIO (fileID: %s): %v", fileIDStr, downloadErr))
 	}
 
+	// 4. HLS に変換する
 	_ = updateVideoStatus(bg, videoID, StatusProcessing, "動画ファイルの変換を開始しました...")
 	hlsOutputPath := filepath.Join(workDir, "hls")
 	if err := os.MkdirAll(hlsOutputPath, os.ModePerm); err != nil {
@@ -906,6 +997,8 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		return fail(fmt.Sprintf("HLS変換に失敗しました: %v", err))
 	}
 
+	// 5. サムネイルを生成してアップロードする（失敗しても動画の公開は続ける）
+	// 360p のプレイリストがあればそれを入力にし、無ければ元動画から切り出す。
 	_ = updateVideoStatus(bg, videoID, StatusProcessing, "サムネイルを生成中...")
 	thumbnailPath := ""
 	generatedThumbnailPath := filepath.Join(workDir, "thumbnail.jpg")
@@ -921,16 +1014,18 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		thumbnailPath = uploadThumbnailToMinIO(jobCtx, videoID, generatedThumbnailPath)
 	}
 
-	// 変換したHLSをMinIOへ展開する。ローカルの作業ディレクトリは defer で削除される。
+	// 6. 変換したHLSをMinIOへ展開する。ローカルの作業ディレクトリは defer で削除される。
 	if err := uploadHLSMinIO(jobCtx, videoID, hlsOutputPath); err != nil {
 		return fail(fmt.Sprintf("HLSのMinIOアップロードに失敗しました: %v", err))
 	}
 
+	// 変換・展開の間に削除されていたら、公開せずに後始末して終える。
 	if deletedOrCancelled() {
 		cleanupDeletedVideo(videoID)
 		return true
 	}
 
+	// 7. 配信用パスとサムネイルを記録して public にする
 	m3u8RelativePath := fmt.Sprintf("/videos/%s/playlist.m3u8", videoID)
 	var thumbVal interface{} = thumbnailPath
 	if thumbnailPath == "" {
@@ -943,7 +1038,7 @@ func processVideoAsync(videoID, fileIDStr, filename string) bool {
 		return fail(fmt.Sprintf("最終的なDB更新に失敗しました: %v", err))
 	}
 	if tag.RowsAffected() == 0 {
-		// 最終更新の直前に削除された。
+		// 最終更新の直前に削除された。展開済みのオブジェクトを片付ける。
 		cleanupDeletedVideo(videoID)
 		return true
 	}
@@ -961,6 +1056,7 @@ func runFFmpeg(ctx context.Context, args ...string) error {
 	cmd.Stderr = os.Stderr
 	logger.Infof("Executing: %s", cmd.String())
 	err := cmd.Run()
+	// 停止理由を区別してエラーにする（タイムアウトか、呼び出し元のキャンセルか）。
 	if err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("ffmpeg timed out after %s: %w", ffmpegTimeout, err)
 	}
@@ -970,7 +1066,10 @@ func runFFmpeg(ctx context.Context, args ...string) error {
 	return err
 }
 
+// convertToHLS は入力動画を 360p / 480p / 720p / 1080p の HLS（H.264 + AAC、10 秒セグメント）に変換し、
+// 各画質のプレイリストを束ねるマスタープレイリスト hlsOutputDir/playlist.m3u8 を書き出す。
 func convertToHLS(ctx context.Context, inputPath, hlsOutputDir, videoID string) error {
+	// 画質ごとの高さとビットレート。
 	profiles := []struct {
 		height       int
 		videoBitrate string
@@ -982,6 +1081,7 @@ func convertToHLS(ctx context.Context, inputPath, hlsOutputDir, videoID string) 
 		{height: 1080, videoBitrate: "4000k", audioBitrate: "192k"},
 	}
 
+	// 1. 画質ごとに ffmpeg を実行して <高さ>p/ 配下にプレイリストとセグメントを作る
 	for _, p := range profiles {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -996,6 +1096,8 @@ func convertToHLS(ctx context.Context, inputPath, hlsOutputDir, videoID string) 
 		playlistPath := filepath.Join(variantPath, "playlist.m3u8")
 		segmentPath := filepath.Join(variantPath, "segment%03d.ts")
 
+		// キーフレーム間隔を 48 フレームに固定し、シーン切り替えでの挿入を無効にして、
+		// 画質間でセグメント境界を揃えやすくする。scale=-2:<高さ> で縦横比を保ったまま幅を偶数にする。
 		ffmpegArgs := []string{
 			"-i", inputPath,
 			"-preset", "fast",
@@ -1021,6 +1123,8 @@ func convertToHLS(ctx context.Context, inputPath, hlsOutputDir, videoID string) 
 		}
 	}
 
+	// 2. マスタープレイリストを書き出す。BANDWIDTH は映像と音声のビットレートの合計、
+	// RESOLUTION は 16:9 を仮定して高さから幅を計算した値。
 	_ = updateVideoStatus(context.Background(), videoID, StatusProcessing, "マスタープレイリストを生成中...")
 	masterPlaylistPath := filepath.Join(hlsOutputDir, "playlist.m3u8")
 	masterPlaylistContent := "#EXTM3U\n#EXT-X-VERSION:3\n"
@@ -1046,6 +1150,7 @@ func convertToHLS(ctx context.Context, inputPath, hlsOutputDir, videoID string) 
 	return nil
 }
 
+// updateVideoStatus は動画の status と processing_details（画面に出す進捗文言）を更新する。失敗時はログも残す。
 func updateVideoStatus(ctx context.Context, videoID, status, details string) error {
 	_, err := db.Exec(ctx, "UPDATE videos SET status = $1, processing_details = $2, updated_at = NOW() WHERE id = $3", status, details, videoID)
 	if err != nil {
@@ -1054,7 +1159,10 @@ func updateVideoStatus(ctx context.Context, videoID, status, details string) err
 	return err
 }
 
+// deleteHandler は DELETE /api/videos/:id を処理する。投稿者本人または管理者だけが削除でき、
+// 変換中のジョブを止めたうえで、DB の行、MinIO の HLS とサムネイルを削除する。
 func deleteHandler(c *gin.Context) {
+	// 1. 対象動画を取得し、削除権限を確認する
 	videoID := c.Param("id")
 	if videoID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid video ID"})
@@ -1077,23 +1185,24 @@ func deleteHandler(c *gin.Context) {
 		return
 	}
 
-	// 変換中なら止める（ジョブ側は行が消えたことを確認して、アップロード済みのオブジェクトを片付ける）。
+	// 2. 変換中なら止める（ジョブ側は行が消えたことを確認して、アップロード済みのオブジェクトを片付ける）。
 	if cancelJob(videoID) {
 		logger.Infof("[VideoID: %s] Cancelled in-progress conversion job for deletion", videoID)
 	}
 
-	// 先に行を消し、変換ジョブが後から public に更新できないようにする。
+	// 3. 先に行を消し、変換ジョブが後から public に更新できないようにする。
 	if _, err = db.Exec(context.Background(), "DELETE FROM videos WHERE id = $1", videoID); err != nil {
 		logger.Errorf("Error deleting video record %s from DB: %v", videoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete video record"})
 		return
 	}
 
-	// HLSはMinIOへ保存しているのでMinIOから削除する。
+	// 4. HLSはMinIOへ保存しているのでMinIOから削除する（失敗してもログのみで、削除自体は成功として返す）。
 	if err := removeHLSMinIO(context.Background(), videoID); err != nil {
 		logger.Errorf("Failed to delete HLS from MinIO for video %s: %v", videoID, err)
 	}
 
+	// 5. サムネイルを削除する。thumbnail_path（/videos/thumbnails/<id>）があればそこからキーを求め、無ければ既定のキーを使う。
 	objectName := "thumbnails/" + videoID
 	if thumbnailPath.Valid && thumbnailPath.String != "" {
 		objectName = strings.TrimPrefix(thumbnailPath.String, "/videos/")
@@ -1105,6 +1214,8 @@ func deleteHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Video deleted successfully"})
 }
 
+// deleteThumbnailHandler は DELETE /api/videos/:id/thumbnail を処理する。投稿者本人または管理者だけが、
+// MinIO 上のサムネイルを削除して thumbnail_path を NULL にできる。
 func deleteThumbnailHandler(c *gin.Context) {
 	videoID := c.Param("id")
 	if videoID == "" {
@@ -1128,6 +1239,7 @@ func deleteThumbnailHandler(c *gin.Context) {
 		return
 	}
 
+	// MinIO からの削除に失敗してもログのみで、DB の更新は続ける。
 	if thumbnailPath.Valid && thumbnailPath.String != "" {
 		objectName := strings.TrimPrefix(thumbnailPath.String, "/videos/")
 		if err := videoMinioClient.RemoveObject(context.Background(), videoBucketName, objectName, minio.RemoveObjectOptions{}); err != nil {
@@ -1154,6 +1266,7 @@ func authMiddleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
 			return
 		}
+		// 1. 署名と有効期限を検証する。署名方式は HS256 に固定し、alg のすり替え（none など）を防ぐ。
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			return jwtSecret, nil
@@ -1168,6 +1281,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// 2. jti を必須とし、ログアウト済みトークンの一覧（Redis）に載っていないか確認する
 		jti, _ := claims["jti"].(string)
 		if jti == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
@@ -1184,6 +1298,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// 3. ユーザー ID（sub / userID / user_id のうち最初に見つかったもの）と管理者フラグをコンテキストへ渡す
 		var userID string
 		for _, key := range []string{"sub", "userID", "user_id"} {
 			if val, ok := claims[key].(string); ok && val != "" {
@@ -1203,13 +1318,13 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+// generateThumbnail は動画の 1 秒地点から 1 フレームを切り出し、幅 320 の JPEG サムネイルとして書き出す。
 func generateThumbnail(ctx context.Context, videoPath, thumbnailPath string) error {
 	return runFFmpeg(ctx, "-i", videoPath, "-ss", "00:00:01.000", "-vframes", "1", "-q:v", "2", "-vf", "scale=320:-1", thumbnailPath)
 }
 
-// uploadThumbnailToMinIO uploads a locally generated thumbnail to the video
-// MinIO bucket at thumbnails/<videoID> and returns the served URL
-// (/videos/thumbnails/<videoID>). It returns an empty string on failure.
+// uploadThumbnailToMinIO はローカルで生成したサムネイルを動画用 MinIO バケットの thumbnails/<videoID> に
+// アップロードし、配信用 URL（/videos/thumbnails/<videoID>）を返す。失敗時は空文字を返す。
 func uploadThumbnailToMinIO(ctx context.Context, videoID, localPath string) string {
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -1218,6 +1333,7 @@ func uploadThumbnailToMinIO(ctx context.Context, videoID, localPath string) stri
 	}
 	defer f.Close()
 
+	// 先頭 512 バイトから Content-Type を判定する。
 	buffer := make([]byte, 512)
 	n, _ := f.Read(buffer)
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -1231,6 +1347,7 @@ func uploadThumbnailToMinIO(ctx context.Context, videoID, localPath string) stri
 	}
 
 	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", videoID)
+	// 再試行のたびに読み取り位置を先頭へ戻してから送る。
 	err = putObjectWithRetry(ctx, thumbnailObjectName, func() (minio.UploadInfo, error) {
 		if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
 			return minio.UploadInfo{}, seekErr
@@ -1244,8 +1361,8 @@ func uploadThumbnailToMinIO(ctx context.Context, videoID, localPath string) stri
 	return "/videos/" + thumbnailObjectName
 }
 
-// contentTypeForHLS returns the MIME type for HLS assets so MinIO serves them
-// with the correct Content-Type for browser playback.
+// contentTypeForHLS は HLS の各ファイルに対応する MIME タイプを返す。
+// MinIO がブラウザ再生に必要な正しい Content-Type で配信できるようにするため。
 func contentTypeForHLS(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".m3u8":
@@ -1257,11 +1374,10 @@ func contentTypeForHLS(path string) string {
 	}
 }
 
-// putObjectWithRetry uploads an object to MinIO, retrying on transient failures
-// such as a startup race where video-storage's MinIO is not yet ready to
-// authenticate requests when video-upload-api first starts. The S3 API and
-// credentials are correct, so a few attempts with backoff resolves the race
-// without masking a genuine misconfiguration.
+// putObjectWithRetry は MinIO へのアップロードを、一時的な失敗に備えて最大 5 回（2・4・6・8 秒の待機を挟んで）試す。
+// 想定している一時的な失敗は、video-upload-api の起動直後に video-storage の MinIO がまだ認証を
+// 受け付けられない、という起動時の競合である。S3 API と認証情報自体は正しいため、数回の再試行で
+// この競合は解消し、本当の設定ミスは最終的にエラーとして表に出る。ctx が終了したら途中で打ち切る。
 func putObjectWithRetry(ctx context.Context, objectName string, upload func() (minio.UploadInfo, error)) error {
 	const maxAttempts = 5
 	var lastErr error
@@ -1285,9 +1401,9 @@ func putObjectWithRetry(ctx context.Context, objectName string, upload func() (m
 	return fmt.Errorf("failed to upload %s to MinIO: %w", objectName, lastErr)
 }
 
-// uploadHLSMinIO uploads every file under localHlsDir to the video MinIO bucket.
-// Object keys are "<videoID>/<rel>" (no bucket prefix), matching the nginx
-// stream route which consumes "/videos/<videoID>/<path>" as bucket=videos.
+// uploadHLSMinIO は localHlsDir 配下のすべてのファイルを動画用 MinIO バケットへアップロードする。
+// オブジェクトキーは "<videoID>/<相対パス>"（バケット名の接頭辞なし）。これは nginx の配信ルートが
+// "/videos/<videoID>/<path>" を bucket=videos として扱うことに合わせている。
 func uploadHLSMinIO(ctx context.Context, videoID, localHlsDir string) error {
 	return filepath.Walk(localHlsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -1326,7 +1442,8 @@ func uploadHLSMinIO(ctx context.Context, videoID, localHlsDir string) error {
 	})
 }
 
-// removeHLSMinIO deletes all objects under "<videoID>/" from the video MinIO bucket.
+// removeHLSMinIO は動画用 MinIO バケットから "<videoID>/" 配下のオブジェクトをすべて削除する。
+// 一部で失敗しても残りの削除を続け、最初に起きたエラーを返す。
 func removeHLSMinIO(ctx context.Context, videoID string) error {
 	objectCh := videoMinioClient.ListObjects(ctx, videoBucketName, minio.ListObjectsOptions{
 		Prefix:    fmt.Sprintf("%s/", videoID),
@@ -1349,4 +1466,29 @@ func removeHLSMinIO(ctx context.Context, videoID string) error {
 		}
 	}
 	return firstErr
+}
+
+// uploadLimitMiddleware はユーザーごとのアップロード制限（shared/ratelimit）をかける。authMiddleware の後に置く。
+// ゲーム・静的サイト・動画で同じ Redis のキーを使うので、本数は 3 種類の合計で数える。
+// 管理者は制限しない。Redis に届かないときはログを出して通す（サーバー全体の同時数は nginx でも制限している）。
+func uploadLimitMiddleware(limits ratelimit.UploadLimits) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetBool("isAdmin") {
+			c.Next()
+			return
+		}
+		userID := c.GetString("userID")
+		d, err := ratelimit.CheckUpload(c.Request.Context(), queue.RedisClient, limits, userID)
+		if err != nil {
+			logger.Warnf("Upload rate limit check failed, allowing the request: %v", err)
+		}
+		if !d.Allowed {
+			logger.Warnf("Upload rejected by per-user rate limit: user=%s reason=%s", userID, d.Reason)
+			c.Header("Retry-After", strconv.Itoa(int(d.RetryAfter/time.Second)+1))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": d.Reason})
+			return
+		}
+		defer d.Release()
+		c.Next()
+	}
 }

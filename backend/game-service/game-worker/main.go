@@ -30,12 +30,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// ワーカー全体で共有する接続・設定値。main で初期化し、各 consumer から参照する。
+// tempDir は zip のダウンロード・展開に使う作業ディレクトリ、appURL はゲーム URL の組み立てに使う
+// アプリの公開 URL（APP_URL）。
 var (
 	db              *pgxpool.Pool
-	gameMinioClient *minio.Client // For uploading final game assets
-	sfspMinioClient *minio.Client // For downloading the clean file from SFSP
+	gameMinioClient *minio.Client // 公開用のゲームファイルをアップロードする先（Game 用 MinIO）
+	sfspMinioClient *minio.Client // SFSP からスキャン済みのクリーンなファイルをダウンロードする元
 	gameBucketName  string
-	sfspBucketName  = "clean-files" // Hardcoded as per SFSP design
+	sfspBucketName  = "clean-files" // SFSP の設計に合わせて固定値にしている
 	tempDir         = "./temp"
 	appURL          *url.URL
 	logger          *zap.SugaredLogger
@@ -71,6 +74,8 @@ var imageExtensions = map[string]string{
 	"image/webp": ".webp",
 }
 
+// envInt64 は環境変数 name を正の int64 として読み込む。
+// 未設定なら def を返し、数値でない・0 以下の場合は警告を出して def を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -84,8 +89,10 @@ func envInt64(name string, def int64) int64 {
 	return n
 }
 
+// main は DB・2 つの MinIO・Redis に接続し、ゲーム本体とサムネイルのスキャン完了キューを
+// それぞれ別の goroutine で処理し続ける。
 func main() {
-	// Initialize Zap for logging
+	// ログ出力用に Zap を初期化する
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -95,6 +102,7 @@ func main() {
 
 	ctx := context.Background()
 
+	// 1. 環境変数から接続先と各種上限値を読み込む
 	databaseUrl := os.Getenv("DATABASE_URL")
 	appUrlStr := os.Getenv("APP_URL")
 
@@ -108,25 +116,26 @@ func main() {
 	maxEntryBytes = envInt64("GAME_MAX_ENTRY_BYTES", maxEntryBytes)
 	maxThumbnailBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxThumbnailBytes)
 
-	// Game Storage (for final assets)
+	// Game 用ストレージ（公開用のゲームファイルの保存先）
 	gameMinioEndpoint := os.Getenv("MINIO_ENDPOINT")
 	gameMinioAccessKey := os.Getenv("MINIO_ACCESS_KEY_ID")
 	gameMinioSecretKey := os.Getenv("MINIO_SECRET_ACCESS_KEY")
 	gameMinioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 	gameBucketName = os.Getenv("MINIO_BUCKET_NAME")
 
-	// SFSP Storage (for downloading clean files)
+	// SFSP 用ストレージ（クリーンなファイルのダウンロード元）
 	sfspMinioEndpoint := os.Getenv("SFSP_MINIO_ENDPOINT")
 	sfspMinioAccessKey := os.Getenv("SFSP_MINIO_ACCESS_KEY_ID")
 	sfspMinioSecretKey := os.Getenv("SFSP_MINIO_SECRET_ACCESS_KEY")
 	sfspMinioUseSSL := os.Getenv("SFSP_MINIO_USE_SSL") == "true"
 
-	// Load configuration
+	// 共通設定（Redis の接続情報）を読み込む
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// 2. DB・MinIO・Redis に接続する
 	db, err = pgxpool.New(ctx, databaseUrl)
 	if err != nil {
 		logger.Fatalf("Unable to connect to database: %v\n", err)
@@ -155,13 +164,14 @@ func main() {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 3. 前回の実行で残った一時ファイルを消して作業ディレクトリを作り直す
 	os.RemoveAll(tempDir)
 	os.MkdirAll(tempDir, 0o755)
 
 	gameCompletionQueue := queue.GameCompletionQueue
 	thumbnailCompletionQueue := queue.GameThumbnailCompletionQueue
 
-	// 前回の起動中に取り出したまま Ack していないイベントを元のキューに戻す
+	// 4. 前回の起動中に取り出したまま Ack していないイベントを元のキューに戻す
 	for _, q := range []string{gameCompletionQueue, thumbnailCompletionQueue} {
 		n, err := queue.RecoverProcessing(ctx, q)
 		if err != nil {
@@ -175,7 +185,10 @@ func main() {
 	logger.Infof("Game Worker started (max extracted %d bytes, max entries %d, max entry %d bytes). Waiting for scan completion events...",
 		maxExtractedBytes, maxZipEntries, maxEntryBytes)
 
-	// BRPOPLPUSH は 1 つのキューしか待てないので、キューごとに consumer を動かす
+	// 以前 Content-Encoding: br のまま保存したゲームファイルを gzip に詰め直す（brotli.go。キューの処理とは並行で動かす）
+	go migrateBrotliObjects(ctx)
+
+	// 5. BRPOPLPUSH は 1 つのキューしか待てないので、キューごとに consumer を動かす
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -194,6 +207,7 @@ func main() {
 // 次回起動時の RecoverProcessing で再処理される。
 func consumeQueue(ctx context.Context, queueName, targetService string, handler func(context.Context, *event.ScanCompletionEvent) error) {
 	for {
+		// イベントを取り出す（タイムアウト 0 なので届くまで待つ）。Redis エラー時は 5 秒待って再試行する
 		payload, err := queue.DequeueReliable(ctx, queueName, 0)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -205,6 +219,7 @@ func consumeQueue(ctx context.Context, queueName, targetService string, handler 
 		}
 		logger.Infof("Received event from queue [%s]: %s", queueName, payload)
 
+		// 解釈できないイベントや別サービス宛てのイベントは、再処理しても無駄なので Ack して捨てる
 		var ev event.ScanCompletionEvent
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 			logger.Errorf("ERROR: Unmarshalling event payload from %s: %v (discarding)", queueName, err)
@@ -225,6 +240,7 @@ func consumeQueue(ctx context.Context, queueName, targetService string, handler 
 	}
 }
 
+// ack はイベントを処理中リストから取り除く。失敗してもログに残すだけで処理は続ける。
 func ack(ctx context.Context, queueName, payload string) {
 	if err := queue.Ack(ctx, queueName, payload); err != nil {
 		logger.Errorf("Failed to ack event on %s: %v", queueName, err)
@@ -259,8 +275,12 @@ func findRowByJobID(ctx context.Context, query string, jobID interface{}, dest .
 	return false, lastErr
 }
 
+// processGame はゲーム zip のスキャン完了イベントを処理する。クリーンなら zip をダウンロード・展開し、
+// index.html を書き換えて Game 用 MinIO にアップロードし、status を 'public' にする。
+// クリーンでなければ quarantined / invalid / failed を記録する。
+// 戻り値の error は「DB に終端の状態を書けなかった」ことを表し、呼び出し元はその場合 Ack しない。
 func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
-	// Find the game record using the SFSP job ID
+	// 1. SFSP のジョブ ID からゲームの行を探す
 	var gameID, currentStatus string
 	found, err := findRowByJobID(ctx,
 		"SELECT id, COALESCE(status, '') FROM games WHERE sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -279,7 +299,8 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		return nil
 	}
 
-	// Handle non-clean files
+	// 2. クリーンでないファイルを処理する
+	// malicious / suspicious は quarantined、invalid はそのまま、それ以外は failed として記録する
 	if event.FinalStatus != "clean" {
 		logger.Infof("[GameID: %s] Scan result is '%s'. Aborting processing.", gameID, event.FinalStatus)
 		finalStatus := event.FinalStatus
@@ -297,9 +318,11 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		return updateGameStatus(ctx, gameID, "failed", fmt.Sprintf("%s: %v", msg, err))
 	}
 
+	// 途中経過の status 更新は進捗表示用なので、失敗しても処理を止めない（戻り値を見ていない）
 	logger.Infof("[GameID: %s] File is clean. Starting game processing...", gameID)
 	updateGameStatus(ctx, gameID, "processing", "スキャン完了。ゲームファイルの処理を開始しました...")
 
+	// 3. 作業用のパスを決める
 	// 一時ファイル名にユーザーのファイル名は使わない（パストラバーサル・同名衝突の防止）
 	localZipPath := filepath.Join(tempDir, fmt.Sprintf("game-%s.zip", gameID))
 	unzipPath := filepath.Join(tempDir, fmt.Sprintf("game-%s", gameID))
@@ -307,6 +330,7 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 	defer os.Remove(localZipPath)
 	defer os.RemoveAll(unzipPath)
 
+	// 4. SFSP からクリーンな zip をダウンロードする
 	// sfsp はクリーンなファイルを clean-files の <file_id> に保存する
 	objectKey := event.FileID.String()
 
@@ -317,6 +341,7 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		return fail("Failed to download clean file from SFSP MinIO", err)
 	}
 
+	// 5. zip を展開し、展開後は zip を消してディスクを空ける
 	logger.Infof("[GameID: %s] Unzipping %s...", gameID, localZipPath)
 	updateGameStatus(ctx, gameID, "processing", "ゲームファイルを解凍中...")
 	if err := unzip(localZipPath, unzipPath); err != nil {
@@ -324,6 +349,7 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 	}
 	os.Remove(localZipPath)
 
+	// 6. index.html のあるディレクトリを探し、index.html が通常ファイルで上限サイズ以内か確かめる
 	logger.Infof("[GameID: %s] Finding game root in %s...", gameID, unzipPath)
 	gameRoot, err := findGameRoot(unzipPath)
 	if err != nil {
@@ -334,6 +360,7 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		return fail("Invalid index.html", fmt.Errorf("index.html must be a regular file of at most %d bytes", maxIndexHTMLBytes))
 	}
 
+	// 7. index.html からゲームの解像度を読み取る（見つからなければ既定値を使う）
 	logger.Infof("[GameID: %s] Extracting native resolution...", gameID)
 	nativeWidth, nativeHeight, err := extractNativeResolution(indexPath)
 	if err != nil {
@@ -343,11 +370,15 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		nativeHeight = 720
 	}
 
+	// 8. 余白・スクロールと Unity のフッターを消す CSS を index.html に差し込む
 	logger.Infof("[GameID: %s] Modifying index.html...", gameID)
 	if err := modifyIndexHtml(indexPath); err != nil {
 		return fail("Failed to modify index.html", err)
 	}
 
+	// 9. ゲーム URL を組み立て、展開したファイルを <gameID>/ 以下にアップロードする
+	// ゲームは <scheme>://<gameID>.<APP_URL のホスト名>:<ポート>/index.html というゲームごとの
+	// サブドメインで配信する
 	publicPathPrefix := fmt.Sprintf("%s/", gameID)
 
 	hostParts := strings.Split(appURL.Host, ":")
@@ -359,6 +390,7 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 		return fail("Failed to upload unzipped files", err)
 	}
 
+	// 10. URL と解像度を保存して公開状態にする
 	logger.Infof("[GameID: %s] Updating game status in DB to 'public'...", gameID)
 	if err := updateGameStatusWithResolution(ctx, gameID, "public", gameURL, nativeWidth, nativeHeight); err != nil {
 		return fmt.Errorf("CRITICAL: failed to update DB status to public for game %s: %w", gameID, err)
@@ -368,7 +400,12 @@ func processGame(ctx context.Context, event *event.ScanCompletionEvent) error {
 	return nil
 }
 
+// processGameThumbnail はゲームのサムネイル画像のスキャン完了イベントを処理する。クリーンな画像なら
+// Game 用 MinIO の thumbnails/<gameID> に保存して games.thumbnail_url を更新する。
+// 行が見つかれば、成功・失敗のどちらでも thumbnail_sfsp_job_id を NULL に戻す
+// （その行のジョブ ID がまだこのイベントのものである場合のみ）。
 func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent) error {
+	// 1. サムネイル用のジョブ ID からゲームの行と現在のサムネイル URL を探す
 	var gameID string
 	var currentThumbnailURL string
 	found, err := findRowByJobID(ctx,
@@ -394,6 +431,7 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 		return clearJob()
 	}
 
+	// 2. クリーンでなければサムネイルは差し替えずにジョブだけ終わらせる
 	if event.FinalStatus != "clean" {
 		logger.Infof("[GameID: %s] Thumbnail scan result is '%s'. Aborting thumbnail processing.", gameID, event.FinalStatus)
 		return clearJob()
@@ -401,6 +439,7 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 
 	logger.Infof("[GameID: %s] Thumbnail is clean. Processing thumbnail...", gameID)
 
+	// 3. 上限サイズまでメモリにダウンロードし、中身から判定した Content-Type が許可した画像か確かめる
 	// sfsp はクリーンなファイルを clean-files の <file_id> に保存する
 	objectKey := event.FileID.String()
 	logger.Infof("[GameID: %s] Downloading thumbnail key '%s' from SFSP MinIO bucket '%s'...", gameID, objectKey, sfspBucketName)
@@ -414,11 +453,13 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 		return fail("Rejected thumbnail", fmt.Errorf("non-image content type %q", contentType))
 	}
 
-	// Name the thumbnail object after the game ID so the thumbnail is directly
-	// identifiable with its game (e.g. thumbnails/<game_id> mirrors games/<game_id>/).
+	// 4. 保存先のオブジェクト名を決める
+	// サムネイルのオブジェクト名をゲーム ID にして、どのゲームのものか直接分かるようにする
+	// （例: thumbnails/<game_id> は games/<game_id>/ と対応する）。
 	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", gameID)
 
-	// Reclaim storage: delete the previous thumbnail before uploading the new one.
+	// 5. ストレージを回収する: 新しいサムネイルをアップロードする前に以前のサムネイルを削除する。
+	// 以前の URL が同じオブジェクト名なら、アップロードで上書きされるので削除しない。
 	if currentThumbnailURL != "" {
 		oldObjectName := strings.TrimPrefix(currentThumbnailURL, "/games/")
 		if oldObjectName != thumbnailObjectName {
@@ -430,6 +471,7 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 		}
 	}
 
+	// 6. 判定した Content-Type を付けてアップロードする
 	_, err = gameMinioClient.PutObject(ctx, gameBucketName, thumbnailObjectName, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
 		ContentType: contentType,
 	})
@@ -437,6 +479,7 @@ func processGameThumbnail(ctx context.Context, event *event.ScanCompletionEvent)
 		return fail("Failed to upload thumbnail to game MinIO", err)
 	}
 
+	// 7. URL を保存し、同時にジョブ ID を NULL に戻す（別の新しいジョブが入っていれば更新しない）
 	thumbnailURL := fmt.Sprintf("/games/%s", thumbnailObjectName)
 	_, err = db.Exec(ctx, "UPDATE games SET thumbnail_url = $1, thumbnail_sfsp_job_id = NULL WHERE id = $2 AND thumbnail_sfsp_job_id = $3", thumbnailURL, gameID, event.JobID)
 	if err != nil {
@@ -461,6 +504,7 @@ func downloadLimited(ctx context.Context, bucket, key string, limit int64) ([]by
 	if st.Size > limit {
 		return nil, fmt.Errorf("object size %d exceeds limit %d", st.Size, limit)
 	}
+	// Stat のサイズだけを信用せず、実際の読み込みも limit+1 バイトで打ち切って超過を検出する
 	data, err := io.ReadAll(io.LimitReader(obj, limit+1))
 	if err != nil {
 		return nil, err
@@ -471,6 +515,8 @@ func downloadLimited(ctx context.Context, bucket, key string, limit int64) ([]by
 	return data, nil
 }
 
+// findGameRoot は展開先から index.html のあるディレクトリを探す。basePath 直下にあればそれを、
+// 直下がディレクトリ 1 つだけでその中にあればそのディレクトリを返す。それ以外はエラー。
 func findGameRoot(basePath string) (string, error) {
 	if _, err := os.Stat(filepath.Join(basePath, "index.html")); err == nil {
 		return basePath, nil
@@ -488,12 +534,15 @@ func findGameRoot(basePath string) (string, error) {
 	return "", fmt.Errorf("could not find a valid game structure; index.html not found")
 }
 
+// extractNativeResolution は index.html からゲームの解像度（幅・高さ）を読み取る。
+// 見つからなければエラーを返す。
 func extractNativeResolution(indexPath string) (width, height int, err error) {
 	content, err := os.ReadFile(indexPath)
 	if err != nil {
 		return 0, 0, err
 	}
 	stringContent := string(content)
+	// まず Unity の WebGL テンプレートにある canvas.style.width = "960px" 形式の指定を探す
 	reWidth := regexp.MustCompile(`canvas\.style\.width\s*=\s*"(\d+)px"`)
 	reHeight := regexp.MustCompile(`canvas\.style\.height\s*=\s*"(\d+)px"`)
 	widthMatch := reWidth.FindStringSubmatch(stringContent)
@@ -503,6 +552,7 @@ func extractNativeResolution(indexPath string) (width, height int, err error) {
 		h, _ := strconv.Atoi(heightMatch[1])
 		return w, h, nil
 	}
+	// 次に <canvas width="..." height="..."> 属性を探す（width が height より前にある場合のみ一致する）
 	reCanvasTag := regexp.MustCompile(`<canvas[^>]*width="(\d+)"[^>]*height="(\d+)"`)
 	canvasTagMatch := reCanvasTag.FindStringSubmatch(stringContent)
 	if len(canvasTagMatch) > 2 {
@@ -513,6 +563,8 @@ func extractNativeResolution(indexPath string) (width, height int, err error) {
 	return 0, 0, fmt.Errorf("could not find resolution")
 }
 
+// modifyIndexHtml は index.html の最初の </head> の直前に、余白とスクロールを無くし
+// Unity のフッター (#unity-footer) を非表示にする <style> を差し込む。</head> がなければ変更しない。
 func modifyIndexHtml(indexPath string) error {
 	content, err := os.ReadFile(indexPath)
 	if err != nil {
@@ -523,6 +575,8 @@ func modifyIndexHtml(indexPath string) error {
 	return os.WriteFile(indexPath, []byte(modifiedContent), 0644)
 }
 
+// updateGameStatus はゲームの status と processing_details（進捗やエラーの説明文）を更新する。
+// 失敗時はログに残してエラーを返す。
 func updateGameStatus(ctx context.Context, gameID, status, details string) error {
 	_, err := db.Exec(ctx, "UPDATE games SET status = $1, processing_details = $2, updated_at = NOW() WHERE id = $3", status, details, gameID)
 	if err != nil {
@@ -531,22 +585,30 @@ func updateGameStatus(ctx context.Context, gameID, status, details string) error
 	return err
 }
 
+// updateGameStatusWithResolution は status に加えてゲーム URL と解像度を保存し、processing_details を NULL にする。
 func updateGameStatusWithResolution(ctx context.Context, gameID, status, gameURL string, nativeWidth, nativeHeight int) error {
 	_, err := db.Exec(ctx, "UPDATE games SET status = $1, game_url = $2, native_width = $3, native_height = $4, processing_details = NULL, updated_at = NOW() WHERE id = $5",
 		status, gameURL, nativeWidth, nativeHeight, gameID)
 	return err
 }
 
+// uploadDirectory は localPath 以下のファイルを remotePathPrefix を付けたキーで Game 用 MinIO に
+// アップロードする。拡張子から Content-Type を決め、Unity の .gz 圧縮ファイルには
+// Content-Encoding: gzip を付けてブラウザがそのまま展開できるようにする。
+// .br 圧縮ファイルは HTTP では展開されないため、gzip に詰め直して Content-Encoding: gzip で保存する。
 func uploadDirectory(ctx context.Context, localPath, remotePathPrefix string) error {
 	return filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
+			// オブジェクトキーは OS に関係なく "/" 区切りにする
 			relPath, _ := filepath.Rel(localPath, path)
 			remotePath := filepath.Join(remotePathPrefix, relPath)
 			remotePath = strings.ReplaceAll(remotePath, "\\", "/")
 
+			// 拡張子から Content-Type / Content-Encoding を決める（未知の拡張子は application/octet-stream）
+			// ".js.br" などは ".js" より先に判定する必要がある
 			contentType := "application/octet-stream"
 			contentEncoding := ""
 
@@ -581,6 +643,10 @@ func uploadDirectory(ctx context.Context, localPath, remotePathPrefix string) er
 				contentEncoding = "gzip"
 			}
 
+			// Brotli はブラウザが HTTPS でしか展開しないため、gzip に詰め直して保存する（brotli.go）
+			if contentEncoding == "br" {
+				return uploadBrotliFileAsGzip(ctx, path, remotePath, contentType)
+			}
 			_, err = gameMinioClient.FPutObject(ctx, gameBucketName, remotePath, path, minio.PutObjectOptions{ContentType: contentType, ContentEncoding: contentEncoding})
 			return err
 		}
@@ -601,6 +667,7 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
+	// 1. 展開を始める前に、ヘッダーの申告値でエントリー数・サイズを検査する
 	if int64(len(r.File)) > maxZipEntries {
 		return fmt.Errorf("zip has too many entries (%d > %d)", len(r.File), maxZipEntries)
 	}
@@ -615,6 +682,7 @@ func unzip(src, dest string) error {
 		}
 	}
 
+	// 2. 展開先を絶対パスにして作成する（後でエントリーのパスが外に出ていないかの比較に使う）
 	destAbs, err := filepath.Abs(dest)
 	if err != nil {
 		return err
@@ -623,8 +691,10 @@ func unzip(src, dest string) error {
 		return err
 	}
 
+	// 3. エントリーごとにパスを検証してから展開する
 	var total int64
 	for _, f := range r.File {
+		// "\" 区切りも "/" に揃えたうえで、空・絶対パス・NUL 文字・Windows のドライブ指定 ("C:") を拒否する
 		name := strings.ReplaceAll(f.Name, `\`, "/")
 		if name == "" || strings.HasPrefix(name, "/") || strings.ContainsRune(name, 0) || (len(name) >= 2 && name[1] == ':') {
 			return fmt.Errorf("illegal file path in zip: %q", f.Name)
@@ -636,6 +706,7 @@ func unzip(src, dest string) error {
 		if cleanName == ".." || strings.HasPrefix(cleanName, "../") {
 			return fmt.Errorf("illegal file path in zip: %q", f.Name)
 		}
+		// 正規化後のパスでも念のため dest の外に出ていないかを再確認する
 		fpath := filepath.Join(destAbs, filepath.FromSlash(cleanName))
 		rel, err := filepath.Rel(destAbs, fpath)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
@@ -657,6 +728,8 @@ func unzip(src, dest string) error {
 			return err
 		}
 
+		// ヘッダーの申告値は偽装できるので、実際に書き出す量も「1 エントリーの上限」と
+		// 「合計の残り」の小さい方で打ち切る
 		limit := maxEntryBytes
 		if remaining := maxExtractedBytes - total; remaining < limit {
 			limit = remaining
@@ -684,6 +757,7 @@ func extractEntry(f *zip.File, fpath string, limit int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// limit+1 バイトまで読み、limit を超えたかどうかを判定できるようにする（短い場合は io.EOF が返る）
 	n, err := io.CopyN(outFile, rc, limit+1)
 	closeErr := outFile.Close()
 	if err != nil && err != io.EOF {

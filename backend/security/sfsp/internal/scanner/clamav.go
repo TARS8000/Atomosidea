@@ -1,3 +1,4 @@
+// Package scanner はサンドボックス内で ClamAV / YARA を実行し、結果を判定するスキャナーを提供する。
 package scanner
 
 import (
@@ -13,26 +14,27 @@ import (
 // （例: Heuristics.Limits.Exceeded.MaxFileSize）
 const limitsExceededPrefix = "Heuristics.Limits.Exceeded"
 
-// ClamAVLimits are passed to clamscan explicitly. clamscan's defaults are small (e.g.
-// 100 MB max file size) and files over a limit are otherwise skipped and reported clean.
+// ClamAVLimits は clamscan に明示的に渡す上限値。clamscan の既定値は小さく（例: 最大ファイルサイズ 100 MB）、
+// 指定しないと上限を超えたファイルは検査されずに clean と報告されてしまうため。
+// 0 以下の項目はオプションを付けない（clamscan の既定値になる）。
 type ClamAVLimits struct {
-	MaxFileSize     int64 // bytes
-	MaxScanSize     int64 // bytes
+	MaxFileSize     int64 // バイト
+	MaxScanSize     int64 // バイト
 	MaxFiles        int
 	MaxRecursion    int
 	MaxDirRecursion int
 	MaxScanTimeMs   int64
-	PCREMaxFileSize int64 // bytes
+	PCREMaxFileSize int64 // バイト
 }
 
-// ClamAVScanner implements the Scanner interface for ClamAV
+// ClamAVScanner は ClamAV（clamscan）をサンドボックス内で実行するスキャナー。
 type ClamAVScanner struct {
-	clamscanImage string // Docker image for clamscan client
+	clamscanImage string // clamscan クライアントの Docker イメージ
 	limits        ClamAVLimits
 	logger        *zap.SugaredLogger
 }
 
-// NewClamAVScanner creates a new ClamAVScanner instance
+// NewClamAVScanner は新しい ClamAVScanner を作成する。
 func NewClamAVScanner(clamscanImage string, limits ClamAVLimits, logger *zap.SugaredLogger) *ClamAVScanner {
 	return &ClamAVScanner{
 		clamscanImage: clamscanImage,
@@ -41,6 +43,8 @@ func NewClamAVScanner(clamscanImage string, limits ClamAVLimits, logger *zap.Sug
 	}
 }
 
+// command はサンドボックスで実行する clamscan のコマンドラインを組み立てる。
+// 検査対象パスは {FILE_PATH} のプレースホルダーとして末尾に置き、サンドボックス側で置換される。
 func (c *ClamAVScanner) command() []string {
 	l := c.limits
 	cmd := []string{
@@ -75,7 +79,8 @@ func (c *ClamAVScanner) command() []string {
 	return append(cmd, "{FILE_PATH}")
 }
 
-// parseFound returns the signature names of every "<path>: <name> FOUND" line.
+// parseFound は "<パス>: <検出名> FOUND" 形式のすべての行から検出名（シグネチャ名）を取り出して返す。
+// パスに ": " が含まれる場合に備え、最後の ": " で区切る。
 func parseFound(stdout string) []string {
 	threats := []string{}
 	for _, line := range strings.Split(stdout, "\n") {
@@ -90,21 +95,24 @@ func parseFound(stdout string) []string {
 	return threats
 }
 
-// Scan performs a ClamAV scan on the given file path using the provided sandbox.
-// clamscan exit codes: 0 = no virus found, 1 = virus(es) found, other = error.
-// The verdict is decided by the exit code, never by "OK" substrings, so a partial
-// error can not be misread as clean. Only exit code 0 is ever "clean".
+// Scan は指定されたサンドボックスを使って filePath を ClamAV でスキャンする。
+// clamscan の終了コード: 0 = ウイルスなし、1 = ウイルス検出、それ以外 = エラー。
+// 判定は終了コードで行い、出力中の "OK" などの文字列では判定しない。これにより一部のエラーを
+// clean と誤認することを防ぐ。clean になるのは終了コード 0 の場合だけである。
 func (c *ClamAVScanner) Scan(ctx context.Context, sb sandbox.Sandbox, jobID string, filePath string) (ScanResult, error) {
+	// 1. サンドボックスで clamscan を実行する
 	command := c.command()
 
 	stdout, stderr, err := sb.RunInSandbox(ctx, jobID, c.clamscanImage, filePath, command)
 	rawOutput := &map[string]any{"stdout": stdout, "stderr": stderr}
 
+	// 2. 終了コード 0 のときだけ clean とする
 	if err == nil {
 		c.logger.Infof("ClamAV scan clean for %s", filePath)
 		return ScanResult{Result: "clean", Details: "No threats found", RawOutput: rawOutput}, nil
 	}
 
+	// 3. 検出名を、本物の検出と上限超過（Heuristics.Limits.Exceeded.*）に分ける
 	code := sandbox.ExitCode(err)
 	threats := parseFound(stdout)
 	var real, limits []string

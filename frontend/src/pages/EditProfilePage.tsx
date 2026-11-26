@@ -5,13 +5,19 @@ import { useAuth } from '../context/AuthContext';
 import { Container, TextField, Button, Typography, Box, Alert, CircularProgress, Avatar } from '@mui/material';
 import ImageCropperModal from '../components/ImageCropperModal';
 
+/**
+ * ログイン中ユーザーのプロフィール（ユーザー名・自己紹介・アイコン・背景画像）を編集するページ。
+ * 画像は選択後にトリミングモーダルで切り抜き、送信時に SFSP のセキュリティスキャンを経て保存される。
+ */
 const EditProfilePage = () => {
   const { token, user, updateUser } = useAuth();
   const navigate = useNavigate();
 
+  // テキスト項目
   const [username, setUsername] = useState('');
   const [bio, setBio] = useState('');
 
+  // 画像項目: 送信用のファイル（トリミング後）と、表示用のプレビュー URL
   const [icon, setIcon] = useState<File | null>(null);
   const [iconPreview, setIconPreview] = useState('');
   const [background, setBackground] = useState<File | null>(null);
@@ -21,14 +27,17 @@ const EditProfilePage = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
+  // トリミングモーダルの状態（対象画像の data URL、縦横比、どちらの画像を編集中か）
   const [cropperOpen, setCropperOpen] = useState(false);
   const [imageToCrop, setImageToCrop] = useState('');
   const [cropAspect, setCropAspect] = useState(1);
   const [editingImageType, setEditingImageType] = useState<'icon' | 'background' | null>(null);
 
+  // 各画像がセキュリティスキャン中かどうか
   const [isScanningIcon, setIsScanningIcon] = useState(false);
   const [isScanningBackground, setIsScanningBackground] = useState(false);
 
+  // ログインユーザーが確定したら現在のプロフィールを取得してフォームに反映する。
   useEffect(() => {
     const fetchProfile = async () => {
       if (!user) return;
@@ -47,6 +56,7 @@ const EditProfilePage = () => {
     fetchProfile();
   }, [user]);
 
+  /** 画像ファイルを選択したら data URL として読み込み、種類に応じた縦横比でトリミングモーダルを開く。 */
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>, type: 'icon' | 'background') => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
@@ -54,14 +64,16 @@ const EditProfilePage = () => {
       reader.onload = () => {
         setImageToCrop(reader.result as string);
         setEditingImageType(type);
-        setCropAspect(type === 'icon' ? 1 : 679 / 160); // Set aspect ratio for background
+        setCropAspect(type === 'icon' ? 1 : 679 / 160); // アイコンは 1:1、背景は 679:160 の縦横比にする
         setCropperOpen(true);
       };
       reader.readAsDataURL(file);
     }
+    // 同じファイルを再選択しても onChange が発火するよう値をクリアする
     e.target.value = '';
   };
 
+  /** トリミング結果の Blob を JPEG ファイルにして、編集中の画像（アイコンまたは背景）に設定する。 */
   const handleCropSave = (croppedImageBlob: Blob) => {
     const file = new File([croppedImageBlob], `${editingImageType}.jpg`, { type: 'image/jpeg' });
     const previewUrl = URL.createObjectURL(file);
@@ -76,6 +88,10 @@ const EditProfilePage = () => {
     setCropperOpen(false);
   };
 
+  /**
+   * 2 秒ごとにプロフィールを取得し、icon_sfsp_job_id と background_sfsp_job_id が
+   * 両方とも空になった（スキャン処理が終わった）時点で解決する。中断時は reject する。
+   */
   const pollProfile = async (signal: AbortSignal): Promise<{ iconUrl?: string; backgroundImageUrl?: string }> => {
     return new Promise((resolve, reject) => {
       const pollInterval = setInterval(async () => {
@@ -96,6 +112,7 @@ const EditProfilePage = () => {
         }
       }, 2000);
 
+      // 中断（AbortController.abort）されたらポーリングを止めて reject する
       signal.addEventListener('abort', () => {
         clearInterval(pollInterval);
         reject(new Error('Polling aborted'));
@@ -103,6 +120,7 @@ const EditProfilePage = () => {
     });
   };
 
+  /** フォーム送信時の処理。テキスト項目を更新した後、選択された画像を順にアップロードしてスキャン完了を待つ。 */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -111,6 +129,7 @@ const EditProfilePage = () => {
     const controller = new AbortController();
 
     try {
+      // 1. ユーザー名と自己紹介を更新する
       await axios.put('/api/profile', { username, bio }, {
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
@@ -119,6 +138,7 @@ const EditProfilePage = () => {
       let newIconUrl = iconPreview;
       let newBackgroundUrl = backgroundPreview;
 
+      // 2. アイコンが選択されていればアップロードし、スキャン中なら完了まで待つ
       if (icon) {
         setIsScanningIcon(true);
         const formData = new FormData();
@@ -135,6 +155,7 @@ const EditProfilePage = () => {
         setIsScanningIcon(false);
       }
 
+      // 3. 背景画像が選択されていればアップロードし、スキャン中なら完了まで待つ
       if (background) {
         setIsScanningBackground(true);
         const formData = new FormData();
@@ -151,11 +172,13 @@ const EditProfilePage = () => {
         setIsScanningBackground(false);
       }
 
+      // 4. 認証コンテキストのユーザー情報を更新し（ヘッダーなどの表示に反映）、マイページへ遷移する
       updateUser({ username, iconUrl: newIconUrl, backgroundImageUrl: newBackgroundUrl });
 
       setSuccess('プロフィールを更新しました。');
       setTimeout(() => navigate('/mypage'), 1500);
     } catch (err) {
+      // HTTP ステータスに応じてエラーメッセージを出し分ける（413: サイズ超過、415: 非対応形式）
       if (!axios.isCancel(err)) {
         const status = axios.isAxiosError(err) ? err.response?.status : undefined;
         if (status === 413) {
@@ -181,6 +204,7 @@ const EditProfilePage = () => {
         プロフィール編集
       </Typography>
       <form onSubmit={handleSubmit}>
+        {/* アイコンのプレビューと変更ボタン */}
         <Box sx={{ display: 'flex', alignItems: 'center', mb: 3 }}>
           <Avatar src={iconPreview} sx={{ width: 100, height: 100, mr: 2 }} />
           <Box>
@@ -195,6 +219,7 @@ const EditProfilePage = () => {
             )}
           </Box>
         </Box>
+        {/* 背景画像のプレビュー。領域全体が label なのでクリックでファイル選択が開く */}
         <Box sx={{ mb: 3 }}>
           <Typography gutterBottom>背景画像</Typography>
           <Box
@@ -249,6 +274,7 @@ const EditProfilePage = () => {
         </Button>
       </form>
 
+      {/* 画像トリミング用モーダル（一度でも画像を選択した後にマウントする） */}
       {imageToCrop && (
         <ImageCropperModal
           open={cropperOpen}

@@ -1,6 +1,8 @@
 services:
   mon-nginx:
-    image: nginx:alpine
+    # 版を固定する（nginx:alpine のままだと古いイメージが残っていても pull されない）。
+    # 1.31.9 は NGINX2Root（CVE-2026-123007 ほか 4 件）の修正版
+    image: nginx:1.31.9-alpine
     container_name: mon-nginx
     restart: always
     ports:
@@ -27,6 +29,9 @@ services:
       MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
       # 許可ホストの追加（カンマ区切り、任意）。localhost / 127.0.0.1 / ::1 は常に許可。空・未設定なら追加なし
       MONITORING_ALLOWED_HOSTS: ${MONITORING_ALLOWED_HOSTS:-}
+      # 監視対象の compose プロジェクト（Atomosidea 本体）。表示・ログ・MinIO 操作をこのプロジェクトのコンテナに限る。
+      # 未設定なら mon-backend が atmosidea-frontend コンテナのプロジェクトを使う
+      MONITOR_PROJECT: ${COMPOSE_PROJECT_NAME:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
