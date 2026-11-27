@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,19 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
+// サービス全体で共有する接続・設定値。main() の起動時に環境変数から初期化される。
+//   - dbAuth: auth-db（users テーブル）への接続プール
+//   - dbApp: app-db（games / static_sites / videos）への接続プール。アカウント削除時に使う
+//   - redisClient: JWT ブロックリストと OAuth ワンタイムコードの保存先
+//   - minioClient*: プロフィール画像・ゲーム・静的サイト・動画それぞれの MinIO クライアント
+//   - jwtSecret: JWT の HS256 署名鍵
+//   - googleOauthConfig: Google OAuth2 設定（クライアント ID/シークレット未設定なら nil）
+//   - appURL: フロントエンドの公開 URL（CORS の許可オリジンと Google のリダイレクト URL に使う）
+//   - adminRegistrationCode: ローカル管理者アカウントの登録に必要なコード
+//   - internalAPIKey: サービス間呼び出しで X-Internal-Key ヘッダーに載せるキー
+//   - profileServiceURL / teamServiceURL: 各サービスのベース URL（末尾の / は除去済み）
+//   - cookieSecure: APP_URL が https のとき true にし、Cookie に Secure 属性を付ける
+//   - *BucketName: 各 MinIO バケット名
 var (
 	dbAuth                *pgxpool.Pool
 	dbApp                 *pgxpool.Pool
@@ -39,7 +54,7 @@ var (
 	minioClientProfile    *minio.Client
 	minioClientGame       *minio.Client
 	minioClientStaticSite *minio.Client
-	minioClientVideo      *minio.Client // nil when VIDEO_MINIO_* credentials are not configured
+	minioClientVideo      *minio.Client // VIDEO_MINIO_* の認証情報が未設定の場合は nil
 	jwtSecret             []byte
 	googleOauthConfig     *oauth2.Config
 	appURL                string
@@ -53,28 +68,30 @@ var (
 	staticSiteBucketName  string = "static-sites"
 	videoBucketName       string = "videos"
 
-	// internalHTTPClient is used for service-to-service calls (profile-service, team-service, Google).
+	// internalHTTPClient はサービス間呼び出し（profile-service、team-service、Google）に使う。
 	internalHTTPClient = &http.Client{Timeout: 15 * time.Second}
 )
 
+// OAuth の state Cookie、ワンタイムコード、管理者パスワードに関する定数。
+// state Cookie の Path を /api/auth/google に限定し、Google ログイン関連のパスにだけ送られるようにしている。
 const oauthStateCookieName = "oauthstate"
 const oauthStateCookiePath = "/api/auth/google"
-const oauthStateMaxAge = 10 * 60 // seconds
+const oauthStateMaxAge = 10 * 60 // 秒
 const oauthCodeKeyPrefix = "oauth_code:"
 const oauthCodeTTL = 60 * time.Second
 const minAdminPasswordLength = 8
 
-// errAccountDisabled is returned when the user exists but its status does not allow login.
+// errAccountDisabled は、ユーザーは存在するが status がログインを許可しない場合に返すエラー。
 var errAccountDisabled = errors.New("account is disabled")
 
-// isLoginAllowedStatus reports whether a users.status value may log in / use a token.
-// Values in auth-db: 'active' / 'pending' / 'deleted_data'. Only 'deleted_data' (and any
-// unknown value) is rejected; 'pending' is kept for rows created by older versions.
+// isLoginAllowedStatus は users.status の値がログイン／トークン利用を許可されるかを返す。
+// auth-db での値は 'active' / 'pending' / 'deleted_data'。'deleted_data'（および未知の値）のみ拒否する。
+// 'pending' は旧バージョンで作成された行のために許可したままにしている。
 func isLoginAllowedStatus(status string) bool {
 	return status == "active" || status == "pending"
 }
 
-// randomURLToken returns n random bytes encoded as base64url (no padding).
+// randomURLToken は暗号学的乱数で n バイトを生成し、base64url（パディングなし）で返す。
 func randomURLToken(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -84,6 +101,8 @@ func randomURLToken(n int) (string, error) {
 }
 
 // User 構造体（ID を uuid.UUID に設定）
+// auth-db の users テーブルの1行のうち、ログイン処理で使う列を保持する。
+// Username は Google ユーザーのデータ削除後に NULL になり得るため sql.NullString にしている。
 type User struct {
 	ID           uuid.UUID      `json:"id"`
 	Username     sql.NullString `json:"username"`
@@ -92,8 +111,12 @@ type User struct {
 	IsAdmin      bool           `json:"is_admin"`
 }
 
+// authMiddleware は Authorization ヘッダーの Bearer トークン（JWT）を検証する Gin ミドルウェアを返す。
+// 署名・有効期限の検証、ブロックリスト照合、users.status の確認を行い、
+// 通過したらコンテキストに userID / userUUID / isAdmin / tokenString を格納する。
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 1. Authorization ヘッダーからトークン文字列を取り出す
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
@@ -101,6 +124,7 @@ func authMiddleware() gin.HandlerFunc {
 		}
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
+		// 2. 署名と有効期限を検証する（alg 差し替え攻撃を防ぐため HS256 のみ許可）
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			return jwtSecret, nil
 		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
@@ -109,7 +133,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-			// Check if the token is in the blocklist (Fail-Closed)
+			// 3. トークンがブロックリストに登録されていないか確認する（Redis エラー時は拒否する Fail-Closed）
 			// logoutHandler は "blocklist:<jti>" で登録するため、同じキーで照合する
 			jti, _ := claims["jti"].(string)
 			if jti == "" {
@@ -127,7 +151,9 @@ func authMiddleware() gin.HandlerFunc {
 				return
 			}
 
+			// 4. トークンからユーザー ID を取り出し UUID として解釈する
 			// JWTからのID取得を文字列（UUID形式）として処理
+			// 互換性のため sub → userID → user_id の順にクレームを探す
 			var userIDStr string
 			if idStr, ok := claims["sub"].(string); ok {
 				userIDStr = idStr
@@ -146,7 +172,7 @@ func authMiddleware() gin.HandlerFunc {
 				return
 			}
 
-			// Reject tokens of deleted / disabled accounts (fail-closed on DB errors)
+			// 5. 削除済み・無効なアカウントのトークンを拒否する（DB エラー時も拒否する Fail-Closed）
 			var status string
 			err = dbAuth.QueryRow(c.Request.Context(), "SELECT status FROM users WHERE id = $1", parsedUUID).Scan(&status)
 			if err == pgx.ErrNoRows {
@@ -163,6 +189,8 @@ func authMiddleware() gin.HandlerFunc {
 				return
 			}
 
+			// 6. 後続ハンドラ向けにユーザー情報をコンテキストへ格納する
+			// isAdmin は DB ではなく JWT のクレームから取る（クレームがなければ false）
 			isAdmin, ok := claims["isAdmin"].(bool)
 			if !ok {
 				isAdmin = false
@@ -178,8 +206,11 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+// main は環境変数から設定を読み込み、Redis・PostgreSQL（auth-db / app-db）・MinIO に接続したうえで、
+// /api/auth 以下のルートを登録して :8080 で HTTP サーバーを起動する。
 func main() {
 	var err error
+	// 1. 環境変数から設定値を読み込む（未設定のサービス URL は Docker Compose 内の既定値を使う）
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 	authDatabaseUrl := os.Getenv("DATABASE_URL")
 	appDatabaseUrl := os.Getenv("APP_DATABASE_URL")
@@ -209,7 +240,7 @@ func main() {
 	}
 	cookieSecure = strings.HasPrefix(strings.ToLower(appURL), "https://")
 
-	// Initialize Redis client
+	// 2. Redis クライアントを初期化する（起動順の差を吸収するため 5 秒間隔で最大 5 回試行）
 	for i := 0; i < 5; i++ {
 		redisClient = redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPassword, DB: redisDB})
 		_, err = redisClient.Ping(context.Background()).Result()
@@ -224,7 +255,7 @@ func main() {
 	}
 	log.Println("Successfully connected to Redis!")
 
-	// MinIO credentials
+	// 3. MinIO の接続情報を読み込む（動画用エンドポイントが未設定なら共通の MINIO_ENDPOINT を使う）
 	minioEndpoint := os.Getenv("MINIO_ENDPOINT")
 	profileMinioAccessKey := os.Getenv("PROFILE_MINIO_ACCESS_KEY_ID")
 	profileMinioSecretKey := os.Getenv("PROFILE_MINIO_SECRET_ACCESS_KEY")
@@ -242,7 +273,7 @@ func main() {
 	videoMinioSecretKey := os.Getenv("VIDEO_MINIO_SECRET_ACCESS_KEY")
 	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 
-	// Initialize auth-db
+	// 4. auth-db に接続する（5 秒間隔で最大 5 回試行）
 	for i := 0; i < 5; i++ {
 		dbAuth, err = pgxpool.New(context.Background(), authDatabaseUrl)
 		if err == nil {
@@ -260,7 +291,7 @@ func main() {
 	defer dbAuth.Close()
 	log.Println("Successfully connected to auth PostgreSQL!")
 
-	// Initialize app-db
+	// 5. app-db に接続する（5 秒間隔で最大 5 回試行）
 	for i := 0; i < 5; i++ {
 		dbApp, err = pgxpool.New(context.Background(), appDatabaseUrl)
 		if err == nil {
@@ -278,7 +309,8 @@ func main() {
 	defer dbApp.Close()
 	log.Println("Successfully connected to app PostgreSQL!")
 
-	// Initialize MinIO client for profile assets
+	// 6. 用途別の MinIO クライアントを初期化する
+	// プロフィール画像用（minio.New は接続確認をしないため、ここで失敗するのは設定不備の場合）
 	minioClientProfile, err = minio.New(minioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(profileMinioAccessKey, profileMinioSecretKey, ""),
 		Secure: minioUseSSL,
@@ -287,7 +319,7 @@ func main() {
 		log.Fatalf("Unable to connect to profile MinIO: %v", err)
 	}
 
-	// Initialize MinIO client for game assets
+	// ゲーム用
 	minioClientGame, err = minio.New(gameMinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(gameMinioAccessKey, gameMinioSecretKey, ""),
 		Secure: minioUseSSL,
@@ -296,7 +328,7 @@ func main() {
 		log.Fatalf("Unable to connect to game MinIO: %v", err)
 	}
 
-	// Initialize MinIO client for static site assets
+	// 静的サイト用
 	minioClientStaticSite, err = minio.New(staticSiteMinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(staticSiteMinioAccessKey, staticSiteMinioSecretKey, ""),
 		Secure: minioUseSSL,
@@ -305,7 +337,7 @@ func main() {
 		log.Fatalf("Unable to connect to static site MinIO: %v", err)
 	}
 
-	// Initialize MinIO client for video assets (HLS + thumbnails), used on account deletion
+	// 動画用（HLS とサムネイル）。アカウント削除時に使う。認証情報がなければ作成せず nil のままにする
 	if videoMinioAccessKey != "" && videoMinioSecretKey != "" && videoMinioEndpoint != "" {
 		minioClientVideo, err = minio.New(videoMinioEndpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(videoMinioAccessKey, videoMinioSecretKey, ""),
@@ -318,6 +350,7 @@ func main() {
 		log.Println("WARNING: VIDEO_MINIO_ACCESS_KEY_ID / VIDEO_MINIO_SECRET_ACCESS_KEY not set; video objects will not be deleted on account deletion.")
 	}
 
+	// 7. Gin ルーターを作成し、CORS は APP_URL のオリジンのみ許可する
 	r := gin.Default()
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{appURL}
@@ -325,6 +358,7 @@ func main() {
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Authorization"}
 	r.Use(cors.New(config))
 
+	// 8. /api/auth 以下のルートを登録する（logout と /me は認証必須）
 	authRoutes := r.Group("/api/auth")
 	{
 		authRoutes.POST("/register", registerHandler)
@@ -332,6 +366,7 @@ func main() {
 		authRoutes.POST("/logout", authMiddleware(), logoutHandler)
 		authRoutes.POST("/oauth/exchange", oauthExchangeHandler)
 
+		// Google のクライアント ID とシークレットが両方設定されている場合のみ Google ログインを有効にする
 		googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
 		googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
 		if googleClientID != "" && googleClientSecret != "" {
@@ -355,12 +390,25 @@ func main() {
 		authRoutes.DELETE("/me", authMiddleware(), deleteAccountHandler)
 	}
 
+	// 9. HTTP サーバーを起動する
 	log.Println("INFO: Auth service starting on port 8080")
-	if err := r.Run(":8080"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（本文は画像程度までなので読み取りは短め）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
 	}
 }
 
+// logoutHandler は POST /api/auth/logout を処理する。
+// 現在のトークンの jti を、トークンの残り有効期間を TTL として Redis のブロックリストに登録し、以後の利用を無効化する。
 func logoutHandler(c *gin.Context) {
 	tokenString, exists := c.Get("tokenString")
 	if !exists {
@@ -368,6 +416,7 @@ func logoutHandler(c *gin.Context) {
 		return
 	}
 
+	// 署名は authMiddleware で検証済みのため、ここでは検証なしでクレームだけを取り出す
 	token, _, err := new(jwt.Parser).ParseUnverified(tokenString.(string), jwt.MapClaims{})
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token format"})
@@ -392,6 +441,7 @@ func logoutHandler(c *gin.Context) {
 		return
 	}
 
+	// 期限切れ後はブロックリストに残す必要がないため、TTL はトークンの残り有効期間にする
 	ttl := time.Until(time.Unix(int64(exp), 0))
 	if ttl <= 0 {
 		c.JSON(http.StatusOK, gin.H{"message": "Token already expired"})
@@ -408,6 +458,9 @@ func logoutHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully logged out"})
 }
 
+// registerHandler は POST /api/auth/register を処理し、ローカル（メール＋パスワード）の管理者アカウントを作成する。
+// 正しい管理者コードがなければ拒否するため、一般ユーザーのローカル登録はできない。
+// 作成後は profile-service に初期プロフィールの作成を依頼する。
 func registerHandler(c *gin.Context) {
 	var req struct {
 		Email     string `json:"email"`
@@ -423,6 +476,7 @@ func registerHandler(c *gin.Context) {
 
 	// ローカルアカウント登録は管理者コードを入力した場合（管理者アカウント）のみ許可
 	// (入力されたコードはログに残さない)
+	// タイミング攻撃でコードを推測されないよう定数時間比較を使う。サーバー側のコードが未設定なら常に拒否する
 	if adminRegistrationCode == "" || subtle.ConstantTimeCompare([]byte(req.AdminCode), []byte(adminRegistrationCode)) != 1 {
 		log.Printf("WARN: Rejected admin registration attempt with invalid admin code")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid Admin Code."})
@@ -441,6 +495,7 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
+	// 同じメールアドレスのローカルアカウントが既に存在しないか確認する
 	var existingID uuid.UUID
 	err := dbAuth.QueryRow(context.Background(), "SELECT id FROM users WHERE email = $1 AND provider = 'local'", email).Scan(&existingID)
 	if err == nil {
@@ -471,6 +526,7 @@ func registerHandler(c *gin.Context) {
 	// ユーザー名はメールアドレスのローカル部（プロフィール画面で変更可能）
 	username := strings.SplitN(email, "@", 2)[0]
 
+	// is_admin = true、status = 'active' でユーザー行を作成する
 	var userID uuid.UUID
 	err = dbAuth.QueryRow(context.Background(),
 		"INSERT INTO users (id, username, email, password_hash, provider, is_admin, status) VALUES ($1, $2, $3, $4, 'local', $5, 'active') RETURNING id",
@@ -491,6 +547,8 @@ func registerHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"message": "Admin user created successfully", "userID": userID.String()})
 }
 
+// loginHandler は POST /api/auth/login を処理する。
+// ローカルアカウントのメールアドレスとパスワードを照合し、成功すれば JWT を {"token": ...} で返す。
 func loginHandler(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email" binding:"required"`
@@ -501,6 +559,14 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	// 0. 同じアカウントへのログインの失敗が続いていたら、しばらく受け付けない（パスワードの総当たり対策）
+	if blocked, retry := loginLockedOut(c.Request.Context(), req.Email); blocked {
+		c.Header("Retry-After", strconv.Itoa(int(retry/time.Second)+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("ログインの失敗が続いたため、このアカウントには %d 分ほどログインできません。", int((retry+time.Minute-1)/time.Minute))})
+		return
+	}
+
+	// 1. メールアドレスでローカルアカウントを検索する（password_hash は NULL の可能性があるため NullString で受ける）
 	var user User
 	var status string
 	var passwordHash sql.NullString
@@ -509,6 +575,7 @@ func loginHandler(c *gin.Context) {
 	user.PasswordHash = passwordHash.String
 	if err != nil {
 		if err == pgx.ErrNoRows {
+			recordLoginFailure(c.Request.Context(), req.Email)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			return
 		}
@@ -517,10 +584,13 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	// 2. パスワードを照合する（ユーザー不在と同じ "Invalid credentials" を返し、どちらで失敗したかを区別させない）
 	if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		recordLoginFailure(c.Request.Context(), req.Email)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
+	clearLoginFailures(c.Request.Context(), req.Email)
 
 	// 削除済み・無効なアカウントはログインさせない（パスワード照合後に判定し、存在の有無を漏らさない）
 	if !isLoginAllowedStatus(status) {
@@ -528,6 +598,7 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	// 3. JWT を発行して返す
 	token, err := generateJWT(user.ID, user.Username.String, user.IsAdmin)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -537,7 +608,8 @@ func loginHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
-// googleUserInfo is the subset of https://www.googleapis.com/oauth2/v2/userinfo we use.
+// googleUserInfo は https://www.googleapis.com/oauth2/v2/userinfo のレスポンスのうち、このサービスで使う項目だけを持つ。
+// VerifiedEmail はレスポンスに含まれない場合と false を区別するためポインタにしている。
 type googleUserInfo struct {
 	ID            string `json:"id"`
 	Email         string `json:"email"`
@@ -545,6 +617,8 @@ type googleUserInfo struct {
 	Name          string `json:"name"` // Google アカウントの設定名 (氏名)
 }
 
+// setOAuthStateCookie は OAuth の state を保持する HttpOnly Cookie を設定する。
+// maxAge に負の値を渡すと Cookie を削除する。
 func setOAuthStateCookie(c *gin.Context, value string, maxAge int) {
 	// Domain は指定しない（host-only Cookie）。Google からのトップレベル GET で送られるよう SameSite=Lax。
 	http.SetCookie(c.Writer, &http.Cookie{
@@ -558,7 +632,12 @@ func setOAuthStateCookie(c *gin.Context, value string, maxAge int) {
 	})
 }
 
+// googleCallbackHandler は GET /api/auth/google/callback を処理する。
+// state を検証して Google ユーザー情報を取得し、ユーザーを検索または新規作成して JWT を発行する。
+// JWT は直接渡さず、Redis に保存したワンタイムコードを付けて /login/success へリダイレクトする。
+// エラー時は /login?error=... へリダイレクトする。
 func googleCallbackHandler(c *gin.Context) {
+	// 1. state Cookie とクエリの state を照合する（CSRF 対策）
 	oauthState, _ := c.Cookie(oauthStateCookieName)
 	// state は一度きり: 照合の成否にかかわらず Cookie を削除する
 	setOAuthStateCookie(c, "", -1)
@@ -570,6 +649,7 @@ func googleCallbackHandler(c *gin.Context) {
 		return
 	}
 
+	// 2. 認可コードを Google のトークンに交換し、ユーザー情報を取得する
 	code := c.Query("code")
 	if code == "" {
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=google_error")
@@ -584,12 +664,14 @@ func googleCallbackHandler(c *gin.Context) {
 	}
 	log.Printf("DEBUG: Google user data received - ID: %s", googleUser.ID)
 
+	// 3. Google のユーザー ID（provider_id）で既存ユーザーを検索する
 	var user User
 	var status string
 	err = dbAuth.QueryRow(context.Background(),
 		"SELECT id, username, is_admin, status FROM users WHERE provider = 'google' AND provider_id = $1", googleUser.ID).Scan(&user.ID, &user.Username, &user.IsAdmin, &status)
 
 	if err == pgx.ErrNoRows {
+		// 3a. 未登録なら新規ユーザーを作成する
 		log.Printf("DEBUG: User not found in DB, attempting to create new user for Google ID: %s", googleUser.ID)
 
 		// Googleユーザー新規作成時に UUID v7 を採番
@@ -600,6 +682,7 @@ func googleCallbackHandler(c *gin.Context) {
 			return
 		}
 
+		// 初期ユーザー名は Google ID の先頭 8 文字から "user_xxxxxxxx" の形で作る
 		idPrefix := googleUser.ID
 		if len(idPrefix) > 8 {
 			idPrefix = idPrefix[:8]
@@ -618,6 +701,7 @@ func googleCallbackHandler(c *gin.Context) {
 		log.Printf("DEBUG: New Google user created with ID: %s, Username: %s", user.ID.String(), user.Username.String)
 
 		// profile-service へ初期プロフィールの自動作成リクエストを送信
+		// ログインのリダイレクトを待たせないよう非同期で行う。リクエスト終了後も続くため独立したコンテキストを使う
 		go func(userIDStr, username string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -633,6 +717,7 @@ func googleCallbackHandler(c *gin.Context) {
 		c.Redirect(http.StatusTemporaryRedirect, "/login?error=db_error")
 		return
 	} else {
+		// 3b. 既存ユーザーなら status を確認し、削除済み・無効なアカウントは拒否する
 		if !isLoginAllowedStatus(status) {
 			log.Printf("WARN: Rejected Google login for disabled account %s (status=%s)", user.ID.String(), status)
 			c.Redirect(http.StatusTemporaryRedirect, "/login?error=account_disabled")
@@ -647,6 +732,7 @@ func googleCallbackHandler(c *gin.Context) {
 		}
 	}
 
+	// 4. JWT を発行する
 	token, err := generateJWT(user.ID, user.Username.String, user.IsAdmin)
 	if err != nil {
 		log.Printf("ERROR: Failed to generate JWT for user %s: %v", user.ID.String(), err)
@@ -654,6 +740,7 @@ func googleCallbackHandler(c *gin.Context) {
 		return
 	}
 
+	// 5. ワンタイムコードを発行してフロントエンドへリダイレクトする
 	// JWT を URL に載せず、60 秒・1 回限りのコードを Redis に保存してコードだけを渡す。
 	// フロントエンドは POST /api/auth/oauth/exchange でトークンに交換する。
 	oneTimeCode, err := randomURLToken(32)
@@ -678,6 +765,7 @@ func oauthExchangeHandler(c *gin.Context) {
 	var req struct {
 		Code string `json:"code"`
 	}
+	// 空や過度に長いコードは Redis に問い合わせる前に弾く
 	if err := c.ShouldBindJSON(&req); err != nil || req.Code == "" || len(req.Code) > 128 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
 		return
@@ -697,6 +785,8 @@ func oauthExchangeHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
+// googleLoginHandler は GET /api/auth/google/login を処理する。
+// ランダムな state を生成して Cookie に保存し、Google の認可画面へリダイレクトする。
 func googleLoginHandler(c *gin.Context) {
 	state, err := randomURLToken(32)
 	if err != nil {
@@ -708,8 +798,8 @@ func googleLoginHandler(c *gin.Context) {
 	c.Redirect(http.StatusTemporaryRedirect, googleOauthConfig.AuthCodeURL(state))
 }
 
-// callInternal sends a request to another internal service with X-Internal-Key.
-// Non-2xx responses are returned as errors.
+// callInternal は X-Internal-Key ヘッダーを付けて他の内部サービスへリクエストを送る。
+// 2xx 以外のレスポンスはエラーとして返す（レスポンス本文の先頭 1KB をエラーメッセージに含める）。
 func callInternal(ctx context.Context, method, url string, body []byte) error {
 	var reader io.Reader
 	if body != nil {
@@ -737,7 +827,7 @@ func callInternal(ctx context.Context, method, url string, body []byte) error {
 	return nil
 }
 
-// createProfile asks profile-service to create the initial profile row (body format unchanged).
+// createProfile は profile-service に初期プロフィール行の作成を依頼する（リクエストボディの形式は従来どおり）。
 func createProfile(ctx context.Context, userID, username string) error {
 	payload, _ := json.Marshal(map[string]string{
 		"user_id":  userID,
@@ -746,7 +836,8 @@ func createProfile(ctx context.Context, userID, username string) error {
 	return callInternal(ctx, http.MethodPost, profileServiceURL+"/internal/create", payload)
 }
 
-// removeObjectsWithPrefix deletes every object under prefix in bucket.
+// removeObjectsWithPrefix は bucket 内で prefix から始まるすべてのオブジェクトを削除する。
+// 途中で失敗しても残りの削除は続け、最初に発生したエラーだけを返す。
 func removeObjectsWithPrefix(ctx context.Context, client *minio.Client, bucket, prefix string) error {
 	var firstErr error
 	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
@@ -763,7 +854,7 @@ func removeObjectsWithPrefix(ctx context.Context, client *minio.Client, bucket, 
 	return firstErr
 }
 
-// queryIDs returns the id column of rows matching query (args...).
+// queryIDs は app-db に query（引数 args）を実行し、結果の id 列を文字列のスライスで返す。
 func queryIDs(ctx context.Context, query string, args ...interface{}) ([]string, error) {
 	rows, err := dbApp.Query(ctx, query, args...)
 	if err != nil {
@@ -781,6 +872,10 @@ func queryIDs(ctx context.Context, query string, args ...interface{}) ([]string,
 	return ids, rows.Err()
 }
 
+// deleteAccountHandler は DELETE /api/auth/me を処理し、ログイン中ユーザーのアカウントと関連データを削除する。
+// profile-service / team-service のデータ、MinIO 上のファイル、app-db の行を順に削除し、
+// 最後に auth-db のユーザーを処理する（ローカルは行を削除、Google は status を 'deleted_data' にして個人情報を消す）。
+// 途中の後始末が失敗しても処理は続け、失敗した項目名を cleanupErrors としてレスポンスに含める。
 func deleteAccountHandler(c *gin.Context) {
 	userIDStr := c.GetString("userID")
 	if userIDStr == "" {
@@ -798,6 +893,7 @@ func deleteAccountHandler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// 最後の auth-db の処理方法を決めるため provider（local / google）を取得する
 	var provider string
 	err = dbAuth.QueryRow(ctx, "SELECT provider FROM users WHERE id = $1", userID).Scan(&provider)
 	if err != nil {
@@ -823,7 +919,8 @@ func deleteAccountHandler(c *gin.Context) {
 		fail("team-service", err)
 	}
 
-	// --- Profile images in MinIO (keys: icons/<userId>-<uuid>.<ext>, backgrounds/<userId>-<uuid>.<ext>) ---
+	// --- MinIO 上のプロフィール画像（キー: icons/<userId>-<uuid>.<ext>, backgrounds/<userId>-<uuid>.<ext>） ---
+	// 末尾に "-" を付け、ID が前方一致する別ユーザーのファイルを消さないようにしている
 	for _, prefix := range []string{"icons/" + userID.String() + "-", "backgrounds/" + userID.String() + "-"} {
 		if err := removeObjectsWithPrefix(ctx, minioClientProfile, profileBucketName, prefix); err != nil {
 			fail("profile-images", err)
@@ -831,7 +928,7 @@ func deleteAccountHandler(c *gin.Context) {
 		}
 	}
 
-	// --- Games: MinIO games/<id>/ + thumbnails/<id>, then app-db rows ---
+	// --- ゲーム: MinIO の games/<id>/ と thumbnails/<id> を消してから app-db の行を削除する ---
 	gameIDs, err := queryIDs(ctx, "SELECT id::text FROM games WHERE user_id = $1", userID)
 	if err != nil {
 		fail("games", err)
@@ -848,7 +945,8 @@ func deleteAccountHandler(c *gin.Context) {
 		}
 	}
 
-	// --- Static sites: MinIO static-sites/<id>/ + thumbnail (from thumbnail_url), then app-db rows ---
+	// --- 静的サイト: MinIO の static-sites/<id>/ とサムネイル（thumbnail_url から求める）を消してから app-db の行を削除する ---
+	// siteRow は削除対象の静的サイトの ID とサムネイル URL を保持する。
 	type siteRow struct {
 		id        string
 		thumbnail sql.NullString
@@ -872,6 +970,7 @@ func deleteAccountHandler(c *gin.Context) {
 			fail("static-site:"+site.id, err)
 		}
 		// "/static-sites/thumbnails/xxxx.ext" → "thumbnails/xxxx.ext"
+		// DB の値をそのままキーにするため、thumbnails/ 配下で ".." を含まないものだけを削除対象にする
 		if site.thumbnail.Valid {
 			if obj, ok := strings.CutPrefix(site.thumbnail.String, "/static-sites/"); ok && strings.HasPrefix(obj, "thumbnails/") && !strings.Contains(obj, "..") {
 				if err := minioClientStaticSite.RemoveObject(ctx, staticSiteBucketName, obj, minio.RemoveObjectOptions{}); err != nil {
@@ -884,7 +983,8 @@ func deleteAccountHandler(c *gin.Context) {
 		}
 	}
 
-	// --- Videos: MinIO videos/<id>/ (HLS) + thumbnails/<id>, then app-db rows ---
+	// --- 動画: MinIO の videos/<id>/（HLS）と thumbnails/<id> を消してから app-db の行を削除する ---
+	// 動画用 MinIO クライアントが未設定の場合はファイル削除を失敗扱いにし、DB の行だけ削除する
 	videoIDs, err := queryIDs(ctx, "SELECT id::text FROM videos WHERE uploader_id = $1", userID)
 	if err != nil {
 		fail("videos", err)
@@ -905,7 +1005,9 @@ func deleteAccountHandler(c *gin.Context) {
 		}
 	}
 
-	// --- Finally, delete user record from auth-db ---
+	// --- 最後に auth-db のユーザーレコードを処理する ---
+	// ローカルアカウントは行ごと削除する。Google アカウントは行を残して status を 'deleted_data' にし、
+	// ユーザー名と Google 名を消す（以後の Google ログインは isLoginAllowedStatus で拒否される）
 	if provider == "local" {
 		_, err = dbAuth.Exec(ctx, "DELETE FROM users WHERE id = $1", userID)
 		if err != nil {
@@ -947,8 +1049,8 @@ func deleteAccountHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "アカウントデータが正常に削除されました。", "cleanupErrors": cleanupErrors})
 }
 
-// getMeHandler returns the auth-db account information of the JWT user
-// (provider is needed by the frontend, e.g. for the account deletion dialog).
+// getMeHandler は GET /api/auth/me を処理し、JWT のユーザーの auth-db 上のアカウント情報を返す
+// （provider はフロントエンドのアカウント削除ダイアログなどで必要になる）。
 func getMeHandler(c *gin.Context) {
 	userID, ok := c.Get("userUUID")
 	if !ok {
@@ -976,6 +1078,7 @@ func getMeHandler(c *gin.Context) {
 		return
 	}
 
+	// username が NULL の場合は JSON で null を返す
 	var usernameValue interface{}
 	if username.Valid {
 		usernameValue = username.String
@@ -990,6 +1093,8 @@ func getMeHandler(c *gin.Context) {
 	})
 }
 
+// generateJWT は HS256 で署名した有効期限 7 日の JWT を生成する。
+// ログアウト時のブロックリスト登録に使うため、jti にランダムな UUID を設定する。
 // JWT 生成処理で userID (uuid.UUID) を文字列としてセット
 func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error) {
 	jti, err := uuid.NewRandom()
@@ -999,7 +1104,8 @@ func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error
 
 	userIDStr := userID.String()
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	// トークンを読む側の互換性のため、同じユーザー ID を sub / userID / user_id / id に重複して入れている
+	claims := jwt.MapClaims{
 		"sub":      userIDStr,
 		"userID":   userIDStr,
 		"user_id":  userIDStr,
@@ -1008,20 +1114,39 @@ func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error
 		"isAdmin":  isAdmin,
 		"exp":      time.Now().Add(time.Hour * 24 * 7).Unix(),
 		"jti":      jti.String(),
-	})
+	}
+	// アカウントを作った時刻（Unix 秒）。アップロード API が「作ったばかりのアカウント」の制限に使う。
+	// 読めなければ入れない（読む側は、無ければ既存のアカウントとして扱う）
+	var createdAt time.Time
+	if dbAuth != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := dbAuth.QueryRow(ctx, "SELECT created_at FROM users WHERE id = $1", userID).Scan(&createdAt); err != nil {
+			log.Printf("WARN: could not read created_at for %s: %v", userIDStr, err)
+		}
+	}
+	if !createdAt.IsZero() {
+		claims["acctCreated"] = createdAt.Unix()
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(jwtSecret)
 }
 
+// getGoogleUserData は認可コードをアクセストークンに交換し、Google の userinfo API からユーザー情報を取得する。
+// ID・メールアドレスが空の場合や、メールアドレスが未確認（verified_email が false）の場合はエラーを返す。
 func getGoogleUserData(parent context.Context, code string) (*googleUserInfo, error) {
+	// 1. タイムアウト付きのコンテキストを作り、oauth2 ライブラリにもタイムアウト付き HTTP クライアントを使わせる
 	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, internalHTTPClient)
 
+	// 2. 認可コードをトークンに交換する
 	token, err := googleOauthConfig.Exchange(ctx, code)
 	if err != nil {
 		return nil, fmt.Errorf("code exchange failed: %w", err)
 	}
 
+	// 3. userinfo API を呼び出す
 	// アクセストークンは URL ではなく Authorization ヘッダーで送る
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v2/userinfo", nil)
 	if err != nil {
@@ -1037,6 +1162,8 @@ func getGoogleUserData(parent context.Context, code string) (*googleUserInfo, er
 		return nil, fmt.Errorf("userinfo returned status %d", response.StatusCode)
 	}
 
+	// 4. レスポンスを読み込んで検証する（読み込みは最大 1MiB に制限する）
+	// verified_email がレスポンスにない場合は拒否せず通す
 	var info googleUserInfo
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&info); err != nil {
 		return nil, fmt.Errorf("failed to decode user info: %w", err)
@@ -1050,4 +1177,71 @@ func getGoogleUserData(parent context.Context, code string) (*googleUserInfo, er
 		return nil, errors.New("google email is not verified")
 	}
 	return &info, nil
+}
+
+// ---- ログインの失敗が続いたアカウントのロック（パスワードの総当たり対策） ----
+// nginx の制限は接続元 IP ごとなので、IP を変えながら 1 つのアカウントを狙う攻撃はここで止める。
+// LOGIN_MAX_FAILURES 回（既定 10）失敗すると、最初の失敗から LOGIN_LOCKOUT_MINUTES 分（既定 15）は受け付けない。
+// Redis に届かないときは判定せずに通す。キーはメールアドレスそのものではなくハッシュにする
+
+func loginFailureKey(email string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
+	return "login_fail:" + hex.EncodeToString(sum[:])
+}
+
+func loginLimitSettings() (maxFailures int64, window time.Duration) {
+	maxFailures, window = 10, 15*time.Minute
+	if v, err := strconv.ParseInt(os.Getenv("LOGIN_MAX_FAILURES"), 10, 64); err == nil && v > 0 {
+		maxFailures = v
+	}
+	if v, err := strconv.ParseInt(os.Getenv("LOGIN_LOCKOUT_MINUTES"), 10, 64); err == nil && v > 0 {
+		window = time.Duration(v) * time.Minute
+	}
+	return
+}
+
+// loginLockedOut は、このアカウントがロック中なら true と残り時間を返す。
+func loginLockedOut(ctx context.Context, email string) (bool, time.Duration) {
+	if redisClient == nil || email == "" {
+		return false, 0
+	}
+	maxFailures, _ := loginLimitSettings()
+	key := loginFailureKey(email)
+	n, err := redisClient.Get(ctx, key).Int64()
+	if err != nil || n < maxFailures {
+		return false, 0
+	}
+	ttl, err := redisClient.TTL(ctx, key).Result()
+	if err != nil || ttl <= 0 {
+		return false, 0
+	}
+	return true, ttl
+}
+
+// recordLoginFailure はログインの失敗を 1 回数える（最初の失敗から window のあいだ数える）。
+func recordLoginFailure(ctx context.Context, email string) {
+	if redisClient == nil || email == "" {
+		return
+	}
+	maxFailures, window := loginLimitSettings()
+	key := loginFailureKey(email)
+	n, err := redisClient.Incr(ctx, key).Result()
+	if err != nil {
+		log.Printf("WARN: failed to record login failure: %v", err)
+		return
+	}
+	if n == 1 {
+		redisClient.Expire(ctx, key, window)
+	}
+	if n == maxFailures {
+		log.Printf("WARN: login locked for %s after %d failures", key, n)
+	}
+}
+
+// clearLoginFailures はログインに成功したら失敗の数を消す。
+func clearLoginFailures(ctx context.Context, email string) {
+	if redisClient == nil || email == "" {
+		return
+	}
+	redisClient.Del(ctx, loginFailureKey(email))
 }

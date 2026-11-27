@@ -21,11 +21,14 @@ const sandboxTimeout = 30 * time.Minute
 // sandboxTmpfsOptions はサンドボックスの /tmp に使う tmpfs のオプション（実行不可・setuid 無効・512 MiB 上限）
 const sandboxTmpfsOptions = "rw,noexec,nosuid,nodev,size=512m"
 
+// DockerSandbox は Docker API でスキャナー用の使い捨てコンテナを起動する Sandbox の実装。
 type DockerSandbox struct {
 	cli    *client.Client
 	logger *zap.SugaredLogger
 }
 
+// NewDockerSandbox は環境変数（DOCKER_HOST など）の設定で Docker クライアントを作成し、
+// API バージョンをデーモンとネゴシエートする DockerSandbox を返す。
 func NewDockerSandbox(logger *zap.SugaredLogger) (*DockerSandbox, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -37,6 +40,10 @@ func NewDockerSandbox(logger *zap.SugaredLogger) (*DockerSandbox, error) {
 	}, nil
 }
 
+// RunInSandbox は imageName のコンテナを、ネットワーク遮断・権限削減・リソース制限付きで起動し、
+// command（{FILE_PATH} を置換したもの）を実行して stdout と stderr を返す。
+// スキャン用ボリュームは /scan_target に読み取り専用でマウントされ、targetPath はその下のパスに変換される。
+// 0 以外で終了した場合は出力と併せて *ExitError を返す。
 func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageName string, targetPath string, command []string) (string, string, error) {
 	// スキャナー種別を判定（例: clamav, yara）
 	scannerName := "sandbox"
@@ -59,6 +66,7 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 	}
 
 	// ベースディレクトリ (/tmp/sfsp-scan) からの相対パスを安全に取得
+	// ワーカー側の /tmp/sfsp-scan とコンテナ側の /scan_target は同じボリュームを指す前提
 	const baseDir = "/tmp/sfsp-scan"
 	cleanBase := filepath.Clean(baseDir)
 	cleanTarget := filepath.Clean(targetPath)
@@ -140,12 +148,14 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 	// 前回異常終了等で同名コンテナが残っていた場合は事前に削除
 	_ = s.cli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
 
+	// コンテナを作成して起動する
 	resp, err := s.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, containerName)
 	if err != nil {
 		return "", "-1", fmt.Errorf("failed to create container %s: %w", containerName, err)
 	}
 
 	// 処理終了時に確実にコンテナを削除する
+	// （タイムアウト後でも削除できるよう、ctx ではなく context.Background() を使う）
 	defer func() {
 		_ = s.cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
 	}()
@@ -155,6 +165,7 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 	}
 
 	// コンテナの終了を待機
+	// タイムアウトやキャンセル時は errCh 側にエラーが届く
 	statusCh, errCh := s.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 
 	select {
@@ -173,6 +184,7 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 		}
 		defer out.Close()
 
+		// Tty: false のログは stdout/stderr が多重化されているため、StdCopy で分離する
 		var stdoutBuf, stderrBuf bytes.Buffer
 		_, err = stdcopy.StdCopy(&stdoutBuf, &stderrBuf, out)
 		if err != nil {
@@ -190,5 +202,6 @@ func (s *DockerSandbox) RunInSandbox(ctx context.Context, jobID string, imageNam
 		return stdoutBuf.String(), stderrBuf.String(), nil
 	}
 
+	// select はどちらかの case で必ず return するため、通常ここには到達しない（errCh に nil が届いた場合のみ）
 	return "", "-1", fmt.Errorf("unexpected end of container execution for %s", containerName)
 }

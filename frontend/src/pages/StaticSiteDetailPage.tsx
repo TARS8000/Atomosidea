@@ -6,6 +6,7 @@ import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import EditIcon from '@mui/icons-material/Edit';
 import { useAuth } from '../context/AuthContext';
 
+/** GET /api/static-sites/:id が返す静的サイト情報。 */
 interface StaticSite {
   id: string;
   user_id?: string;
@@ -13,6 +14,7 @@ interface StaticSite {
   title: string;
   description: string;
   minio_path: string;
+  /** 公開 URL の末尾に付けるエントリーポイント（例: index.html）のパス。 */
   entry_point_path: string;
   thumbnail_url: string;
   status: string;
@@ -23,12 +25,17 @@ interface StaticSite {
 // これらの status になったらポーリングを止める（スキャン・展開の終端状態）
 const TERMINAL_STATUSES = ['public', 'error', 'failed', 'invalid', 'quarantined'];
 
+/**
+ * 静的サイトの詳細ページ。処理完了までは状態をポーリングし、公開後はサイトへのリンクと
+ * クリックで別タブを開くプレビュー（iframe）を表示する。投稿者には編集ボタンを表示する。
+ */
 const StaticSiteDetailPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
   const navigate = useNavigate();
   const { user } = useAuth();
 
+  // アップロード直後の遷移では location.state で初期 status が渡される（無ければ 'unknown'）
   const initialStatus = (location.state as { initialStatus?: string })?.initialStatus || 'unknown';
 
   const [staticSite, setStaticSite] = useState<StaticSite | null>(null);
@@ -36,11 +43,15 @@ const StaticSiteDetailPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<string>(initialStatus);
 
+  // 公開サイトを配信するドメイン（サイト ID をサブドメインにして配信する）
   const staticSiteDomain = import.meta.env.VITE_STATIC_SITE_DOMAIN || 'localhost';
 
+  // サイト情報を取得し、終端状態になるまで 5 秒ごとにポーリングする。
+  // currentStatus が変わるたびに effect が再実行され、取得とポーリング設定をやり直す。
   useEffect(() => {
     let pollingInterval: number;
 
+    // サイト情報を 1 回取得し、終端状態ならポーリングを止める。
     const fetchStaticSite = async () => {
       try {
         const response = await axios.get<StaticSite>(`/api/static-sites/${id}`);
@@ -79,10 +90,12 @@ const StaticSiteDetailPage: React.FC = () => {
     }
   }, [id, currentStatus]);
 
+  /** 編集ページへ遷移する。 */
   const handleEditClick = () => {
     navigate(`/edit-static-site/${id}`);
   };
 
+  // 読み込み中・スキャン中・処理中は status に応じた進捗メッセージを表示する
   if (loading || (staticSite && (staticSite.status === 'scanning' || staticSite.status === 'processing'))) {
     let message = 'サイトを準備中...';
     if (staticSite?.status === 'scanning') {
@@ -117,6 +130,7 @@ const StaticSiteDetailPage: React.FC = () => {
     );
   }
 
+  // 公開済みの場合のみ、サイト ID をサブドメインにした配信 URL（ポート 3001）を組み立てる
   const publicSiteUrl = staticSite.status === 'public'
       ? `http://${staticSite.id}.${staticSiteDomain}:3001/${staticSite.entry_point_path}`
       : '';
@@ -130,6 +144,7 @@ const StaticSiteDetailPage: React.FC = () => {
       ? (staticSite.user_id || staticSite.uploader_id || (staticSite as any).uploaderId)
       : null;
 
+  // ログインユーザーとサイト所有者の ID を、前後空白と大文字小文字を無視して比較する
   const isOwner = Boolean(
       currentUserId &&
       siteOwnerId &&
@@ -138,6 +153,7 @@ const StaticSiteDetailPage: React.FC = () => {
 
   return (
       <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+        {/* サイト情報（タイトル・説明・日時）と、状態に応じた操作ボタン・メッセージ */}
         <Paper elevation={3} sx={{ p: 4, mb: 4 }}>
           <Typography variant="h4" component="h1" gutterBottom>
             {staticSite.title}
@@ -149,6 +165,7 @@ const StaticSiteDetailPage: React.FC = () => {
             アップロード日時: {new Date(staticSite.created_at).toLocaleString()}
           </Typography>
 
+          {/* 公開済み: 別タブで開くボタンと、所有者向けの編集ボタン */}
           {staticSite.status === 'public' && publicSiteUrl && (
               <Stack direction="row" spacing={2} sx={{ mt: 3 }}>
                 <Button
@@ -174,12 +191,14 @@ const StaticSiteDetailPage: React.FC = () => {
               </Stack>
           )}
 
+          {/* 処理失敗系の状態 */}
           {(staticSite.status === 'error' || staticSite.status === 'failed' || staticSite.status === 'invalid') && (
               <Alert severity="error" sx={{ mt: 3 }}>
                 サイトの処理中にエラーが発生しました{staticSite.processing_details ? `: ${staticSite.processing_details}` : '。'}
               </Alert>
           )}
 
+          {/* スキャンで隔離された状態 */}
           {staticSite.status === 'quarantined' && (
               <Alert severity="warning" sx={{ mt: 3 }}>
                 セキュリティスキャンで問題が検出されたため、このサイトは公開されていません。
@@ -187,6 +206,7 @@ const StaticSiteDetailPage: React.FC = () => {
           )}
         </Paper>
 
+        {/* 公開済みサイトのプレビュー。クリックすると別タブでサイトを開く */}
         {staticSite.status === 'public' && publicSiteUrl && (
             <Paper elevation={3} sx={{ p: 2, height: '80vh', overflow: 'hidden' }}>
               <Typography variant="h6" gutterBottom>
@@ -210,6 +230,7 @@ const StaticSiteDetailPage: React.FC = () => {
                     },
                   }}
               >
+                {/* pointerEvents: 'none' で iframe 内の操作を無効にし、クリックを外側の Box に渡す */}
                 <iframe
                     src={publicSiteUrl}
                     title={staticSite.title}
@@ -222,6 +243,7 @@ const StaticSiteDetailPage: React.FC = () => {
                     sandbox="allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock allow-same-origin"
                 />
 
+                {/* ホバー時にプレビューを少し暗くするオーバーレイ */}
                 <Box
                     className="iframe-overlay"
                     sx={{
@@ -234,6 +256,7 @@ const StaticSiteDetailPage: React.FC = () => {
                     }}
                 />
 
+                {/* ホバー時に中央へ表示する「別タブで表示」バッジ */}
                 <Box
                     className="launch-badge"
                     sx={{

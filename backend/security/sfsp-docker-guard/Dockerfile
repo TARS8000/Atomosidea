@@ -1,6 +1,6 @@
 # sfsp-docker-guard（標準ライブラリだけ。ビルド中にネットワークは使わない）。
-# sfsp の Dockerfile と同じ golang:1.25-alpine を使う。テストが通らなければビルドを失敗させる
-FROM golang:1.25-alpine AS build
+# sfsp の Dockerfile と同じ golang:1.27.4-alpine3.24 を使う。テストが通らなければビルドを失敗させる
+FROM golang:1.27.4-alpine3.24 AS build
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod *.go ./

@@ -23,16 +23,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// APIKeyHeader is the header every /api/v1/* request must carry.
+// APIKeyHeader は /api/v1/* へのすべてのリクエストが付けなければならないヘッダー名。
 const APIKeyHeader = "X-SFSP-API-Key"
 
-// API holds dependencies for API handlers
+// API は API ハンドラが使う依存（設定とロガー）を保持する。
 type API struct {
 	Config config.Config
 	Logger *zap.SugaredLogger
 }
 
-// NewAPI creates a new API instance
+// NewAPI は新しい API インスタンスを生成する。
 func NewAPI(cfg config.Config, logger *zap.SugaredLogger) *API {
 	return &API{
 		Config: cfg,
@@ -40,16 +40,16 @@ func NewAPI(cfg config.Config, logger *zap.SugaredLogger) *API {
 	}
 }
 
-// RequireAPIKey rejects requests whose X-SFSP-API-Key header does not match expected.
-// Both values are hashed before the constant-time comparison so that neither the
-// content nor the length of the key leaks through timing.
-// It runs before the handler, so an unauthenticated upload body is never read.
+// RequireAPIKey は X-SFSP-API-Key ヘッダーが expected と一致しないリクエストを 401 で拒否するミドルウェアを返す。
+// キーの内容も長さもタイミングから漏れないよう、両方の値を SHA-256 でハッシュしてから定数時間比較する。
+// ハンドラより前に実行されるため、認証されていないアップロードのボディは読まれない。
 func RequireAPIKey(expected string) gin.HandlerFunc {
 	want := sha256.Sum256([]byte(expected))
 	return func(c *gin.Context) {
 		provided := c.GetHeader(APIKeyHeader)
 		got := sha256.Sum256([]byte(provided))
 		if provided == "" || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			// ボディは未読のまま。接続を再利用せず閉じさせ、未認証の大きなボディを読み続けないようにする
 			c.Header("Connection", "close")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
@@ -58,6 +58,7 @@ func RequireAPIKey(expected string) gin.HandlerFunc {
 	}
 }
 
+// allowedServices は target_service として受け付ける値の許可リスト。
 var allowedServices = map[string]bool{
 	"static-site":     true,
 	"game":            true,
@@ -68,16 +69,20 @@ var allowedServices = map[string]bool{
 	"site-thumbnail":  true,
 }
 
+// errUploadTooLarge はファイル部分が MaxUploadBytes を超えたときに countingLimitReader が返すエラー。
 var errUploadTooLarge = errors.New("uploaded file exceeds the size limit")
 
-// countingLimitReader counts bytes and fails once more than max bytes were read.
+// countingLimitReader は読み取ったバイト数を数え、max を超えて読んだ時点でエラーを返す。
 type countingLimitReader struct {
-	r        io.Reader
+	r io.Reader
+	// n はこれまでに読み取ったバイト数、max は許容する最大バイト数。
+	// exceeded は上限を超えたかどうか（413 を返すかの判定に使う）。
 	n        int64
 	max      int64
 	exceeded bool
 }
 
+// Read は下位の Reader から読み取り、累計が max を超えたら errUploadTooLarge を返す。
 func (l *countingLimitReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	l.n += int64(n)
@@ -88,17 +93,21 @@ func (l *countingLimitReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// isBodyTooLarge は err がサイズ上限超過によるものかを判定する。
+// http.MaxBytesError や errUploadTooLarge がラップされずに文字列としてしか残らない場合に備え、
+// エラーメッセージの文字列でも判定する。
 func isBodyTooLarge(err error) bool {
 	var mbe *http.MaxBytesError
 	return errors.As(err, &mbe) || errors.Is(err, errUploadTooLarge) ||
 		(err != nil && strings.Contains(err.Error(), "request body too large"))
 }
 
-// HandleFileUpload handles file uploads, streams them to MinIO, and enqueues a scan job.
-// The multipart body is read part by part (MultipartReader) and the file part is streamed
-// straight to MinIO while its SHA256 is computed, so the upload is never held in memory
-// nor copied to a temporary file.
+// HandleFileUpload はファイルのアップロードを受け付け、MinIO へストリーミング保存し、スキャンジョブをキューに積む。
+// multipart のボディはパートごとに読み（MultipartReader）、ファイルパートは SHA256 を計算しながら
+// そのまま MinIO へ流すため、アップロード内容をメモリに保持したり一時ファイルにコピーしたりしない。
+// 成功時は 202 Accepted で FileID・JobID・状態を返す。
 func (a *API) HandleFileUpload(c *gin.Context) {
+	// 1. ボディ全体のサイズ上限を設定し、multipart リーダーを取得する
 	maxUpload := a.Config.Limits.MaxUploadBytes
 	// フォームのフィールドや境界の分として 1 MiB の余裕を持たせる
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpload+(1<<20))
@@ -135,6 +144,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		}
 	}()
 
+	// 2. パートを順に読み、target_service を取り出し、file を MinIO へストリーミングする
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -152,6 +162,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 
 		switch part.FormName() {
 		case "target_service":
+			// 短い識別子なので 256 バイトまでしか読まない
 			b, err := io.ReadAll(io.LimitReader(part, 256))
 			part.Close()
 			if err != nil {
@@ -183,6 +194,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 			// MinIO のオブジェクトキーを FileID の文字列単体に統一
 			objectName = fileID.String()
 
+			// サイズを数えつつ SHA256 を計算しながら、サイズ不明（-1）として MinIO へ流し込む
 			hash := sha256.New()
 			counter := &countingLimitReader{r: part, max: maxUpload}
 			a.Logger.Infof("Streaming upload to MinIO bucket '%s' with key '%s'", rawBucket, objectName)
@@ -200,6 +212,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 				return
 			}
 			uploaded = true
+			// MinIO がサイズを返さなかった場合は自前で数えたバイト数を使う
 			fileSize = info.Size
 			if fileSize <= 0 {
 				fileSize = counter.n
@@ -212,6 +225,8 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		}
 	}
 
+	// 3. 必須項目を検証する（file が target_service より先に来た場合はここで初めて検証される。
+	//    不正なら defer でアップロード済みオブジェクトが削除される）
 	if !uploaded {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get file from request"})
 		return
@@ -226,6 +241,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		return
 	}
 
+	// 4. ファイルのメタデータを files テーブルに登録する
 	fileType := determineFileType(filename, contentType)
 
 	newFile := model.File{
@@ -249,6 +265,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		return
 	}
 
+	// 5. queued 状態のスキャンジョブを scan_jobs テーブルに登録する
 	newJob := model.ScanJob{
 		ID:        uuid.New(),
 		FileID:    newFile.ID,
@@ -266,6 +283,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		return
 	}
 
+	// 6. ジョブ ID を Redis のスキャンキューに積む
 	if err := queue.EnqueueJob(ctx, newJob.ID.String()); err != nil {
 		a.Logger.Errorf("Failed to enqueue job to Redis: %v", err)
 		// キューに入らなかったジョブが queued のまま残らないようにする
@@ -275,6 +293,7 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to enqueue scan job"})
 		return
 	}
+	// ここまで成功したので、defer による raw オブジェクトの削除を行わない
 	committed = true
 
 	a.Logger.Infof("Successfully uploaded file and enqueued job: FileID=%s, JobID=%s, Bucket=%s, ObjectKey=%s, FileType=%s, Size=%d", newFile.ID, newJob.ID, rawBucket, objectName, fileType, fileSize)
@@ -285,11 +304,14 @@ func (a *API) HandleFileUpload(c *gin.Context) {
 	})
 }
 
+// rejectTargetService は不正な target_service をログに記録し、許可値の一覧を含む 400 を返す。
 func (a *API) rejectTargetService(c *gin.Context, targetService string) {
 	a.Logger.Errorf("Invalid target_service: %s", targetService)
 	c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid target_service: %s. Allowed values are 'static-site', 'game', 'stream', 'profile', 'video-thumbnail', 'game-thumbnail', 'site-thumbnail'", targetService)})
 }
 
+// HandleGetJob はパスパラメータ id のスキャンジョブを scan_jobs から取得して返す。
+// ID の形式が不正なら 400、取得に失敗した場合（DB エラーを含む）は 404 を返す。
 func (a *API) HandleGetJob(c *gin.Context) {
 	jobIDStr := c.Param("id")
 	jobID, err := uuid.Parse(jobIDStr)
@@ -311,6 +333,8 @@ func (a *API) HandleGetJob(c *gin.Context) {
 	c.JSON(http.StatusOK, job)
 }
 
+// HandleGetResult はパスパラメータ id のジョブに紐づくスキャナーごとの結果（scan_results）を返す。
+// 結果がまだ無い場合は、ジョブが存在すればその状態をメッセージ付きで返し、存在しなければ 404 を返す。
 func (a *API) HandleGetResult(c *gin.Context) {
 	jobIDStr := c.Param("id")
 	jobID, err := uuid.Parse(jobIDStr)
@@ -339,6 +363,7 @@ func (a *API) HandleGetResult(c *gin.Context) {
 		results = append(results, result)
 	}
 
+	// 結果が無い場合は、ジョブ自体の有無と状態を確認する
 	if len(results) == 0 {
 		var jobStatus string
 		err = database.DB.QueryRow(c, "SELECT status FROM scan_jobs WHERE id = $1", jobID).Scan(&jobStatus)
@@ -353,6 +378,8 @@ func (a *API) HandleGetResult(c *gin.Context) {
 	c.JSON(http.StatusOK, results)
 }
 
+// determineFileType は拡張子と Content-Type から、ワーカーの処理分岐に使うファイル種別
+// （"zip" / "video" / "html" / "other"）を判定する。上の case ほど優先される。
 func determineFileType(filename, mimeType string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch {

@@ -1,6 +1,8 @@
 services:
   mon-nginx:
-    image: nginx:alpine
+    # 版を固定する（nginx:alpine のままだと古いイメージが残っていても pull されない）。
+    # 1.31.9 は NGINX2Root（CVE-2026-123007 ほか 4 件）の修正版
+    image: nginx:1.31.9-alpine
     container_name: mon-nginx
     restart: always
     ports:
@@ -24,15 +26,16 @@ services:
   # ここから読むので、もともと必要）・ログ・archive / export でのファイルの読み取りなど）。
   # GET の /containers/{id}/attach/ws（WebSocket）も通るので、stdin_open のコンテナがあればその標準入力には書き込める（今は無い）
   mon-docker-proxy:
-    image: tecnativa/docker-socket-proxy:0.3.0 # ルートの docker-compose.yml の sfsp-docker-proxy と同じ版
+    image: tecnativa/docker-socket-proxy:v0.5.0 # ルートの docker-compose.yml の sfsp-docker-proxy と同じ版
     container_name: mon-docker-proxy
     restart: always
     # ログの追従（/ws/logs）が、ログの出ないコンテナで HAProxy の既定のタイムアウト（10 分）で切れないよう 24 時間に延ばしてから
     # 元の entrypoint を実行する
+    # （v0.4 以降の docker-entrypoint.sh は haproxy.cfg を /tmp/haproxy.cfg に書き出す）
     entrypoint:
       - sh
       - -c
-      - sed -i -e 's/timeout client 10m/timeout client 24h/' -e 's/timeout server 10m/timeout server 24h/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      - sed -i -e 's/timeout client 10m/timeout client 24h/' -e 's/timeout server 10m/timeout server 24h/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /tmp/haproxy.cfg
     environment:
       CONTAINERS: 1 # ContainerList / ContainerInspect / ContainerStats / ContainerLogs（GET だけ）
       VOLUMES: 1 # VolumeList
@@ -61,6 +64,8 @@ services:
       ALLOW_RESTARTS: 0
       ALLOW_START: 0
       ALLOW_STOP: 0
+      ALLOW_PAUSE: 0 # v0.4 で増えた項目（既定でも拒否だが明示する）
+      ALLOW_UNPAUSE: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     security_opt:
@@ -80,6 +85,20 @@ services:
       MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
       # 許可ホストの追加（カンマ区切り、任意）。localhost / 127.0.0.1 / ::1 は常に許可。空・未設定なら追加なし
       MONITORING_ALLOWED_HOSTS: ${MONITORING_ALLOWED_HOSTS:-}
+      # DoS 対策の見張り（backend/guard.go）。処理待ちの件数を Redis から読む
+      REDIS_ADDR: atmosidea-redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # しきい値を超えたら Discord に知らせる（未設定ならダッシュボードに出すだけ）
+      ALERT_DISCORD_WEBHOOK_URL: ${ALERT_DISCORD_WEBHOOK_URL:-}
+      ALERT_MIN_FREE_DISK_BYTES: ${ALERT_MIN_FREE_DISK_BYTES:-16106127360}
+      ALERT_SCAN_BACKLOG: ${ALERT_SCAN_BACKLOG:-15}
+      ALERT_TRANSCODE_BACKLOG: ${ALERT_TRANSCODE_BACKLOG:-8}
+      ALERT_429_PER_5MIN: ${ALERT_429_PER_5MIN:-300}
+      ALERT_5XX_PER_5MIN: ${ALERT_5XX_PER_5MIN:-50}
+      ALERT_COOLDOWN_MINUTES: ${ALERT_COOLDOWN_MINUTES:-30}
+      # 監視対象の compose プロジェクト（Atomosidea 本体）。表示・ログ・MinIO 操作をこのプロジェクトのコンテナに限る。
+      # 未設定なら mon-backend が atmosidea-frontend コンテナのプロジェクトを使う
+      MONITOR_PROJECT: ${COMPOSE_PROJECT_NAME:-}
       # Docker API は mon-docker-proxy（読み取りだけ）経由。docker.sock は直接マウントしない
       DOCKER_HOST: tcp://mon-docker-proxy:2375
     depends_on:

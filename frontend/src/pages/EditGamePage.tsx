@@ -4,12 +4,19 @@ import axios from 'axios';
 import { Container, TextField, Button, Typography, Box, CircularProgress, Alert } from '@mui/material';
 import { useAuth } from '../context/AuthContext';
 
+/**
+ * ゲームのタイトル・説明・サムネイルを編集するページ。
+ * サムネイルは SFSP のセキュリティスキャンを経て保存されるため、送信後にスキャン完了を待つ。
+ */
 const EditGamePage = () => {
   const { id } = useParams();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  // 新しく選択されたサムネイル画像（未選択なら null）
   const [thumbnail, setThumbnail] = useState<File | null>(null);
+  // サーバーに保存済みのサムネイル URL（スキャン後に URL が得られない場合の代替に使う）
   const [existingThumbnailUrl, setExistingThumbnailUrl] = useState('');
+  // 画面に表示中のサムネイル URL（選択直後はローカルの blob URL になる）
   const [thumbnailUrl, setThumbnailUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
@@ -19,6 +26,7 @@ const EditGamePage = () => {
   const navigate = useNavigate();
   const { token } = useAuth();
 
+  // 初回表示時に現在のゲーム情報を取得してフォームに反映する。
   useEffect(() => {
     const fetchGame = async () => {
       try {
@@ -38,6 +46,7 @@ const EditGamePage = () => {
     fetchGame();
   }, [id, token]);
 
+  /** ファイル選択時に、選んだ画像を保持してローカルプレビューを表示する。 */
   const handleThumbnailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
@@ -48,9 +57,10 @@ const EditGamePage = () => {
 
   // thumbnail_sfsp_job_id が NULL になるまでポーリングする。
   // このフラグがクリアされるのはゲームワーカーがクリーンなサムネイルを
-  // game-storage に書き込んだ後だけなので、これでストレ書き込み完了を
+  // game-storage に書き込んだ後だけなので、これでストレージ書き込み完了を
   // 保証でき、フライングによる旧画像の表示を防止できる。
   const MAX_POLL_MS = 120000;
+  /** 2 秒ごとにゲーム情報を取得し、サムネイルのスキャン完了（またはタイムアウト）で解決する。中断時は reject する。 */
   const pollGame = async (signal: AbortSignal): Promise<{ thumbnailUrl?: string }> => {
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
@@ -77,6 +87,7 @@ const EditGamePage = () => {
         }
       }, 2000);
 
+      // 中断（AbortController.abort）されたらポーリングを止めて reject する
       signal.addEventListener('abort', () => {
         clearInterval(pollInterval);
         reject(new Error('Polling aborted'));
@@ -84,6 +95,7 @@ const EditGamePage = () => {
     });
   };
 
+  /** フォーム送信時の処理。サムネイルがあれば PUT /api/games/:id で送信し、スキャン完了を待ってから詳細ページへ遷移する。 */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setUpdating(true);
@@ -92,6 +104,7 @@ const EditGamePage = () => {
 
     const controller = new AbortController();
 
+    // 1. 送信するフォームデータを組み立てる
     const formData = new FormData();
     formData.append('title', title);
     formData.append('description', description);
@@ -102,6 +115,7 @@ const EditGamePage = () => {
     try {
       let newThumbnailUrl = thumbnailUrl;
 
+      // 2. サムネイルが選択されている場合のみ PUT を送り、スキャン中ならスキャン完了まで待つ
       if (thumbnail) {
         setIsScanningThumbnail(true);
         const res = await axios.put(`/api/games/${id}`, formData, {
@@ -118,13 +132,14 @@ const EditGamePage = () => {
         }
       }
 
-      // Preload the freshly-written thumbnail (cache-buster to bypass any stale
-      // browser cache of the old image) and keep the overlay up until it has
-      // loaded, then swap the displayed image only once it is fully ready, so
-      // the old thumbnail never flashes during the transition.
+      // 3. 書き込まれたばかりのサムネイルを先読みする（旧画像のブラウザキャッシュを
+      // 避けるためにキャッシュバスターを付ける）。読み込みが終わるまでオーバーレイを
+      // 表示したままにし、完全に準備できてから表示画像を差し替えることで、
+      // 切り替え中に旧サムネイルが一瞬表示されないようにする。
       const bust = newThumbnailUrl.includes('?') ? '&' : '?';
       const freshUrl = newThumbnailUrl + bust + 't=' + Date.now();
       const preload = new Image();
+      // 先読み完了（成功・失敗とも）で表示を切り替え、2 秒後に詳細ページへ遷移する
       const reveal = () => {
         setIsScanningThumbnail(false);
         setThumbnailUrl(freshUrl);
@@ -144,6 +159,7 @@ const EditGamePage = () => {
     }
   };
 
+  /** 確認ダイアログの後、DELETE /api/games/:id/thumbnail でサムネイルを削除する。 */
   const handleDeleteThumbnail = async () => {
     if (!window.confirm('本当にサムネイルを削除しますか？')) {
       return;
@@ -195,6 +211,7 @@ const EditGamePage = () => {
           />
         </Box>
         <Box mb={2}>
+          {/* サムネイル選択ボタン。スキャン中はボタンの上に半透明のオーバーレイを重ねる */}
           <Box sx={{ position: 'relative', display: 'inline-block' }}>
             <Button variant="contained" component="label">
               新しいサムネイルを選択
@@ -219,6 +236,7 @@ const EditGamePage = () => {
           </Box>
           {thumbnail && <Typography sx={{ ml: 2, display: 'inline' }}>{thumbnail.name}</Typography>}
         </Box>
+        {/* 表示中のサムネイルと削除ボタン */}
         {thumbnailUrl && (
           <Box mb={2}>
             <Typography variant="subtitle1">現在のサムネイル</Typography>

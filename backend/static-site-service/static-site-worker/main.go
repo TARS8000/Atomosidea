@@ -1,3 +1,5 @@
+// static-site-worker は、SFSP（ファイルスキャン基盤）のスキャン完了イベントを Redis キューから受け取り、
+// 静的サイトの ZIP を検証・展開して MinIO に公開する処理と、サイトのサムネイル画像を保存する処理を行う。
 package main
 
 import (
@@ -28,6 +30,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// ワーカー全体で共有する接続・設定。main で初期化する。
+//   - db: アプリ用 PostgreSQL への接続
+//   - minioClient / minioBucket: 公開用（静的サイト配信用）MinIO のクライアントとバケット名（MINIO_BUCKET_NAME）
+//   - sfspMinioClient / sfspBucketName: スキャンで clean と判定されたファイルが置かれる SFSP 側 MinIO のクライアントとバケット名
+//   - logger: 構造化ロガー
 var (
 	db              *sql.DB
 	minioClient     *minio.Client
@@ -44,7 +51,7 @@ var (
 	siteMaxEntryBytes     int64 = 268435456 // SITE_MAX_ENTRY_BYTES: 1 エントリあたりの上限
 )
 
-// 処理を同時に走らせる最大数（静的サイト・サムネイル合計）
+// workerConcurrency は処理を同時に走らせる最大数（静的サイト・サムネイル合計）。
 const workerConcurrency = 4
 
 // errLimitExceeded は展開・ダウンロードのサイズ上限を超えたことを表す。
@@ -70,6 +77,8 @@ var imageExtensions = map[string]string{
 	"image/webp": ".webp",
 }
 
+// envInt64 は環境変数 name を正の int64 として読み取る。
+// 未設定なら def を返し、数値でない・0 以下の場合は警告を出して def を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -83,7 +92,10 @@ func envInt64(name string, def int64) int64 {
 	return n
 }
 
+// main は DB・MinIO（公開用と SFSP 用）・Redis へ接続し、
+// 静的サイト用とサムネイル用の 2 つのキューのコンシューマを起動して、そのまま待ち続ける。
 func main() {
+	// 1. ロガーを初期化する
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -91,17 +103,20 @@ func main() {
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
 
+	// 2. サイズ上限を環境変数で上書きする（logger を使うのでロガー初期化後に行う）
 	maxSiteUploadBytes = envInt64("MAX_SITE_UPLOAD_BYTES", maxSiteUploadBytes)
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
 	siteMaxExtractedBytes = envInt64("SITE_MAX_EXTRACTED_BYTES", siteMaxExtractedBytes)
 	siteMaxZipEntries = envInt64("SITE_MAX_ZIP_ENTRIES", siteMaxZipEntries)
 	siteMaxEntryBytes = envInt64("SITE_MAX_ENTRY_BYTES", siteMaxEntryBytes)
 
+	// 3. 共通設定（Redis 接続情報など）を読み込む
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// 4. PostgreSQL に接続する（起動直後は DB が未準備のことがあるため 5 秒間隔で最大 5 回試す）
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		logger.Fatal("DATABASE_URL environment variable not set")
@@ -123,6 +138,7 @@ func main() {
 	defer db.Close()
 	logger.Info("Successfully connected to PostgreSQL!")
 
+	// 5. 公開用 MinIO に接続する（ListBuckets で疎通を確認し、失敗時は同様にリトライする）
 	minioEndpoint := os.Getenv("MINIO_ENDPOINT")
 	minioAccessKeyID := os.Getenv("MINIO_ACCESS_KEY_ID")
 	minioSecretAccessKey := os.Getenv("MINIO_SECRET_ACCESS_KEY")
@@ -152,6 +168,7 @@ func main() {
 	}
 	logger.Info("Successfully connected to MinIO!")
 
+	// 6. SFSP 側 MinIO のクライアントを作る（minio.New は通信しないため、ここでは疎通確認をしていない）
 	sfspMinioEndpoint := os.Getenv("SFSP_MINIO_ENDPOINT")
 	sfspMinioAccessKey := os.Getenv("SFSP_MINIO_ACCESS_KEY_ID")
 	sfspMinioSecretKey := os.Getenv("SFSP_MINIO_SECRET_ACCESS_KEY")
@@ -166,6 +183,7 @@ func main() {
 	}
 	logger.Info("Successfully connected to SFSP MinIO!")
 
+	// 7. Redis に接続し、購読するキューとハンドラの組を定義する
 	if err := queue.ConnectRedis(cfg, logger); err != nil {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
@@ -192,10 +210,12 @@ func main() {
 
 	logger.Info("Static Site Worker started. Waiting for jobs...")
 
+	// 8. 2 つのキューのコンシューマを起動する。sem は両キューで共有し、同時処理数を workerConcurrency に抑える
 	sem := make(chan struct{}, workerConcurrency)
 	for _, q := range queues {
 		go consume(ctx, q.name, q.handler, sem)
 	}
+	// main を終了させずに待ち続ける
 	select {}
 }
 
@@ -204,6 +224,7 @@ func main() {
 // 次回起動時の RecoverProcessing で再処理させる）。
 func consume(ctx context.Context, queueName string, handler func(string) bool, sem chan struct{}) {
 	for {
+		// 1. メッセージを処理中リストへ移しながら取り出す（5 秒でタイムアウトし、空なら redis.Nil）
 		payload, err := queue.DequeueReliable(ctx, queueName, 5*time.Second)
 		if err == redis.Nil {
 			continue
@@ -214,11 +235,13 @@ func consume(ctx context.Context, queueName string, handler func(string) bool, s
 			continue
 		}
 
+		// 2. セマフォの空きを待ってから、別ゴルーチンでハンドラを実行する
 		sem <- struct{}{}
 		go func(payload string) {
 			defer func() { <-sem }()
 			ack := true
 			func() {
+				// ハンドラが panic した場合は Ack する扱いにする（同じメッセージで再起動のたびに panic し続けるのを防ぐため）
 				defer func() {
 					if r := recover(); r != nil {
 						logger.Errorf("Panic while handling message from %s: %v", queueName, r)
@@ -227,6 +250,7 @@ func consume(ctx context.Context, queueName string, handler func(string) bool, s
 				}()
 				ack = handler(payload)
 			}()
+			// 3. ハンドラが false を返したら処理中リストに残し、成功時のみ Ack（処理中リストから削除）する
 			if !ack {
 				logger.Warnf("Message from %s left unacknowledged; it will be retried on restart", queueName)
 				return
@@ -262,7 +286,10 @@ func lookupWithRetry(query string, jobID string, dest ...interface{}) error {
 	}
 }
 
+// handleStaticSiteMessage は静的サイト用キューのスキャン完了イベントを処理する。
+// 戻り値は Ack してよいか。解析できない・対象外・該当レコードなし・処理済みのイベントは true を返して捨てる。
 func handleStaticSiteMessage(payload string) bool {
+	// 1. イベントを解析し、静的サイト宛てのものだけを対象にする
 	var ev event.ScanCompletionEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 		logger.Errorf("Error unmarshalling event payload: %v", err)
@@ -273,6 +300,7 @@ func handleStaticSiteMessage(payload string) bool {
 		return true
 	}
 
+	// 2. SFSP のジョブ ID から対象サイトの行を探す
 	var siteID, status string
 	err := lookupWithRetry("SELECT id, status FROM static_sites WHERE sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", ev.JobID.String(), &siteID, &status)
 	if err != nil {
@@ -286,6 +314,7 @@ func handleStaticSiteMessage(payload string) bool {
 		return true
 	}
 
+	// 3. スキャン結果が clean 以外なら公開せずに終える（malicious / suspicious は quarantined として記録する）
 	if ev.FinalStatus != "clean" {
 		logger.Infof("[SiteID: %s] Scan result is '%s'. Aborting processing.", siteID, ev.FinalStatus)
 		finalStatus := ev.FinalStatus
@@ -295,6 +324,7 @@ func handleStaticSiteMessage(payload string) bool {
 		return updateProcessingStatus(siteID, finalStatus, fmt.Sprintf("File scan failed with status: %s", ev.FinalStatus)) == nil
 	}
 
+	// 4. 展開・公開処理を行う。panic した場合はサイトを failed にし、result を non-nil にする
 	var result error
 	func() {
 		defer func() {
@@ -305,10 +335,12 @@ func handleStaticSiteMessage(payload string) bool {
 		}()
 		result = processStaticSiteJob(siteID, ev)
 	}()
-	// result は終端状態の書き込みに失敗した場合のみ non-nil
+	// result は終端状態の書き込みに失敗した場合と panic した場合に non-nil
 	return result == nil
 }
 
+// updateProcessingStatus は static_sites の status と processing_details（進捗・エラー内容の表示用）を更新する。
+// 失敗時はログを出してエラーを返す。
 func updateProcessingStatus(siteID, status, details string) error {
 	_, err := db.Exec("UPDATE static_sites SET status = $1, processing_details = $2 WHERE id = $3", status, details, siteID)
 	if err != nil {
@@ -326,6 +358,7 @@ func downloadCleanFile(ctx context.Context, logPrefix string, ev event.ScanCompl
 		return "", fmt.Errorf("get %s: %w", key, err)
 	}
 	defer obj.Close()
+	// limit+1 バイトまで読み、limit を超えて読めたら上限超過と判定する（EOF は正常終了扱い）
 	n, err := io.CopyN(f, obj, limit+1)
 	if err == io.EOF {
 		err = nil
@@ -341,7 +374,9 @@ func downloadCleanFile(ctx context.Context, logPrefix string, ev event.ScanCompl
 }
 
 // removeSitePrefix は失敗時に、途中までアップロードしたサイトのファイルを削除する。
+// 公開用バケットの "<siteID>/" 配下を列挙して一括削除する。削除できなかったものは警告ログのみ出す。
 func removeSitePrefix(ctx context.Context, siteID string) {
+	// 列挙結果を別ゴルーチンからチャネルへ流し、RemoveObjects に渡す（列挙エラー時はそこで打ち切る）
 	objectsCh := make(chan minio.ObjectInfo)
 	go func() {
 		defer close(objectsCh)
@@ -364,6 +399,8 @@ type limitedReader struct {
 	n int64
 }
 
+// Read は残り許容量 n を超えないように p を切り詰めて読み、読んだ分だけ n を減らす。
+// io.LimitReader と違い、上限を超えるデータがあれば EOF ではなくエラーにする。
 func (l *limitedReader) Read(p []byte) (int, error) {
 	if l.n <= 0 {
 		// 上限ちょうどで終わっているかを 1 バイト読んで確認する
@@ -382,6 +419,8 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// contentTypeFor は拡張子（大文字小文字を区別しない）から公開時の Content-Type を決める。
+// 対応表にない拡張子は application/octet-stream にする。
 func contentTypeFor(relPath string) string {
 	lowerPath := strings.ToLower(relPath)
 	switch {
@@ -409,11 +448,13 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 	ctx := context.Background()
 	logPrefix := fmt.Sprintf("[SiteID: %s]", siteID)
 
+	// fail はエラーをログに出し、サイトを終端状態 status にする。戻り値は DB 更新のエラー。
 	fail := func(status, details string) error {
 		logger.Errorf("%s %s", logPrefix, details)
 		return updateProcessingStatus(siteID, status, details)
 	}
 
+	// 1. clean-files から ZIP を一時ファイルへダウンロードする（サイズ上限付き）
 	tmpZip, err := os.CreateTemp("", "static-site-*.zip")
 	if err != nil {
 		return fail("failed", fmt.Sprintf("Failed to create temp file: %v", err))
@@ -435,6 +476,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		return fail("failed", fmt.Sprintf("Failed to write temp file: %v", err))
 	}
 
+	// 2. ZIP を開く
 	_ = updateProcessingStatus(siteID, "processing", "ZIPファイルを解凍中...")
 	zipReader, err := zip.OpenReader(tempZipPath)
 	if err != nil {
@@ -442,7 +484,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 	}
 	defer zipReader.Close()
 
-	// --- zip bomb 対策: エントリ数・宣言サイズの事前検査 ---
+	// 3. zip bomb 対策: エントリ数・宣言サイズの事前検査（展開前にヘッダの値だけで弾く）
 	if int64(len(zipReader.File)) > siteMaxZipEntries {
 		return fail("failed", fmt.Sprintf("ZIP contains too many entries (%d > %d)", len(zipReader.File), siteMaxZipEntries))
 	}
@@ -460,11 +502,14 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		}
 	}
 
+	// 4. 最初に見つかった index.html（大文字小文字を区別しない）の場所をサイトのルートとみなす
+	//    （ZIP 内の格納順で最初のものを採用するため、階層の浅いものが優先されるとは限らない）
 	var indexZipPath string
 	for _, file := range zipReader.File {
 		if file.FileInfo().IsDir() {
 			continue
 		}
+		// バックスラッシュ区切りのパスも扱えるよう "/" にそろえる
 		normalizedPath := strings.ReplaceAll(file.Name, "\\", "/")
 		if strings.ToLower(path.Base(normalizedPath)) == "index.html" {
 			indexZipPath = normalizedPath
@@ -475,6 +520,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		return fail("error", "index.html not found in the ZIP file")
 	}
 
+	// index.html のあるディレクトリ（末尾 "/" 付き、ZIP 直下なら空文字）を、公開時に取り除く接頭辞にする
 	zipRootDir := path.Dir(indexZipPath)
 	if zipRootDir == "." {
 		zipRootDir = ""
@@ -482,7 +528,9 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		zipRootDir = zipRootDir + "/"
 	}
 
-	// Zip Slip 対策は全エントリをアップロード前に検査する（途中まで公開されるのを防ぐ）
+	// 5. Zip Slip 対策は全エントリをアップロード前に検査する（途中まで公開されるのを防ぐ）
+	//    シンボリックリンクと不正なパスがあれば ZIP 全体を拒否し、公開先の相対パスを決める
+	// entry は検査済みの ZIP エントリと、公開先（<siteID>/ 配下）の相対パスの組。
 	type entry struct {
 		file    *zip.File
 		relPath string
@@ -496,6 +544,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 			return fail("error", fmt.Sprintf("Illegal file path in ZIP: %s", file.Name))
 		}
 		normalizedPath := strings.ReplaceAll(file.Name, "\\", "/")
+		// ルート配下のエントリは接頭辞を外す。ルート外のエントリは ZIP 内のパスのまま公開される
 		relPath := normalizedPath
 		if zipRootDir != "" && strings.HasPrefix(normalizedPath, zipRootDir) {
 			relPath = strings.TrimPrefix(normalizedPath, zipRootDir)
@@ -509,6 +558,8 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		entries = append(entries, entry{file: file, relPath: cleanRelPath})
 	}
 
+	// 6. 各エントリを公開用 MinIO の "<siteID>/<relPath>" にアップロードする。
+	//    remaining は展開後合計の残り許容量。途中で失敗したらアップロード済みのファイルを削除する
 	_ = updateProcessingStatus(siteID, "processing", "ファイルをアップロード中...")
 	remaining := siteMaxExtractedBytes
 	for _, e := range entries {
@@ -534,6 +585,7 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		rc.Close()
 		if err != nil {
 			removeSitePrefix(ctx, siteID)
+			// 上限超過かどうかは errors.Is に加え、エラーメッセージに含まれる文字列でも判定する（minio-go 経由で包まれて返る場合に備える）
 			if errors.Is(err, errLimitExceeded) || strings.Contains(err.Error(), errLimitExceeded.Error()) {
 				return fail("failed", fmt.Sprintf("ZIP entry %q exceeds the size limit", e.file.Name))
 			}
@@ -542,13 +594,13 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 		remaining -= declared
 	}
 
-	// 1. DB ステータスを 'public' に更新
+	// 7. DB ステータスを 'public' に更新（エントリポイントは常に "index.html"）
 	entryPointPath := "index.html"
 	if _, err = db.Exec("UPDATE static_sites SET status = 'public', entry_point_path = $1, processing_details = NULL WHERE id = $2", entryPointPath, siteID); err != nil {
 		return fail("error", fmt.Sprintf("Failed to update static site status to public: %v", err))
 	}
 
-	// 2. 本番化成功後に SFSP MinIO (clean-files) からファイルを削除
+	// 8. 本番化成功後に SFSP MinIO (clean-files) からファイルを削除（失敗しても警告のみ）
 	if downloadedKey != "" {
 		if err := sfspMinioClient.RemoveObject(ctx, sfspBucketName, downloadedKey, minio.RemoveObjectOptions{}); err != nil {
 			logger.Warnf("%s Failed to delete clean file from SFSP MinIO (%s): %v", logPrefix, downloadedKey, err)
@@ -561,6 +613,8 @@ func processStaticSiteJob(siteID string, ev event.ScanCompletionEvent) error {
 	return nil
 }
 
+// handleThumbnailMessage はサムネイル用キューのスキャン完了イベントを解析し、
+// サイトのサムネイル宛てのものだけを processStaticSiteThumbnail に渡す。戻り値は Ack してよいか。
 func handleThumbnailMessage(payload string) bool {
 	var ev event.ScanCompletionEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
@@ -575,7 +629,7 @@ func handleThumbnailMessage(payload string) bool {
 }
 
 // clearThumbnailJob はサムネイルのジョブを終了させる（フロントエンドのポーリングが「却下」と判定できる）。
-// 新しいジョブに置き換わっている場合は何もしない。
+// 新しいジョブに置き換わっている場合は何もしない。戻り値は DB 更新に成功したか（= Ack してよいか）。
 func clearThumbnailJob(siteID string, jobID string) bool {
 	_, err := db.Exec("UPDATE static_sites SET thumbnail_sfsp_job_id = NULL WHERE id = $1 AND thumbnail_sfsp_job_id = $2", siteID, jobID)
 	if err != nil {
@@ -586,20 +640,25 @@ func clearThumbnailJob(siteID string, jobID string) bool {
 }
 
 // thumbnailKeyFromURL は "/static-sites/thumbnails/xxx.ext" を MinIO のキー "thumbnails/xxx.ext" にする。
+// 形式が合わない URL には空文字を返す。
 func thumbnailKeyFromURL(u string) string {
 	const prefix = "/static-sites/"
 	if !strings.HasPrefix(u, prefix) {
 		return ""
 	}
 	key := strings.TrimPrefix(u, prefix)
+	// 削除対象を thumbnails/ 直下の 1 オブジェクトに限定し、サイト本体など他のキーを消さないようにする
 	if !strings.HasPrefix(key, "thumbnails/") || strings.Contains(key, "..") || strings.Count(key, "/") != 1 {
 		return ""
 	}
 	return key
 }
 
-// processStaticSiteThumbnail の戻り値は Ack してよいか（終端状態を DB に反映できたか）。
+// processStaticSiteThumbnail はスキャン済みのサムネイル画像を検証して公開用 MinIO に保存し、
+// サイトの thumbnail_url を差し替える。途中で失敗した場合はジョブを終了させる（clearThumbnailJob）。
+// 戻り値は Ack してよいか（終端状態を DB に反映できたか）。
 func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEvent) bool {
+	// 1. サムネイル用のジョブ ID から対象サイトを探す
 	jobID := ev.JobID.String()
 	var siteID string
 	err := lookupWithRetry("SELECT id FROM static_sites WHERE thumbnail_sfsp_job_id = $1 ORDER BY created_at DESC LIMIT 1", jobID, &siteID)
@@ -610,11 +669,13 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 	logPrefix := fmt.Sprintf("[SiteID: %s]", siteID)
 	logger.Infof("%s Found matching static site record for thumbnail SFSP JobID %s", logPrefix, jobID)
 
+	// 2. スキャン結果が clean 以外なら保存せずにジョブを終了させる
 	if ev.FinalStatus != "clean" {
 		logger.Infof("%s Thumbnail scan result is '%s'. Aborting thumbnail processing.", logPrefix, ev.FinalStatus)
 		return clearThumbnailJob(siteID, jobID)
 	}
 
+	// 3. clean-files から画像を一時ファイルへダウンロードする（サイズ上限付き）
 	tmp, err := os.CreateTemp("", "site-thumb-*")
 	if err != nil {
 		logger.Errorf("%s Failed to create temp file for thumbnail: %v", logPrefix, err)
@@ -633,6 +694,8 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 		return clearThumbnailJob(siteID, jobID)
 	}
 
+	// 4. 先頭 512 バイトの中身から Content-Type を判定し、許可した画像形式以外は拒否する
+	//    （申告されたファイル名や Content-Type は信用しない）
 	buffer := make([]byte, 512)
 	n, _ := io.ReadFull(tmp, buffer)
 	contentType := http.DetectContentType(buffer[:n])
@@ -651,6 +714,7 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 		return clearThumbnailJob(siteID, jobID)
 	}
 
+	// 5. ランダムな名前で公開用 MinIO の thumbnails/ にアップロードする
 	thumbnailRandomName := generateRandomThumbnailName()
 	if thumbnailRandomName == "" {
 		return clearThumbnailJob(siteID, jobID)
@@ -662,7 +726,7 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 	}
 	thumbnailURL := "/static-sites/" + newKey
 
-	// 新しい URL を確定させる。ジョブが別のアップロードに置き換わっていたら反映しない。
+	// 6. 新しい URL を確定させる。ジョブが別のアップロードに置き換わっていたら反映しない。
 	oldURL, committed, err := commitThumbnail(ctx, siteID, jobID, thumbnailURL)
 	if err != nil {
 		logger.Errorf("%s Failed to update thumbnail URL in DB: %v", logPrefix, err)
@@ -676,7 +740,7 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 		return true
 	}
 
-	// 新しいサムネイルの確定後に古いオブジェクトを削除する（このサイトのもので、他から参照されていない場合のみ）
+	// 7. 新しいサムネイルの確定後に古いオブジェクトを削除する（このサイトのもので、他から参照されていない場合のみ）
 	if oldKey := thumbnailKeyFromURL(oldURL); oldKey != "" && oldKey != newKey {
 		var others int
 		if err := db.QueryRow("SELECT COUNT(*) FROM static_sites WHERE thumbnail_url = $1 AND id <> $2", oldURL, siteID).Scan(&others); err != nil {
@@ -690,6 +754,7 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 		}
 	}
 
+	// 8. SFSP MinIO (clean-files) の元ファイルを削除する（失敗しても警告のみ）
 	if downloadedKey != "" {
 		if err := sfspMinioClient.RemoveObject(ctx, sfspBucketName, downloadedKey, minio.RemoveObjectOptions{}); err != nil {
 			logger.Warnf("%s Failed to delete clean thumbnail from SFSP MinIO (%s): %v", logPrefix, downloadedKey, err)
@@ -701,7 +766,8 @@ func processStaticSiteThumbnail(ctx context.Context, ev *event.ScanCompletionEve
 }
 
 // commitThumbnail は thumbnail_sfsp_job_id が jobID のままの場合に限り thumbnail_url を差し替え、
-// 差し替え前の URL を返す。
+// 差し替え前の URL を返す。ジョブが置き換わっていた（行がない）場合は committed=false を返す。
+// 行を FOR UPDATE でロックし、同じサイトへの並行した差し替えと競合しないようにしている。
 func commitThumbnail(ctx context.Context, siteID, jobID, newURL string) (string, bool, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

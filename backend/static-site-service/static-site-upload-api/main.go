@@ -21,6 +21,7 @@ import (
 
 	"github.com/atmosidea/shared/config"
 	"github.com/atmosidea/shared/queue"
+	"github.com/atmosidea/shared/ratelimit"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -30,6 +31,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// パッケージ全体で共有する接続・設定値。main で初期化し、各ハンドラから参照する。
 var (
 	db             *sql.DB
 	minioClient    *minio.Client
@@ -44,6 +46,7 @@ var (
 	maxSiteUploadBytes  int64 = 524288000 // MAX_SITE_UPLOAD_BYTES
 	maxImageUploadBytes int64 = 10485760  // MAX_IMAGE_UPLOAD_BYTES
 
+	// sfsp-api への送信は大きな ZIP をストリーミングするため長め、team-service への権限確認は短めのタイムアウトにする
 	sfspHTTPClient = &http.Client{Timeout: 10 * time.Minute}
 	teamHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
@@ -77,9 +80,11 @@ type teamPermission struct {
 // authHeader は検証済みのトークンのときだけ渡す（空なら匿名として問い合わせる）。
 // 通信エラー等は error を返すので、呼び出し側は拒否として扱う（fail closed）。
 func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*teamPermission, error) {
+	// トークン形式を検証し、パス操作などの不正な値を URL に埋め込まないようにする
 	if !teamTokenPattern.MatchString(teamToken) {
 		return &teamPermission{}, nil
 	}
+	// TEAM_SERVICE_URL 未設定時は Docker Compose 内のサービス名を既定値として使う
 	if teamServiceURL == "" {
 		teamServiceURL = "http://team-service:8080"
 	}
@@ -95,12 +100,14 @@ func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*te
 		return nil, fmt.Errorf("request failed for team %s: %w", teamToken, err)
 	}
 	defer resp.Body.Close()
+	// チームが存在しない（404）場合はエラーではなく権限なしとして扱う
 	if resp.StatusCode == http.StatusNotFound {
 		return &teamPermission{}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("team service returned %d for team %s", resp.StatusCode, teamToken)
 	}
+	// 応答本文は 64KiB までに制限して読み込む
 	var perm teamPermission
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&perm); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
@@ -117,9 +124,10 @@ func viewerAuthHeader(c *gin.Context, userID string) string {
 	return c.GetHeader("Authorization")
 }
 
-// teamAccessCheck calls the team-service permission endpoint to verify that the
-// caller is allowed to post to the given team. Returns true if posting is allowed.
-// A missing/empty team_id is treated as a public post (always allowed).
+// teamAccessCheck は team-service の権限エンドポイントに問い合わせ、呼び出し元が
+// 指定チームへ投稿できるかを確認する。投稿可能なら true を返す。
+// team_id が空の場合は公開投稿として扱い、常に許可する。
+// 問い合わせに失敗した場合は false（拒否）を返す。
 // authMiddleware を通過したリクエストでのみ呼ぶ（Authorization はそのまま転送する）。
 func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	if teamToken == "" {
@@ -133,20 +141,24 @@ func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	return perm.CanPost
 }
 
-// StaticSite represents a static site entry in the database.
+// StaticSite は static_sites テーブルの1行（静的サイト1件）を表し、API の応答にも使う。
 type StaticSite struct {
-	ID                 string     `json:"id"`
-	UserID             string     `json:"user_id"`
-	TeamID             string     `json:"team_id"`
-	Title              string     `json:"title"`
-	Description        string     `json:"description"`
-	MinioPath          string     `json:"minio_path"`
-	EntryPointPath     string     `json:"entry_point_path"`
-	ThumbnailURL       *string    `json:"thumbnail_url"`
-	Status             string     `json:"status"`
-	ProcessingDetails  *string    `json:"processing_details,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// 公開投稿なら空文字
+	TeamID         string  `json:"team_id"`
+	Title          string  `json:"title"`
+	Description    string  `json:"description"`
+	MinioPath      string  `json:"minio_path"`
+	EntryPointPath string  `json:"entry_point_path"`
+	ThumbnailURL   *string `json:"thumbnail_url"`
+	// アップロード時は 'scanning' で作成される。一覧には 'public' のものだけを出す
+	Status string `json:"status"`
+	// 投稿者・管理者以外には返さない内部情報
+	ProcessingDetails *string   `json:"processing_details,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	// 投稿者・管理者以外には返さない内部情報
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 }
 
@@ -156,6 +168,8 @@ type SfspUploadResponse struct {
 	JobID string `json:"job_id"`
 }
 
+// envInt64 は環境変数 name を正の int64 として読み込む。
+// 未設定なら def を返し、数値でない・0 以下の場合は警告を出して def を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -169,7 +183,9 @@ func envInt64(name string, def int64) int64 {
 	return n
 }
 
+// main は各種設定と外部接続（PostgreSQL・MinIO・Redis）を初期化し、HTTP サーバーを起動する。
 func main() {
+	// 1. ロガーを初期化する
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -177,6 +193,7 @@ func main() {
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
 
+	// 2. アップロード上限と team-service の URL を環境変数から読み込む
 	maxSiteUploadBytes = envInt64("MAX_SITE_UPLOAD_BYTES", maxSiteUploadBytes)
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
 	if v := os.Getenv("TEAM_SERVICE_URL"); v != "" {
@@ -188,6 +205,7 @@ func main() {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// 3. PostgreSQL に接続する（起動順の都合で DB が未準備のことがあるため、5 秒間隔で最大 5 回試す）
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		logger.Fatal("DATABASE_URL environment variable not set")
@@ -208,6 +226,7 @@ func main() {
 	}
 	logger.Info("Successfully connected to PostgreSQL!")
 
+	// 4. MinIO に接続する（ListBuckets で疎通を確認し、DB と同様に最大 5 回試す）
 	minioEndpoint := os.Getenv("MINIO_ENDPOINT")
 	minioAccessKeyID := os.Getenv("MINIO_ACCESS_KEY_ID")
 	minioSecretAccessKey := os.Getenv("MINIO_SECRET_ACCESS_KEY")
@@ -239,10 +258,12 @@ func main() {
 
 	// バケットの作成と匿名ダウンロードの設定は minio-init が行う
 
+	// 5. Redis に接続する（JWT のブロックリスト照合に使う）
 	if err := queue.ConnectRedis(cfg, logger); err != nil {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 6. JWT 署名鍵と sfsp-api（ファイルスキャン）の接続情報を読み込む
 	jwtSecret = os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		logger.Fatal("JWT_SECRET environment variable not set")
@@ -257,6 +278,13 @@ func main() {
 		logger.Warn("SFSP_API_KEY is not set; requests to sfsp-api will be rejected")
 	}
 
+	// 7. ルーティングを設定する（閲覧系は認証不要、作成・更新・削除は authMiddleware を通す）
+	// 保存量・ディスク・処理待ちの判定と、分割アップロードの準備
+	initUploadGuard(context.Background(), maxSiteUploadBytes)
+
+	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
+	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
+	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
 	r := gin.Default()
 	r.MaxMultipartMemory = multipartMemoryBytes
 
@@ -266,18 +294,31 @@ func main() {
 	auth := r.Group("/")
 	auth.Use(authMiddleware)
 	{
-		auth.POST("/api/static-sites/upload", uploadStaticSiteHandler)
-		auth.PUT("/api/static-sites/:id", updateStaticSiteHandler)
+		auth.POST("/api/static-sites/upload", uploadLimitMiddleware(uploadLimits), uploadStaticSiteHandler)
+		// 分割アップロード（Cloudflare の 100 MB 制限への対応）
+		registerChunkRoutes(auth, "/api/static-sites/upload/chunks")
+		auth.PUT("/api/static-sites/:id", imageLimitMiddleware(), updateStaticSiteHandler)
 		auth.DELETE("/api/static-sites/:id", deleteStaticSiteHandler)
 		auth.DELETE("/api/static-sites/:id/thumbnail", deleteThumbnailHandler)
 	}
 
+	// 8. サーバーを起動する（既定ポートは 8085）
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8085"
 	}
 	logger.Infof("Static Site Upload API running on port %s", port)
-	logger.Fatal(r.Run(":" + port))
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（大きなアップロードを受けるので本文の読み取りは長めに許す）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	logger.Fatal(srv.ListenAndServe())
 }
 
 // authenticate は Authorization ヘッダーの JWT を検証し、ブロックリスト（blocklist:<jti>）を確認する。
@@ -289,6 +330,7 @@ func authenticate(c *gin.Context) (userID string, isAdmin bool, status int, msg 
 	}
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
+	// 署名アルゴリズムを HS256 に限定し、alg すり替え攻撃を防ぐ
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return []byte(jwtSecret), nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
@@ -314,6 +356,7 @@ func authenticate(c *gin.Context) (userID string, isAdmin bool, status int, msg 
 		return "", false, http.StatusUnauthorized, "Token has been invalidated"
 	}
 
+	// ユーザー ID は発行元によってクレーム名が異なりうるため、候補を順に探して最初に見つかったものを使う
 	for _, key := range []string{"sub", "userID", "user_id", "id"} {
 		if val, ok := claims[key].(string); ok && val != "" {
 			userID = val
@@ -330,7 +373,8 @@ func authenticate(c *gin.Context) (userID string, isAdmin bool, status int, msg 
 	return userID, isAdmin, 0, ""
 }
 
-// authMiddleware authenticates requests using JWT.
+// authMiddleware は JWT でリクエストを認証する。失敗時は中断してエラーを返し、
+// 成功時はコンテキストに userID と isAdmin を設定して次へ進む。
 func authMiddleware(c *gin.Context) {
 	userID, isAdmin, status, msg := authenticate(c)
 	if status != 0 {
@@ -354,6 +398,7 @@ func optionalUser(c *gin.Context) (string, bool) {
 	return userID, isAdmin
 }
 
+// generateRandomID は暗号論的乱数 5 バイトから 16 進 10 文字のサイト ID を生成する。
 func generateRandomID() (string, error) {
 	bytes := make([]byte, 5)
 	if _, err := rand.Read(bytes); err != nil {
@@ -370,6 +415,7 @@ func isBodyTooLarge(err error) bool {
 
 // parseMultipart は上限付きでリクエストを解析する。失敗時はレスポンスを書いて false を返す。
 func parseMultipart(c *gin.Context, limit int64) bool {
+	// 本文全体を limit バイトで打ち切り、巨大なリクエストでディスクやメモリを使い切られないようにする
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	if err := c.Request.ParseMultipartForm(multipartMemoryBytes); err != nil {
 		if isBodyTooLarge(err) {
@@ -386,6 +432,7 @@ func parseMultipart(c *gin.Context, limit int64) bool {
 func sniffContentType(f multipart.File) (string, error) {
 	buffer := make([]byte, 512)
 	n, err := io.ReadFull(f, buffer)
+	// 512 バイト未満の小さいファイルでは EOF 系のエラーになるが、読めた分で判定するので許容する
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return "", err
 	}
@@ -415,6 +462,7 @@ func openThumbnail(c *gin.Context) (header *multipart.FileHeader, f multipart.Fi
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open thumbnail file"})
 		return nil, nil, true, false
 	}
+	// クライアント申告の Content-Type ではなく、実際の中身から形式を判定する
 	ct, err := sniffContentType(f)
 	if err != nil {
 		f.Close()
@@ -430,6 +478,7 @@ func openThumbnail(c *gin.Context) (header *multipart.FileHeader, f multipart.Fi
 }
 
 // safeFilename はパス区切りを取り除いたファイル名を返す。
+// Windows 形式の "\" も "/" とみなして末尾要素だけを残し、空や "." / ".." などは "upload" に置き換える。
 func safeFilename(name string) string {
 	name = path.Base(strings.ReplaceAll(name, "\\", "/"))
 	if name == "." || name == "/" || name == ".." || name == "" {
@@ -440,6 +489,7 @@ func safeFilename(name string) string {
 
 // uploadToSFSP は src を multipart で sfsp-api にストリーミング送信する（全体をメモリに読まない）。
 func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService string) (*SfspUploadResponse, error) {
+	// 1. パイプの書き込み側で multipart 本文を組み立て、読み込み側を HTTP リクエストの本文にする
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	writeDone := make(chan struct{})
@@ -458,14 +508,18 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 			}
 			return mw.Close()
 		}()
+		// 書き込み中のエラーを読み込み側（HTTP クライアント）に伝える。err が nil なら通常の EOF になる
 		pw.CloseWithError(err)
 	}()
 	// 送信側の goroutine が src を読み終える（または中断する）まで待ってから戻る
+	// （呼び出し側が戻った後に src が閉じられても goroutine が読み続けないようにするため）。
+	// pr を先に閉じることで、書き込み途中の goroutine もエラーで抜けられる。
 	defer func() {
 		pr.CloseWithError(errors.New("sfsp upload finished"))
 		<-writeDone
 	}()
 
+	// 2. sfsp-api へ送信する
 	req, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SFSP request: %w", err)
@@ -479,6 +533,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	}
 	defer resp.Body.Close()
 
+	// 3. 応答（最大 1MiB）を読み、2xx 以外はエラーにして job_id を取り出す
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SFSP response: %w", err)
@@ -493,6 +548,9 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	return &out, nil
 }
 
+// uploadStaticSiteHandler は POST /api/static-sites/upload を処理する。
+// ZIP（と任意のサムネイル画像）を受け取り、static_sites に 'scanning' 状態の行を作成したうえで
+// sfsp-api にスキャンを依頼し、202 とサイト ID を返す。公開処理はスキャン完了後に別のワーカーが行う。
 func uploadStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	userIDStr := c.GetString("userID")
@@ -503,10 +561,12 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
+	// 1. サイト ZIP・サムネイル・フォーム項目の合計を上限としてリクエストを解析する
 	if !parseMultipart(c, maxSiteUploadBytes+maxImageUploadBytes+multipartOverheadBytes) {
 		return
 	}
 
+	// 2. フォーム項目を検証し、チーム投稿ならチームへの投稿権限を確認する
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 	teamID := c.PostForm("team_id")
@@ -521,23 +581,22 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to get file: %v", err)})
-		return
-	}
-	if fileHeader.Size > maxSiteUploadBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("File too large (max %d bytes)", maxSiteUploadBytes)})
-		return
-	}
-	file, err := fileHeader.Open()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to open uploaded file: %v", err)})
+	// 3. サイト本体のファイルを開いてサイズを確認する（分割アップロードなら upload_id から組み立て済みのファイルを開く）
+	file, fileName, fileSize, ok := openMainUpload(c, "file")
+	if !ok {
 		return
 	}
 	defer file.Close()
+	if fileSize > maxSiteUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("File too large (max %d bytes)", maxSiteUploadBytes)})
+		return
+	}
+	// 保存量・ディスクの空き・処理待ちを確かめる
+	if !guardUploadSize(c, fileSize) {
+		return
+	}
 
-	// ファイル形式チェック
+	// 4. ファイル形式チェック（中身から判定し、ZIP 以外は拒否する）
 	contentType, err := sniffContentType(file)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read file for type detection"})
@@ -548,6 +607,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
+	// 5. 任意のサムネイルを検証して開く
 	thumbnailHeader, thumbnailFile, hasThumbnail, ok := openThumbnail(c)
 	if !ok {
 		return
@@ -556,6 +616,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		defer thumbnailFile.Close()
 	}
 
+	// 6. サイト ID を採番する
 	siteID, err := generateRandomID()
 	if err != nil {
 		logger.Errorf("ERROR: Failed to generate static site ID: %v", err)
@@ -563,21 +624,24 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
+	// 公開投稿（team_id が空）は空文字ではなく NULL で保存する（一覧の team_id IS NULL 条件に合わせる）
 	teamIDVal := interface{}(teamID)
 	if teamID == "" {
 		teamIDVal = nil
 	}
 
+	// 7. 'scanning' 状態の行を作成する。
 	// 行を先に作成し、sfsp-api の応答を受けたらすぐに job_id を書き込む。
 	// こうすることで完了イベントが届いた時点で行が必ず存在する（残る隙間はワーカーの再試行で吸収する）。
 	_, err = db.ExecContext(reqCtx,
-		"INSERT INTO static_sites (id, user_id, title, description, status, minio_path, team_id, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, NOW(), NOW())",
-		siteID, userUUID, title, description, "", teamIDVal)
+		"INSERT INTO static_sites (id, user_id, title, description, status, minio_path, team_id, upload_bytes, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, NOW(), NOW())",
+		siteID, userUUID, title, description, "", teamIDVal, fileSize)
 	if err != nil {
 		logger.Errorf("ERROR: Failed to insert static site into DB: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register static site"})
 		return
 	}
+	// abort は以降の処理が失敗したときに作成済みの行を削除し、エラー応答を返す
 	abort := func(status int, msg string) {
 		// リクエストのコンテキストが切れていても削除できるよう独立したコンテキストを使う
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -588,6 +652,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		c.JSON(status, gin.H{"error": msg})
 	}
 
+	// 8. サムネイルがあれば先に sfsp-api へ送り、job_id を行に記録する
 	if hasThumbnail {
 		thumbResp, err := uploadToSFSP(reqCtx, thumbnailFile, thumbnailHeader.Filename, "site-thumbnail")
 		if err != nil {
@@ -608,7 +673,8 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		}
 	}
 
-	sfspRespData, err := uploadToSFSP(reqCtx, file, fileHeader.Filename, "static-site")
+	// 9. サイト ZIP を sfsp-api へ送り、job_id を行に記録する
+	sfspRespData, err := uploadToSFSP(reqCtx, file, fileName, "static-site")
 	if err != nil {
 		logger.Errorf("Error forwarding file to SFSP: %v", err)
 		abort(http.StatusServiceUnavailable, "File scanning service is unavailable")
@@ -629,6 +695,8 @@ func uploadStaticSiteHandler(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"message": "Static site upload initiated for scanning", "siteId": siteID})
 }
 
+// listStaticSitesHandler は GET /api/static-sites を処理し、公開済みの静的サイト一覧を新しい順に返す。
+// クエリ q でタイトルの部分一致検索、team でチーム限定の一覧に切り替える（認証は任意）。
 func listStaticSitesHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	searchTerm := c.Query("q")
@@ -665,6 +733,7 @@ func listStaticSitesHandler(c *gin.Context) {
 	}
 	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
 
+	// 条件の文字列は固定の断片だけで組み立て、利用者の入力は args でプレースホルダーに渡す
 	rows, err := db.QueryContext(reqCtx,
 		"SELECT id, user_id, title, description, minio_path, status, entry_point_path, thumbnail_url, created_at, updated_at FROM static_sites "+whereClause+" ORDER BY created_at DESC", args...)
 	if err != nil {
@@ -679,10 +748,12 @@ func listStaticSitesHandler(c *gin.Context) {
 		var s StaticSite
 		var description sql.NullString
 		if err := rows.Scan(&s.ID, &s.UserID, &s.Title, &description, &s.MinioPath, &s.Status, &s.EntryPointPath, &s.ThumbnailURL, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			// 読み取れない行はログに残して読み飛ばす
 			logger.Errorf("Error scanning static site row: %v", err)
 			continue
 		}
 		s.Description = description.String
+		// SELECT では team_id を取得していないため、チーム限定の一覧では検索条件のトークンを詰める
 		if teamToken != "" {
 			s.TeamID = teamToken
 		}
@@ -691,11 +762,14 @@ func listStaticSitesHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, staticSites)
 }
 
+// getStaticSiteHandler は GET /api/static-sites/:id を処理し、静的サイト1件の詳細を返す（認証は任意）。
+// 閲覧権限がない場合は存在自体を隠すため 404 を返す。
 func getStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	siteID := c.Param("id")
 	var s StaticSite
 	var description, teamID sql.NullString
+	// 1. 行を取得する（権限確認の前に取得し、存在しない場合は 404）
 	err := db.QueryRowContext(reqCtx, "SELECT id, user_id, team_id, title, description, minio_path, status, processing_details, entry_point_path, thumbnail_url, created_at, updated_at, thumbnail_sfsp_job_id FROM static_sites WHERE id = $1", siteID).Scan(
 		&s.ID, &s.UserID, &teamID, &s.Title, &description, &s.MinioPath, &s.Status, &s.ProcessingDetails, &s.EntryPointPath, &s.ThumbnailURL, &s.CreatedAt, &s.UpdatedAt, &s.ThumbnailSfspJobID)
 	if err != nil {
@@ -710,7 +784,7 @@ func getStaticSiteHandler(c *gin.Context) {
 	s.Description = description.String
 	s.TeamID = teamID.String
 
-	// 閲覧権限: 投稿者（と管理者）は常に閲覧可。それ以外は status='public' のみ、
+	// 2. 閲覧権限: 投稿者（と管理者）は常に閲覧可。それ以外は status='public' のみ、
 	// チーム限定ならチームの閲覧権限（can_view）が必要。存在を漏らさないため 404 を返す。
 	userID, isAdmin := optionalUser(c)
 	isOwner := userID != "" && strings.EqualFold(userID, s.UserID)
@@ -738,6 +812,9 @@ func getStaticSiteHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, s)
 }
 
+// updateStaticSiteHandler は PUT /api/static-sites/:id を処理する（投稿者または管理者のみ）。
+// サムネイルが無ければタイトル・説明を即時更新して 200 を返す。サムネイルがある場合は
+// タイトル・説明は更新せず、サムネイルを sfsp-api に送ってスキャン用の job_id を 202 で返す。
 func updateStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	siteID := c.Param("id")
@@ -751,7 +828,7 @@ func updateStaticSiteHandler(c *gin.Context) {
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 
-	// Fetch current site details to check ownership
+	// 所有者を確認するため、現在のサイト情報を取得する
 	var ownerUUID uuid.UUID
 	err := db.QueryRowContext(reqCtx, "SELECT user_id FROM static_sites WHERE id = $1", siteID).Scan(&ownerUUID)
 	if err != nil {
@@ -764,16 +841,15 @@ func updateStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
-	// Authorization check
+	// 権限チェック（管理者でも投稿者でもなければ拒否する）
 	if !isAdmin && ownerUUID.String() != userIDStr {
 		c.JSON(http.StatusForbidden, gin.H{"error": "You are not authorized to update this static site"})
 		return
 	}
 
-	// Fetch the thumbnail file. When a thumbnail is uploaded, the title/description
-	// update is deferred until the security scan completes (the frontend sends a
-	// follow-up request after polling). When no thumbnail is uploaded, update
-	// title/description immediately.
+	// サムネイルファイルを取得する。サムネイルがアップロードされた場合、タイトル・説明の
+	// 更新はセキュリティスキャン完了まで保留する（フロントエンドがポーリング後に改めて
+	// リクエストを送る）。サムネイルが無い場合は、タイトル・説明をすぐに更新する。
 	thumbnailHeader, thumbnailFile, hasThumbnail, ok := openThumbnail(c)
 	if !ok {
 		return
@@ -792,6 +868,7 @@ func updateStaticSiteHandler(c *gin.Context) {
 	}
 	defer thumbnailFile.Close()
 
+	// サムネイルを sfsp-api に送り、job_id を行に記録する（反映はスキャン完了後にワーカーが行う）
 	thumbSfspResp, err := uploadToSFSP(reqCtx, thumbnailFile, thumbnailHeader.Filename, "site-thumbnail")
 	if err != nil {
 		logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
@@ -822,12 +899,15 @@ func updateStaticSiteHandler(c *gin.Context) {
 	})
 }
 
+// deleteStaticSiteHandler は DELETE /api/static-sites/:id を処理する（投稿者または管理者のみ）。
+// MinIO 上のサムネイルとサイトのファイル一式を削除してから DB の行を削除する。
 func deleteStaticSiteHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	siteID := c.Param("id")
 	userIDStr := c.GetString("userID")
 	isAdmin := c.GetBool("isAdmin")
 
+	// 所有者とサムネイル URL を取得し、投稿者または管理者であることを確認する
 	var ownerUUID uuid.UUID
 	var thumbnailURL sql.NullString
 	err := db.QueryRowContext(reqCtx, "SELECT user_id, thumbnail_url FROM static_sites WHERE id = $1", siteID).Scan(&ownerUUID, &thumbnailURL)
@@ -852,6 +932,7 @@ func deleteStaticSiteHandler(c *gin.Context) {
 		parts := strings.Split(thumbnailURL.String, "/static-sites/")
 		if len(parts) == 2 {
 			thumbObjPath := parts[1]
+			// サムネイル削除の失敗は無視し、サイト本体の削除を続ける
 			_ = minioClient.RemoveObject(reqCtx, minioBucket, thumbObjPath, minio.RemoveObjectOptions{})
 		}
 	}
@@ -860,6 +941,8 @@ func deleteStaticSiteHandler(c *gin.Context) {
 	objectPrefix := fmt.Sprintf("%s/", siteID)
 	objectsCh := make(chan minio.ObjectInfo)
 
+	// "<siteID>/" 配下のオブジェクトを列挙して objectsCh に流し、RemoveObjects で一括削除する
+	// （列挙でエラーが出た場合はそこで打ち切る）
 	go func() {
 		defer close(objectsCh)
 		for object := range minioClient.ListObjects(reqCtx, minioBucket, minio.ListObjectsOptions{
@@ -875,6 +958,7 @@ func deleteStaticSiteHandler(c *gin.Context) {
 	}()
 
 	errorCh := minioClient.RemoveObjects(reqCtx, minioBucket, objectsCh, minio.RemoveObjectsOptions{})
+	// 削除エラーが1件でもあれば 500 を返し、DB の行は残す
 	for err := range errorCh {
 		logger.Errorf("ERROR: Failed to delete object %s from MinIO: %v", err.ObjectName, err.Err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete site files from storage"})
@@ -892,12 +976,15 @@ func deleteStaticSiteHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Static site deleted successfully"})
 }
 
+// deleteThumbnailHandler は DELETE /api/static-sites/:id/thumbnail を処理する（投稿者または管理者のみ）。
+// MinIO 上のサムネイル画像を削除し、thumbnail_url を NULL に戻す。
 func deleteThumbnailHandler(c *gin.Context) {
 	reqCtx := c.Request.Context()
 	siteID := c.Param("id")
 	userIDStr := c.GetString("userID")
 	isAdmin := c.GetBool("isAdmin")
 
+	// 1. 所有者とサムネイル URL を取得し、権限を確認する
 	var ownerUUID uuid.UUID
 	var thumbnailURL sql.NullString
 	err := db.QueryRowContext(reqCtx, "SELECT user_id, thumbnail_url FROM static_sites WHERE id = $1", siteID).Scan(&ownerUUID, &thumbnailURL)
@@ -916,6 +1003,8 @@ func deleteThumbnailHandler(c *gin.Context) {
 		return
 	}
 
+	// 2. MinIO からサムネイルを削除する（URL の "/static-sites/" 以降をオブジェクトパスとみなす）。
+	// サイト削除時と違い、こちらは削除に失敗したら 500 を返す
 	if thumbnailURL.Valid && thumbnailURL.String != "" {
 		parts := strings.Split(thumbnailURL.String, "/static-sites/")
 		if len(parts) == 2 {
@@ -929,6 +1018,7 @@ func deleteThumbnailHandler(c *gin.Context) {
 		}
 	}
 
+	// 3. DB の thumbnail_url を NULL に戻す
 	_, err = db.ExecContext(reqCtx, "UPDATE static_sites SET thumbnail_url = NULL WHERE id = $1", siteID)
 	if err != nil {
 		logger.Errorf("Failed to update thumbnail_url in DB: %v", err)

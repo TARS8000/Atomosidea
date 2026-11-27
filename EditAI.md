@@ -86,7 +86,7 @@
 | | jwt-decode | JWT のデコード（期限切れ判定・ユーザー情報） |
 | | react-image-crop | アイコン・背景画像の切り抜き |
 | | ESLint（`frontend/.eslintrc.cjs`） | `npm run lint`（`monitoring-service/frontend` にも同じく `.eslintrc.cjs` がある） |
-| バックエンド | Go 1.25 | 全サービス |
+| バックエンド | Go 1.27（go.mod は go 1.27.4、ビルドは golang:1.27.4-alpine3.24） | 全サービス |
 | | Gin | HTTP ルーター（監視サービスのみ gorilla/mux + gorilla/websocket） |
 | | pgx/v5 | PostgreSQL（プレースホルダ `$1` を使用。static-site-upload-api / static-site-worker は lib/pq） |
 | | minio-go/v7 | MinIO |
@@ -208,7 +208,7 @@ sfsp-worker ◀──BRPOPLPUSH── sfsp:scan_queue（→ sfsp:scan_queue:proc
 |---|---|---|---|
 | `mon-nginx` | mon-nginx | `127.0.0.1:8090:80` | `monitoring-service/nginx.conf` |
 | `mon-backend` | mon-backend | 8080 | `monitoring-service/backend/main.go`（Docker ソケットはマウントせず、`DOCKER_HOST=tcp://mon-docker-proxy:2375`。全ルートで HTTP Basic 認証。参加するネットワークは `monitoring-network`・`mon-docker-net`（`internal: true`。mon-docker-proxy 用）と `atmosidea-network`（MinIO 操作用）。`sfsp-isolated-net` には参加しない） |
-| `mon-docker-proxy` | mon-docker-proxy | 2375 | `tecnativa/docker-socket-proxy:0.3.0`（compose で定義） | mon-backend 専用の読み取り専用 Docker API プロキシ。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD のみ（`POST=0`） |
+| `mon-docker-proxy` | mon-docker-proxy | 2375 | `tecnativa/docker-socket-proxy:v0.5.0`（compose で定義） | mon-backend 専用の読み取り専用 Docker API プロキシ。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD のみ（`POST=0`） |
 | `mon-frontend` | mon-frontend-builder | — | `monitoring-service/frontend/`（ビルドして `dist/` に出力するだけ） |
 
 ### 4.1. フロントエンドのルート（`frontend/src/App.tsx`）
@@ -875,10 +875,10 @@ error_page 404 = @fallback_static_site;        # 無ければ static-sites バ�
 2. **ビルドコンテキストはプロジェクトルート**: compose の `context: .`、Dockerfile は `COPY . .` → `WORKDIR /app/backend/<サービス>` の順。これで `../../shared` が解決される。この組み合わせを変えない。`frontend` は `context: ./frontend`（`frontend/.dockerignore`）、`monitoring-service/backend` はそのディレクトリがコンテキスト。
    - ルートの `.dockerignore` が `.git`・IDE の設定・`.env` / `.env.*`（`.env.example` は除く）・`node_modules`・`frontend/dist`・`backend/storage_data`・`backend/video-service/upload_workdir`・動画 / zip を除外する（コンテキストは約 2MB）。`backend/<サービス>/` のソースは除外してはいけない。
 3. **`go.sum` はコミット済み、ビルド時に `go mod tidy` しない**: どの Go の Dockerfile も `go mod download` → `CGO_ENABLED=0 GOOS=linux go build -o ...`（monitoring-service/backend は `GOOS=linux go build`）だけを行う（`go mod tidy` も `-a -installsuffix cgo` も使わない）。全モジュールの `go.sum`（`monitoring-service/backend/go.sum` を含む）はリポジトリにある。**依存を追加・削除したら、ローカルで `go mod tidy` して `go.mod` / `go.sum` をコミットする**（しないと `missing go.sum entry` でビルドが失敗する）。
-4. **最終イメージ**: `alpine:latest` に `ca-certificates` と `tzdata`。**`.env` はイメージにコピーしない**（設定は実行時に compose の `environment:` から渡る）ので、`.env` が無くてもビルドはできる（`docker compose` が `${...:?}` の変数を要求するので `up` には必要）。`EXPOSE` は実際の待ち受けポートに合わせてあり（static-site-upload-api は 8085）、ポートを持たないワーカー（game-worker、static-site-worker）には `EXPOSE` が無い。
+4. **最終イメージ**: `alpine:3.24.4`（版を固定）に `ca-certificates` と `tzdata`。**`.env` はイメージにコピーしない**（設定は実行時に compose の `environment:` から渡る）ので、`.env` が無くてもビルドはできる（`docker compose` が `${...:?}` の変数を要求するので `up` には必要）。`EXPOSE` は実際の待ち受けポートに合わせてあり（static-site-upload-api は 8085）、ポートを持たないワーカー（game-worker、static-site-worker）には `EXPOSE` が無い。
    - frontend は `npm ci --legacy-peer-deps`（`package-lock.json` どおりに入れる）→ `npm run build` → `nginx:stable-alpine` に `dist` と `nginx.conf`（`/etc/nginx/nginx.conf`）をコピー。依存を変えたら `package-lock.json` も更新する。
    - sfsp-worker のイメージにはワーカーのバイナリだけが入る（docker-cli・yara は入れない）。
-5. **ローカルに Go が無い場合**: `docker run --rm -v "<リポジトリ>:/src:ro" -v atomosidea-gomodcache:/go/pkg/mod golang:1.25-alpine sh -c 'cd /src/<モジュール> && go build ./... && go vet ./...'` でビルドと vet を確認できる。
+5. **ローカルに Go が無い場合**: `docker run --rm -v "<リポジトリ>:/src:ro" -v atomosidea-gomodcache:/go/pkg/mod golang:1.27.4-alpine3.24 sh -c 'cd /src/<モジュール> && go build ./... && go vet ./...'` でビルドと vet を確認できる。
 6. **改行コード**: リポジトリのソースは LF。Windows の Python などで書き換えると CRLF になることがあるので注意する。
 7. **フロントエンドの lint**: `frontend/` と `monitoring-service/frontend/` に ESLint の設定（`.eslintrc.cjs`）があり、`npm run lint` が通る状態にしてある。
 

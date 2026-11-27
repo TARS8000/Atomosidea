@@ -1,14 +1,14 @@
 # ベースイメージ
-FROM node:20-alpine AS builder
+FROM node:24.22.3-alpine AS builder
 
 # 作業ディレクトリを設定
 WORKDIR /app
 
-# package.json と package-lock.json をコピー
+# package.json と package-lock.json をコピー（lockfile どおりに入れる）
 COPY package*.json ./
 
 # 依存関係をインストール
-RUN npm install
+RUN npm ci
 
 # ソースコードをコピー
 COPY . .

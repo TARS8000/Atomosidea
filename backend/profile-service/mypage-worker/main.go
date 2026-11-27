@@ -15,12 +15,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// main で初期化し、ハンドラとミドルウェアから参照する共有の接続・設定値。
+// dbApp は app-db への接続プール、jwtSecret は JWT の HS256 署名検証用の鍵、
+// redisClient はログアウト済みトークンのブロックリスト確認用。
 var (
 	dbApp       *pgxpool.Pool
 	jwtSecret   []byte
 	redisClient *redis.Client
 )
 
+// Video はマイページの動画一覧の 1 件。ThumbnailURL には videos.thumbnail_path の値を入れる。
 type Video struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
@@ -29,6 +33,7 @@ type Video struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// Game はマイページのゲーム一覧の 1 件。UploaderID には games.user_id の値を入れる。
 type Game struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
@@ -37,6 +42,7 @@ type Game struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// StaticSite はマイページの静的サイト一覧の 1 件。UploaderID には static_sites.user_id の値を入れる。
 type StaticSite struct {
 	ID          string    `json:"id"`
 	Title       string    `json:"title"`
@@ -45,8 +51,11 @@ type StaticSite struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+// authMiddleware は Authorization ヘッダーの JWT を検証し、ユーザー ID（UUID 文字列）を
+// コンテキストの "userID" に入れる。検証に失敗したら 401（Redis エラー時は 500）で中断する。
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 1. "Bearer " を取り除いたトークンを HS256 のみ許可して検証する（alg のすり替え対策）
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is missing"})
@@ -68,7 +77,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// ログアウト済みのトークン (blocklist:<jti>) を拒否する。Redis エラー時は拒否する (fail closed)
+		// 2. ログアウト済みのトークン (blocklist:<jti>) を拒否する。Redis エラー時は拒否する (fail closed)
 		jti, _ := claims["jti"].(string)
 		if jti == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
@@ -85,6 +94,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// 3. ユーザー ID を sub → userID → user_id の順にクレームから取り出す
 		var userIDStr string
 		if idStr, ok := claims["sub"].(string); ok {
 			userIDStr = idStr
@@ -109,8 +119,10 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+// main は JWT 鍵・Redis・app-db を準備し、認証付きの /api/my 以下のルートをポート 8083 で公開する。
 func main() {
 	var err error
+	// JWT の署名検証鍵がなければ起動しない
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 	if len(jwtSecret) == 0 {
 		log.Fatal("JWT_SECRET environment variable is not set")
@@ -132,6 +144,7 @@ func main() {
 		log.Printf("WARNING: Failed to connect to Redis at %s: %v", redisAddr, err)
 	}
 	cancelPing()
+	// app-db（動画・ゲーム・静的サイトの各テーブル）に接続する
 	appDbUrl := os.Getenv("APP_DATABASE_URL")
 
 	dbApp, err = pgxpool.New(context.Background(), appDbUrl)
@@ -140,6 +153,7 @@ func main() {
 	}
 	defer dbApp.Close()
 
+	// /api/my 以下はすべて authMiddleware を通し、ログイン中のユーザー自身の投稿だけを返す
 	r := gin.Default()
 	api := r.Group("/api/my")
 	api.Use(authMiddleware())
@@ -150,11 +164,23 @@ func main() {
 	}
 
 	log.Println("INFO: MyPage service starting on port 8083")
-	if err := r.Run(":8083"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（本文は画像程度までなので読み取りは短め）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8083",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
 	}
 }
 
+// myVideosHandler はログイン中のユーザーがアップロードした動画を新しい順に返す。
+// 読み取れなかった行はログに残して飛ばす。
 func myVideosHandler(c *gin.Context) {
 	uploaderID := c.GetString("userID")
 	rows, err := dbApp.Query(c.Request.Context(), "SELECT id, title, COALESCE(thumbnail_path, ''), uploader_id, created_at FROM videos WHERE uploader_id = $1 ORDER BY created_at DESC", uploaderID)
@@ -177,6 +203,8 @@ func myVideosHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, videos)
 }
 
+// myGamesHandler はログイン中のユーザーが投稿したゲームを新しい順に返す（status による絞り込みはしない）。
+// 読み取れなかった行はログに残して飛ばす。
 func myGamesHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 
@@ -204,6 +232,8 @@ func myGamesHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, games)
 }
 
+// myStaticSitesHandler はログイン中のユーザーが投稿した静的サイトを新しい順に返す（status による絞り込みはしない）。
+// 読み取れなかった行はログに残して飛ばす。
 func myStaticSitesHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 

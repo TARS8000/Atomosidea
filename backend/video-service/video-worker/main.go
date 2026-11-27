@@ -1,3 +1,5 @@
+// video-worker は動画メタデータの参照・更新 API（:8081）と、SFSP でスキャン済みのサムネイルを
+// 動画用 MinIO へ取り込むバックグラウンドワーカーを1プロセスで動かすサービス。
 package main
 
 import (
@@ -30,42 +32,54 @@ import (
 	"go.uber.org/zap"
 )
 
+// main で初期化され、ハンドラーとワーカーから共有されるグローバル状態。
 var (
-	db                   *pgxpool.Pool
-	sfspApiUrl           string
-	sfspApiKey           string
+	// db は PostgreSQL の接続プール。
+	db *pgxpool.Pool
+	// sfspApiUrl / sfspApiKey は SFSP（ファイルスキャン）API の URL と API キー。
+	sfspApiUrl string
+	sfspApiKey string
+	// sfspCleanMinioClient / sfspCleanBucketName はスキャン済み（クリーン）ファイルを置く MinIO とバケット。
 	sfspCleanMinioClient *minio.Client
 	sfspCleanBucketName  string
-	videoMinioClient     *minio.Client
-	videoBucketName      = "videos"
-	logger               *zap.SugaredLogger
-	jwtSecret            []byte
-	teamServiceURL       string
+	// videoMinioClient / videoBucketName は動画とサムネイルを保存する MinIO とバケット。
+	videoMinioClient *minio.Client
+	videoBucketName  = "videos"
+	logger           *zap.SugaredLogger
+	// jwtSecret は HS256 の JWT 検証に使う共有鍵。
+	jwtSecret []byte
+	// teamServiceURL はチーム閲覧権限を問い合わせる team-service のベース URL（末尾スラッシュなし）。
+	teamServiceURL string
 	// maxImageUploadBytes はサムネイル画像の上限（MAX_IMAGE_UPLOAD_BYTES、既定 10 MiB）。
 	maxImageUploadBytes = int64(10 << 20)
 )
 
 const (
+	// StatusPublic は公開済み動画を表す videos.status の値。
 	StatusPublic = "public"
 	// multipartOverhead はサムネイル以外のフォーム（title / description と境界）に許す余裕。
 	multipartOverhead = 1 << 20
 )
 
+// Video は videos テーブルの1行を API レスポンス用に表した構造体。
+// UploaderName は現状 SQL で固定値 'Unknown User' が入る。
 type Video struct {
-	ID                 string     `json:"id"`
-	Title              string     `json:"title"`
-	Description        string     `json:"description"`
-	Filename           string     `json:"filename"`
-	ThumbnailPath      string     `json:"thumbnail_path"`
-	UploaderID         string     `json:"uploader_id"`
-	UploaderName       string     `json:"uploader_name"`
-	TeamID             string     `json:"team_id"`
-	Status             string     `json:"status"`
-	ProcessingDetails  string     `json:"processing_details"`
+	ID                string `json:"id"`
+	Title             string `json:"title"`
+	Description       string `json:"description"`
+	Filename          string `json:"filename"`
+	ThumbnailPath     string `json:"thumbnail_path"`
+	UploaderID        string `json:"uploader_id"`
+	UploaderName      string `json:"uploader_name"`
+	TeamID            string `json:"team_id"`
+	Status            string `json:"status"`
+	ProcessingDetails string `json:"processing_details"`
+	// ThumbnailSfspJobID はスキャン中のサムネイルの SFSP ジョブ ID。スキャン中でなければ nil。
 	ThumbnailSfspJobID *uuid.UUID `json:"thumbnail_sfsp_job_id,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 }
 
+// SfspUploadResponse は SFSP の POST /api/v1/files が返す応答のうち、ジョブ ID だけを受け取る構造体。
 type SfspUploadResponse struct {
 	JobID string `json:"job_id"`
 }
@@ -79,6 +93,7 @@ var imageExtensions = map[string]string{
 	"image/webp": ".webp",
 }
 
+// envInt64 は環境変数 name を正の int64 として読む。未設定なら def、不正値や 0 以下なら警告を出して def を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -92,7 +107,10 @@ func envInt64(name string, def int64) int64 {
 	return n
 }
 
+// main は環境変数を読み込んで DB・Redis・2つの MinIO に接続し、サムネイルワーカーを起動したうえで
+// 動画メタデータ API を :8081 で提供する。
 func main() {
+	// 1. ロガーを初期化する
 	var err error
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
@@ -103,6 +121,7 @@ func main() {
 
 	ctx := context.Background()
 
+	// 2. 必須・任意の環境変数を読み込む
 	databaseUrl := os.Getenv("DATABASE_URL")
 	if databaseUrl == "" {
 		logger.Fatal("DATABASE_URL environment variable is not set")
@@ -142,6 +161,7 @@ func main() {
 		logger.Fatal("FATAL: Configuration for Clean MinIO is incomplete. SFSP_CLEAN_MINIO_ENDPOINT, SFSP_CLEAN_MINIO_ACCESS_KEY_ID, and SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY must all be set.")
 	}
 
+	// 3. DB と Redis に接続する
 	db, err = pgxpool.New(ctx, databaseUrl)
 	if err != nil {
 		logger.Fatalf("Unable to connect to database: %v\n", err)
@@ -157,6 +177,7 @@ func main() {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 4. クリーンファイル用 MinIO と動画用 MinIO のクライアントを作る
 	sfspCleanMinioClient, err = minio.New(sfspCleanMinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(sfspCleanMinioAccessKey, sfspCleanMinioSecretKey, ""),
 		Secure: sfspCleanMinioUseSSL,
@@ -193,6 +214,7 @@ func main() {
 
 	go videoThumbnailWorker(ctx)
 
+	// 5. HTTP ルーティングを設定してサーバーを起動する（更新 API だけ認証必須）
 	r := gin.Default()
 	r.MaxMultipartMemory = 8 << 20
 
@@ -200,11 +222,21 @@ func main() {
 	{
 		api.GET("", listVideosHandler)
 		api.GET("/:id", videoDetailsHandler)
-		api.PUT("/:id", authMiddleware(), updateVideoHandler)
+		api.PUT("/:id", authMiddleware(), imageLimitMiddleware(), updateVideoHandler)
 	}
 
 	logger.Info("Stream service (metadata) starting on port 8081")
-	if err := r.Run(":8081"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（本文は画像程度までなので読み取りは短め）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8081",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		logger.Fatalf("Failed to run server: %v", err)
 	}
 }
@@ -213,6 +245,7 @@ func main() {
 // 認証
 // ------------------------------------------------------------------
 
+// parseToken が返す認証エラーの種類。呼び出し側で errors.Is により応答を振り分ける。
 var (
 	errNoToken      = errors.New("no token")
 	errInvalidToken = errors.New("invalid token")
@@ -227,6 +260,7 @@ func parseToken(c *gin.Context) (userID string, isAdmin bool, err error) {
 		return "", false, errNoToken
 	}
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	// アルゴリズム混同攻撃（alg=none や RS256 との取り違え）を防ぐため、HS256 以外は受け付けない。
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return jwtSecret, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
@@ -237,6 +271,7 @@ func parseToken(c *gin.Context) (userID string, isAdmin bool, err error) {
 	if !ok {
 		return "", false, errInvalidToken
 	}
+	// ログアウト済みトークンを拒否できるよう、jti を持たないトークンは無効とする。
 	jti, _ := claims["jti"].(string)
 	if jti == "" {
 		return "", false, errInvalidToken
@@ -248,6 +283,7 @@ func parseToken(c *gin.Context) (userID string, isAdmin bool, err error) {
 	if exists > 0 {
 		return "", false, errRevoked
 	}
+	// 発行元ごとのクレーム名の違いに対応するため、ユーザー ID は複数のキーを順に探す。
 	for _, key := range []string{"sub", "userID", "user_id"} {
 		if val, ok := claims[key].(string); ok && val != "" {
 			userID = val
@@ -300,7 +336,7 @@ func optionalUser(c *gin.Context) (userID string, isAdmin bool) {
 }
 
 // teamCanView は team-service に呼び出し元の Authorization ヘッダーを転送し、チームの閲覧権限を確認する。
-// 失敗時は閲覧不可として扱う。
+// 失敗時は閲覧不可として扱う。teamToken が空（全体公開）の場合は問い合わせずに true を返す。
 func teamCanView(c *gin.Context, teamToken string) bool {
 	if teamToken == "" {
 		return true
@@ -338,13 +374,14 @@ func teamCanView(c *gin.Context, teamToken string) bool {
 // 参照 API
 // ------------------------------------------------------------------
 
-// 動画一覧・検索
+// listVideosHandler は動画一覧・検索（GET /api/videos、?q= でタイトル部分一致）を行い、新しい順に最大 50 件返す。
 // 公開済み（status = 'public'）だけを返す。?team= が無ければ全体公開（team_id IS NULL）のみ、
 // ?team= があれば team-service で can_view を確認したうえでそのチーム限定の動画を返す。
 func listVideosHandler(c *gin.Context) {
 	searchTerm := c.Query("q")
 	teamToken := c.Query("team")
 
+	// 1. WHERE 句を組み立てる（値はすべてプレースホルダーで渡し、SQL インジェクションを防ぐ）
 	whereConds := []string{"status = $1"}
 	args := []interface{}{StatusPublic}
 	argIdx := 2
@@ -366,6 +403,7 @@ func listVideosHandler(c *gin.Context) {
 	}
 	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
 
+	// 2. 検索を実行して結果を Video に詰める
 	// 💡 COALESCE(description, '') で NULL 対策を追加
 	rows, err := db.Query(c.Request.Context(),
 		`SELECT id, title, COALESCE(description, '') as description, filename, COALESCE(thumbnail_path, ''), uploader_id, 'Unknown User' as username, COALESCE(team_id, ''), status, COALESCE(processing_details, '') as processing_details, created_at
@@ -390,7 +428,7 @@ func listVideosHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, videos)
 }
 
-// 動画詳細取得
+// videoDetailsHandler は動画詳細（GET /api/videos/:id）を返す。認証は任意。
 // 投稿者本人と管理者は状態にかかわらず閲覧できる。それ以外は status = 'public' のものだけで、
 // team_id があればチームの can_view も必要。見せられない場合は存在を明かさないよう 404 を返す。
 func videoDetailsHandler(c *gin.Context) {
@@ -414,6 +452,7 @@ func videoDetailsHandler(c *gin.Context) {
 		return
 	}
 
+	// 呼び出し元の権限に応じて閲覧可否と返す項目を決める。
 	userID, isAdmin := optionalUser(c)
 	isOwner := userID != "" && strings.EqualFold(userID, v.UploaderID)
 	if !isOwner && !isAdmin {
@@ -432,8 +471,9 @@ func videoDetailsHandler(c *gin.Context) {
 // 更新 API
 // ------------------------------------------------------------------
 
-// 💡 動画更新（PUT /api/videos/:id）
-// title/description を multipart から受取り、thumbnail が存在すれば SFSP スキャンへ投入する。
+// updateVideoHandler は動画更新（PUT /api/videos/:id）を行う。
+// 💡 title/description を multipart から受取り、thumbnail が存在すれば SFSP スキャンへ投入する。
+// サムネイルの反映はスキャン完了後に videoThumbnailWorker が行うため、その場合は 202 を返す。
 func updateVideoHandler(c *gin.Context) {
 	videoID := c.Param("id")
 	if videoID == "" {
@@ -458,6 +498,8 @@ func updateVideoHandler(c *gin.Context) {
 		return
 	}
 
+	// リクエストサイズを制限してからフォームを解析する。
+	// Content-Length での早期拒否に加え、申告を偽った送信にも備えて MaxBytesReader で本体を打ち切る。
 	tooLarge := gin.H{"error": fmt.Sprintf("Thumbnail is too large. The maximum size is %d bytes.", maxImageUploadBytes)}
 	if c.Request.ContentLength > maxImageUploadBytes+multipartOverhead {
 		c.JSON(http.StatusRequestEntityTooLarge, tooLarge)
@@ -474,6 +516,7 @@ func updateVideoHandler(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid multipart form"})
 			return
 		}
+		// メモリ上限を超えてディスクに退避された一時ファイルを、処理後に必ず削除する。
 		defer func() {
 			if c.Request.MultipartForm != nil {
 				_ = c.Request.MultipartForm.RemoveAll()
@@ -498,6 +541,7 @@ func updateVideoHandler(c *gin.Context) {
 			c.JSON(http.StatusRequestEntityTooLarge, tooLarge)
 			return
 		}
+		// 申告された Content-Type やファイル名は信用せず、先頭 512 バイトから実際の形式を判定する。
 		head := make([]byte, 512)
 		n, rerr := io.ReadFull(f, head)
 		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
@@ -509,6 +553,7 @@ func updateVideoHandler(c *gin.Context) {
 			c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "Thumbnail must be a JPEG, PNG, GIF or WebP image"})
 			return
 		}
+		// 判定のために読んだ分を戻し、SFSP へはファイル全体を送る。
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process upload file"})
 			return
@@ -517,6 +562,7 @@ func updateVideoHandler(c *gin.Context) {
 		thumbName = "thumbnail" + ext
 	}
 
+	// タイトルと説明を更新する（フォームに無い項目は空文字で上書きされる）。
 	title := c.Request.FormValue("title")
 	description := c.Request.FormValue("description")
 
@@ -535,6 +581,8 @@ func updateVideoHandler(c *gin.Context) {
 		return
 	}
 
+	// サムネイルを SFSP へ送り、返ってきたジョブ ID を動画に記録する。
+	// ワーカーはこのジョブ ID で完了イベントと動画を突き合わせる。
 	var sfspResp SfspUploadResponse
 	if err := uploadToSFSP(c.Request.Context(), thumbFile, thumbName, "video-thumbnail", &sfspResp); err != nil {
 		logger.Errorf("Error forwarding thumbnail to SFSP: %v", err)
@@ -571,6 +619,8 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
+	// 1. 別ゴルーチンで multipart 本体をパイプへ書き込む。
+	// エラーは CloseWithError でパイプの読み手（HTTP クライアント）へ伝える。
 	go func() {
 		err := func() error {
 			if err := writer.WriteField("target_service", targetService); err != nil {
@@ -588,6 +638,8 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 		pw.CloseWithError(err)
 	}()
 
+	// 2. パイプの読み側を本体とするリクエストを送る。
+	// 失敗時は読み側を閉じて、書き込みゴルーチンがブロックしたまま残らないようにする。
 	sfspRequest, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
 		pr.CloseWithError(err)
@@ -606,6 +658,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	}
 	defer sfspResponse.Body.Close()
 
+	// 3. 応答（最大 1 MiB）を読み、2xx 以外はエラー、2xx なら JSON を resp へデコードする。
 	respBytes, err := io.ReadAll(io.LimitReader(sfspResponse.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("failed to read SFSP response: %w", err)
@@ -626,6 +679,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 // サムネイル差し替えのワーカー
 // ------------------------------------------------------------------
 
+// ackThumbnail は処理を終えたイベントを処理中リストから取り除く。失敗してもログを出すだけにする。
 func ackThumbnail(payload string) {
 	if err := queue.Ack(context.Background(), queue.VideoThumbnailCompletionQueue, payload); err != nil {
 		logger.Errorf("Failed to ack event on %s: %v", queue.VideoThumbnailCompletionQueue, err)
@@ -640,6 +694,7 @@ func videoThumbnailWorker(ctx context.Context) {
 	q := queue.VideoThumbnailCompletionQueue
 
 	for {
+		// タイムアウト 0 で無期限に待ち、取り出したイベントは処理中リストへ移す。
 		payload, err := queue.DequeueReliable(ctx, q, 0)
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
@@ -659,6 +714,7 @@ func videoThumbnailWorker(ctx context.Context) {
 }
 
 // clearThumbnailJob は thumbnail_sfsp_job_id を消して終端状態にする。成功したら true。
+// WHERE 句でジョブ ID も照合し、後から別のサムネイルが登録されていた場合はそちらを消さない。
 func clearThumbnailJob(ctx context.Context, videoID string, jobID uuid.UUID) bool {
 	_, err := db.Exec(ctx, "UPDATE videos SET thumbnail_sfsp_job_id = NULL, updated_at = NOW() WHERE id = $1 AND thumbnail_sfsp_job_id = $2", videoID, jobID)
 	if err != nil {
@@ -669,7 +725,9 @@ func clearThumbnailJob(ctx context.Context, videoID string, jobID uuid.UUID) boo
 }
 
 // handleThumbnailEvent は 1 件のイベントを処理し、Ack してよいか（DB が終端状態になったか）を返す。
+// 解析できないイベントや対象外のイベントは再処理しても無意味なので、true を返して破棄する。
 func handleThumbnailEvent(ctx context.Context, payload string) bool {
+	// 1. イベントを解析し、動画サムネイル向けか確認する
 	var ev event.ScanCompletionEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 		logger.Errorf("ERROR: Unmarshalling event payload (dropping): %v", err)
@@ -681,6 +739,7 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 		return true
 	}
 
+	// 2. ジョブ ID から対象の動画を探す
 	// PUT ハンドラーが thumbnail_sfsp_job_id を保存する前にスキャンが終わることがあるため、少し待って再試行する。
 	var videoID, currentThumbnailPath string
 	var err error
@@ -703,6 +762,7 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 		return false
 	}
 
+	// 3. スキャン結果が clean でなければ取り込まずにジョブを終える
 	if ev.FinalStatus != "clean" {
 		logger.Infof("[VideoID: %s] Thumbnail scan result is '%s'. Aborting thumbnail processing.", videoID, ev.FinalStatus)
 		return clearThumbnailJob(ctx, videoID, ev.JobID)
@@ -710,6 +770,8 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 
 	logger.Infof("[VideoID: %s] Thumbnail is clean. Processing thumbnail...", videoID)
 
+	// 4. クリーンバケットからサムネイルを一時ファイルへダウンロードする
+	// オブジェクトキーは "<FileID>" と "<FileID>/<ファイル名>" の両方の形式を順に試す。
 	fileIDStr := ev.FileID.String()
 	candidateKeys := []string{
 		fileIDStr,
@@ -729,10 +791,9 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 	var downloadErr error
 	downloadSuccess := false
 
-	// The SFSP scan completion event can arrive before the clean file is
-	// fully written to the MinIO bucket (a false-start / flying event).
-	// Retry the download a few times before giving up so a premature event
-	// does not permanently skip the thumbnail.
+	// SFSP のスキャン完了イベントは、クリーンファイルが MinIO バケットへ書き終わる前に
+	// 届くことがある（フライングイベント）。早すぎるイベントのせいでサムネイルが
+	// 恒久的に反映されなくならないよう、諦める前に何度かダウンロードを再試行する。
 	const maxRetries = 10
 	const retryDelay = 3 * time.Second
 	for attempt := 0; attempt <= maxRetries && !downloadSuccess; attempt++ {
@@ -756,6 +817,7 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 		return clearThumbnailJob(ctx, videoID, ev.JobID)
 	}
 
+	// 5. サイズと内容を検証する（メモリへ読み込む前にサイズ上限を確認する）
 	if st, err := os.Stat(tempThumbPath); err != nil || st.Size() > maxImageUploadBytes {
 		logger.Errorf("[VideoID: %s] ERROR: Downloaded thumbnail is unreadable or exceeds the size limit", videoID)
 		return clearThumbnailJob(ctx, videoID, ev.JobID)
@@ -773,13 +835,14 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 		return clearThumbnailJob(ctx, videoID, ev.JobID)
 	}
 
-	// Name the thumbnail object after the video ID so it is directly identifiable
-	// with its video (mirrors videos/<videoID>/). Deterministic naming lets
-	// us reclaim storage by deleting the previous thumbnail first.
+	// 6. 動画用バケットへ保存する
+	// サムネイルのオブジェクト名を動画 ID にして、どの動画のものか直接分かるようにする
+	// （videos/<videoID>/ と対応させる）。名前を決定的にすることで、以前のサムネイルを
+	// 先に削除してストレージを回収できる。
 	thumbnailObjectName := fmt.Sprintf("thumbnails/%s", videoID)
 
-	// Reclaim storage: delete the previous thumbnail if it used a different object name
-	// (the new one overwrites thumbnails/<videoID> in place).
+	// ストレージ回収: 以前のサムネイルが別のオブジェクト名なら削除する
+	// （同名の場合は新しいものが thumbnails/<videoID> をその場で上書きする）。
 	if currentThumbnailPath != "" {
 		oldObjectName := strings.TrimPrefix(currentThumbnailPath, "/videos/")
 		if oldObjectName != thumbnailObjectName {
@@ -797,6 +860,7 @@ func handleThumbnailEvent(ctx context.Context, payload string) bool {
 		return clearThumbnailJob(ctx, videoID, ev.JobID)
 	}
 
+	// 7. DB のサムネイルパスを更新し、ジョブ ID を消して終端状態にする
 	thumbnailURL := "/videos/" + thumbnailObjectName
 	tag, err := db.Exec(ctx, "UPDATE videos SET thumbnail_path = $1, thumbnail_sfsp_job_id = NULL, updated_at = NOW() WHERE id = $2", thumbnailURL, videoID)
 	if err != nil {

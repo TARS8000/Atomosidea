@@ -1,8 +1,12 @@
+// sfsp-api は SFSP（ファイルのセキュリティスキャン基盤）の HTTP API サーバー。
+// ファイルのアップロード受付、スキャンジョブ・スキャン結果の照会を提供する。
 package main
 
 import (
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 
 	"github.com/atmosidea/sfsp/internal/api"
 	"github.com/atmosidea/sfsp/internal/config"
@@ -14,7 +18,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// main は設定を読み込み、DB・MinIO・Redis に接続してから Gin のルーターを起動する。
+// いずれかの初期化に失敗した場合はプロセスを終了する。
 func main() {
+	// ロガーを初期化する
 	logger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -45,6 +52,7 @@ func main() {
 	// REDIS_URL（redis://:<pw>@redis:6379）があればそれを使い、URL にパスワードが無ければ REDIS_PASSWORD を補う
 	sharedCfg.RedisAddr = config.ResolveRedisAddr(sharedCfg.RedisAddr, sharedCfg.RedisPassword)
 
+	// sfsp-db へ接続する（エラー文に DSN のパスワードが含まれうるため伏せてログ出力する）
 	if err := database.Connect(cfg); err != nil {
 		sugar.Fatalf("Failed to connect to database: %s", config.RedactString(err.Error(), cfg.DatabaseURL))
 	}
@@ -60,6 +68,7 @@ func main() {
 		sugar.Fatalf("Failed to connect to Redis (%s): %s", config.RedactURL(sharedCfg.RedisAddr), config.RedactString(err.Error(), sharedCfg.RedisAddr))
 	}
 
+	// ルーターを構築する
 	router := gin.Default()
 	// アップロードは MultipartReader でストリーミングするため、フォーム全体をメモリに展開しない
 	router.MaxMultipartMemory = 1 << 20
@@ -72,6 +81,7 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	// /api/v1 配下はすべて X-SFSP-API-Key ヘッダーによる API キー認証を必須とする
 	v1 := router.Group("/api/v1")
 	v1.Use(api.RequireAPIKey(cfg.API.Key))
 	{
@@ -80,13 +90,24 @@ func main() {
 		v1.GET("/results/:id", apiHandler.HandleGetResult)
 	}
 
+	// ポート未指定時は 8080 で待ち受ける
 	port := cfg.API.Port
 	if port == "" {
 		port = "8080"
 	}
 
 	sugar.Infof("Starting SFSP API server on port %s (max upload %d bytes)", port, cfg.Limits.MaxUploadBytes)
-	if err := router.Run(fmt.Sprintf(":%s", port)); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（大きなアップロードを受けるので本文の読み取りは長めに許す）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		sugar.Fatalf("Failed to run server: %v", err)
 	}
 }

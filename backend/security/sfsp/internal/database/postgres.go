@@ -1,3 +1,4 @@
+// Package database は sfsp-db（PostgreSQL）への接続プールの管理と、起動時のスキーマ補正を行う。
 package database
 
 import (
@@ -10,14 +11,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DB holds the database connection pool
+// DB はパッケージ全体で共有する DB 接続プールを保持する。
 var DB *pgxpool.Pool
 
-// Connect initializes the database connection pool
+// Connect は DB 接続プールを初期化し、Ping が通るまでリトライする。
+// 接続後、古いボリュームで作成された DB に不足しているカラムを追加する。
 func Connect(cfg config.Config) error {
 	var err error
 	connStr := cfg.DatabaseURL
 
+	// 1. 最大5回、2秒から倍々に待ちながら接続を試行する
 	err = config.Retry(5, 2*time.Second, func() error {
 		DB, err = pgxpool.New(context.Background(), connStr)
 		if err != nil {
@@ -30,6 +33,7 @@ func Connect(cfg config.Config) error {
 		return fmt.Errorf("unable to connect to database after retries: %w", err)
 	}
 
+	// 2. 後から追加されたカラムが無ければ追加する
 	if err := ensureTargetServiceColumn(); err != nil {
 		return err
 	}
@@ -41,6 +45,8 @@ func Connect(cfg config.Config) error {
 	return nil
 }
 
+// ensureTargetServiceColumn は files.target_service カラムの有無を information_schema で確認し、
+// 無ければ NOT NULL DEFAULT 'other' で追加する（カラム導入前に作成された DB 向け）。
 func ensureTargetServiceColumn() error {
 	var exists bool
 	if err := DB.QueryRow(context.Background(), `
@@ -67,17 +73,17 @@ func ensureTargetServiceColumn() error {
 	return nil
 }
 
-// Close closes the database connection pool
+// Close は DB 接続プールが初期化済みであれば閉じる。
 func Close() {
 	if DB != nil {
 		DB.Close()
 	}
 }
 
-// ensureEventPublishedColumn adds scan_jobs.event_published_at to databases created before
-// the column existed (docker-entrypoint-initdb.d only runs on an empty volume).
-// The worker uses it to make re-processing a job idempotent: a job that already reached a
-// terminal status and whose completion event was published is not published again.
+// ensureEventPublishedColumn は、カラム導入前に作成された DB に scan_jobs.event_published_at を追加する
+// （docker-entrypoint-initdb.d は空のボリュームでしか実行されないため）。
+// ワーカーはこのカラムを使ってジョブの再処理を冪等にする。最終ステータスに達して
+// 完了イベントを発行済みのジョブは、再度イベントを発行しない。
 func ensureEventPublishedColumn() error {
 	if _, err := DB.Exec(context.Background(), `ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS event_published_at TIMESTAMPTZ`); err != nil {
 		return fmt.Errorf("unable to add event_published_at column: %w", err)

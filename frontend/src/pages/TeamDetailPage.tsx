@@ -57,9 +57,11 @@ import {
 import { useAuth } from '../context/AuthContext';
 import axios from 'axios';
 
+// チームロールの内部値と画面表示名の対応（owner=ホスト、admin=オペレーター、member=メンバー）
 const ROLE_LABEL: Record<string, string> = { owner: 'ホスト', admin: 'オペレーター', member: 'メンバー' };
 
-// メンバー操作（ロール変更・削除・退出）の失敗メッセージ
+// メンバー操作（ロール変更・削除・退出）の失敗メッセージ。
+// HTTP ステータスごとに理由を示し、該当しなければ fallback を返す。
 const memberErrorMessage = (err: any, fallback: string): string => {
   const status = err?.response?.status;
   if (status === 409) {
@@ -72,6 +74,7 @@ const memberErrorMessage = (err: any, fallback: string): string => {
   return fallback;
 };
 
+// 画面上部に並べるタブの定義（key は activeTab の値として使う）
 const TABS: { key: string; label: string }[] = [
   { key: 'all', label: 'すべて' },
   { key: 'videos', label: '動画' },
@@ -80,21 +83,31 @@ const TABS: { key: string; label: string }[] = [
   { key: 'members', label: 'メンバー' },
 ];
 
+// コンテンツ一覧を取得するタブ（「すべて」と「メンバー」以外）
 const CONTENT_TAB_KEYS: TeamContentType[] = ['videos', 'games', 'sites'];
 
-// サムネを強制的に取得するためのキャッシュバスタ（アップロード後に旧画像が混入するのを防止）
+// サムネを強制的に取得するためのキャッシュバスタ（アップロード後に旧画像が混入するのを防止）。
+// 注: 付与する v= の値は URL 自体から作るため、URL が変わらない限りクエリも同じになる。
 const withCacheBuster = (url: string | null | undefined): string | undefined => {
   if (!url) return undefined;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}v=${encodeURIComponent(url)}`;
 };
 
+/**
+ * チーム詳細ページ（/teams/:token）。
+ * チーム情報とメンバーを取得し、タブで投稿コンテンツ（動画・ゲーム・サイト）とメンバー管理を切り替える。
+ * 自分のロールに応じて、投稿の検索、メンバーのロール変更・削除、参加リクエストの承認、
+ * チーム設定の変更・チーム削除などの操作を出し分ける。
+ */
 const TeamDetailPage = () => {
+  // URL のチームトークン（チーム ID ではない）
   const { token } = useParams<{ token: string }>();
   const { user, isAuthenticated } = useAuth();
   const navigate = useNavigate();
   const theme = useTheme();
 
+  // チーム本体とメンバー一覧、画面全体の読み込み・エラー状態
   const [team, setTeam] = useState<Team | null>(null);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [loading, setLoading] = useState(true);
@@ -131,25 +144,34 @@ const TeamDetailPage = () => {
   const [staticSites, setStaticSites] = useState<TeamContentItem[]>([]);
   const [contentLoading, setContentLoading] = useState(false);
   const [contentError, setContentError] = useState('');
+  // ユーザー ID → ユーザー名のキャッシュ（投稿者・メンバー・参加リクエストの表示に共用）
   const [usernames, setUsernames] = useState<Record<string, string>>({});
 
+  // メンバー一覧から自分のロールを求める（未所属・未ログインなら空文字）
   const myRole = (() => {
     if (!user) return '';
     const m = members.find((x) => x.user_id === user.userID);
     return m ? m.role : '';
   })();
+  // ロールの強さに応じた操作可否（画面表示の出し分けに使う。最終的な権限判定は team-service が行う）
+  // canPost: member 以上 / canManageMembers: admin 以上 / canManageTeam: owner のみ
   const canPost = !!myRole && TEAM_ROLE_RANK[myRole] >= TEAM_ROLE_RANK.member;
   const canManageMembers = !!myRole && TEAM_ROLE_RANK[myRole] >= TEAM_ROLE_RANK.admin;
   const canManageTeam = !!myRole && TEAM_ROLE_RANK[myRole] >= TEAM_ROLE_RANK.owner;
 
+  /**
+   * チーム情報とメンバー一覧を読み込み、非公開チームへのアクセス可否を判定する。
+   * ロール変更・設定保存・参加などの後にも呼び直して画面を最新化する。
+   */
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
+      // 1. チーム情報を取得する
       const teamRes = await teamApi.get(token!);
       setTeam(teamRes.data);
 
-      // メンバー一覧を先に取得する。非公開チームのアクセス判定は myRole に依存するため、
+      // 2. メンバー一覧を先に取得する。非公開チームのアクセス判定は myRole に依存するため、
       // members が空の段階で判定するとメンバー（ホスト含む）でも閲覧不可になってしまう。
       let role = '';
       await teamApi.listMembers(token!).then((r) => {
@@ -159,7 +181,7 @@ const TeamDetailPage = () => {
         role = m ? m.role : '';
       }).catch(() => {});
 
-      // 非公開チームでメンバー以外（或未認証）は閲覧不可
+      // 3. 非公開チームでメンバー以外（または未認証）は閲覧不可
       if (!teamRes.data.is_public) {
         if (!isAuthenticated || !role) {
           setError('このチームは非公開です。メンバーがログインしてください。');
@@ -168,6 +190,7 @@ const TeamDetailPage = () => {
         }
       }
     } catch (err: any) {
+      // チーム取得失敗時は HTTP ステータスに応じたメッセージを出す
       if (err.response?.status === 401) {
         setError('このチームを閲覧するにはログインが必要です。');
       } else if (err.response?.status === 403) {
@@ -182,11 +205,14 @@ const TeamDetailPage = () => {
     }
   }, [token, isAuthenticated, user?.userID]);
 
+  // 初回表示時、およびトークン・ログイン状態が変わったときに読み込む
   useEffect(() => {
     load();
   }, [load]);
 
-  // 投稿者の名前を一括取得（詳細ページと同じく /api/profile/:id を使用）
+  // 投稿者の名前を一括取得（詳細ページと同じく /api/profile/:id を使用）。
+  // uploader_id（コンテンツ）か user_id（メンバー・参加リクエスト）を重複なく集めて並行取得し、キャッシュへマージする。
+  // 個別の取得失敗は空の名前として扱い、他の名前の取得は続ける。
   const loadUsernames = useCallback(async (items: Array<{ uploader_id?: string | null; user_id?: string | null }>) => {
     const ids = Array.from(new Set(items.map((it) => it.uploader_id ?? it.user_id).filter(Boolean) as string[]));
     if (ids.length === 0) return;
@@ -205,7 +231,8 @@ const TeamDetailPage = () => {
     }
   }, []);
 
-  // コンテンツ一覧取得
+  // コンテンツ一覧取得。種別ごとの API を検索語付きで呼び、結果を対応する state に入れて投稿者名も取得する。
+  // contentSearch を依存に持つため、検索語が変わるたびに関数が作り直され、下の effect で再取得される。
   const loadContent = useCallback(
     async (type: TeamContentType) => {
       if (!token) return;
@@ -235,6 +262,8 @@ const TeamDetailPage = () => {
     [token, contentSearch, loadUsernames]
   );
 
+  // タブ切り替え・検索語変更時にコンテンツを読み込む。「すべて」タブでは3種類をまとめて取得する。
+  // 注: 3種類が同じ contentLoading を共有するため、最初に終わった取得でローディング表示が消える。
   useEffect(() => {
     if (activeTab === 'all') {
       Promise.all([
@@ -256,8 +285,11 @@ const TeamDetailPage = () => {
     if (joinRequests.length > 0) void loadUsernames(joinRequests);
   }, [joinRequests, loadUsernames]);
 
+  // メンバー操作の失敗理由などを表示するメッセージ
   const [memberMessage, setMemberMessage] = useState('');
 
+  // メンバーのロールを変更する。メンバー追加 API に新しいロールを送って更新し、成功したら再読み込みする。
+  // ホスト権限の付与は取り消せなくなるため、事前に確認ダイアログを出す。
   const handleRoleChange = async (userId: string, role: string) => {
     setMemberMessage('');
     if (role === 'owner' && !window.confirm('このメンバーにホスト権限を付与しますか？付与した後は、あなたからこのメンバーのロールを変更・削除できなくなります。')) {
@@ -271,6 +303,7 @@ const TeamDetailPage = () => {
     }
   };
 
+  // 確認ダイアログの後に指定メンバーをチームから削除する
   const handleRemoveMember = async (userId: string) => {
     if (window.confirm('このメンバーを削除しますか？')) {
       setMemberMessage('');
@@ -284,9 +317,12 @@ const TeamDetailPage = () => {
     }
   };
 
+  // 自分が唯一のホストかどうか。最後のホストが抜けると管理者不在になるため、退出ボタンを無効化する
   const ownerCount = members.filter((m) => m.role === 'owner').length;
   const isLastOwner = myRole === 'owner' && ownerCount <= 1;
 
+  // 自分をメンバーから削除してチームを退出し、一覧へ戻る。
+  // 最後のホストの場合は API を呼ばずに、サーバーの 409 と同じメッセージを表示する。
   const handleLeaveTeam = async () => {
     if (!user) return;
     if (isLastOwner) {
@@ -303,6 +339,7 @@ const TeamDetailPage = () => {
     }
   };
 
+  // 確認ダイアログの後にチームを削除し、一覧へ戻る
   const handleDeleteTeam = () => {
     if (window.confirm('このチームを削除しますか？関連する投稿もすべて削除されます。')) {
       teamApi.deleteTeam(token!).then(() => navigate('/teams')).catch(() => setError('チーム削除に失敗しました。'));
@@ -322,6 +359,7 @@ const TeamDetailPage = () => {
     }
   };
 
+  // 現在のチーム情報を入力欄へ写してから設定ダイアログを開く
   const openSettings = () => {
     if (!team) return;
     setTeamName(team.name);
@@ -333,6 +371,7 @@ const TeamDetailPage = () => {
     setSettingsOpen(true);
   };
 
+  // 設定ダイアログの内容を保存し、成功したらチーム情報を再読み込みする（ダイアログは開いたまま）
   const saveSettings = async () => {
     setSavingSettings(true);
     setSettingsMessage('');
@@ -347,6 +386,7 @@ const TeamDetailPage = () => {
     }
   };
 
+  // 参加リクエストを承認または拒否し、リクエスト一覧を再取得する
   const handleReviewJoinRequest = async (requestId: string, action: 'approve' | 'reject') => {
     try {
       await teamApi.reviewJoinRequest(token!, requestId, action);
@@ -357,6 +397,8 @@ const TeamDetailPage = () => {
     }
   };
 
+  // チームへの参加を申し込む。未ログインならログインページへ遷移する。
+  // 応答の status（承認待ち／参加済み／即時参加）やエラーのステータスに応じてメッセージを出し分ける。
   const handleJoin = async () => {
     if (!isAuthenticated) {
       navigate('/login');
@@ -395,7 +437,7 @@ const TeamDetailPage = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, canManageMembers, token]);
 
-  // コンテンツ削除
+  // コンテンツ削除。種別ごとの削除 API を呼び、成功したらその種別の一覧を再取得する
   const handleDeleteContent = async (type: TeamContentType, id: string) => {
     if (!window.confirm('このコンテンツを削除しますか？')) return;
     try {
@@ -412,6 +454,7 @@ const TeamDetailPage = () => {
     }
   };
 
+  // カードのサムネイルを描画する。動画は thumbnail_path、ゲーム/サイトは thumbnail_url を使い、無ければ代替表示にする
   const renderContentThumbnail = (item: TeamContentItem) => {
     const thumb = item.thumbnail_path || item.thumbnail_url;
     if (thumb) {
@@ -424,6 +467,8 @@ const TeamDetailPage = () => {
     );
   };
 
+  // コンテンツのカード一覧を描画する。カードをクリックすると詳細ページへ遷移し、
+  // 投稿者本人には編集ボタン、ホストには削除ボタンを出す（ボタンはクリックがカードへ伝わらないよう stopPropagation する）
   const renderContentGrid = (type: TeamContentType, items: TeamContentItem[]) => {
     const link = CONTENT_LINKS[type];
     return (
@@ -488,6 +533,7 @@ const TeamDetailPage = () => {
     );
   };
 
+  // チーム情報の読み込み中はスピナーだけを表示する
   if (loading) {
     return (
       <Container maxWidth="sm" sx={{ py: 8, display: 'flex', justifyContent: 'center' }}>
@@ -498,6 +544,7 @@ const TeamDetailPage = () => {
 
   return (
     <Container maxWidth="lg" sx={{ py: 6 }}>
+      {/* エラー表示。「権限」を含むメッセージは警告扱いにして鍵アイコンを付ける */}
       {error && (
         <Alert severity={error.includes('権限') ? 'warning' : 'error'} sx={{ mb: 2 }}>
           {error.includes('権限') && <LockIcon sx={{ mr: 1, verticalAlign: 'middle' }} />}
@@ -505,8 +552,10 @@ const TeamDetailPage = () => {
         </Alert>
       )}
 
+      {/* エラーが無いときだけチームの内容を表示する */}
       {team && !error && (
         <>
+          {/* ヘッダー: チーム名・公開区分・説明と、ロールに応じた操作ボタン */}
 <Paper sx={{ p: 3, mb: 3, borderTop: `4px solid ${theme.palette.primary.main}` }}>
              <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 2 }}>
                <Box sx={{ minWidth: 0, flexGrow: 1 }}>
@@ -520,6 +569,7 @@ const TeamDetailPage = () => {
                   </Typography>
                 )}
               </Box>
+              {/* ホストにはチーム設定・削除ボタンを出す */}
               {canManageTeam && (
                 <>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mr: 1 }}>
@@ -537,6 +587,7 @@ const TeamDetailPage = () => {
                   )}
                 </>
               )}
+              {/* 未所属のユーザーには公開チームへの加入ボタンを出す */}
               {!canManageTeam && !canPost && team?.is_public && (
                 <Button size="small" variant="outlined" startIcon={<GroupIcon />} onClick={handleJoin}>
                   チームへ加入
@@ -545,12 +596,14 @@ const TeamDetailPage = () => {
             </Box>
           </Paper>
 
+          {/* 参加リクエスト関連の結果メッセージ */}
           {joinMessage && (
             <Alert severity="info" sx={{ mb: 2 }} onClose={() => setJoinMessage('')}>
               {joinMessage}
             </Alert>
           )}
 
+          {/* タブ切り替え */}
 <Paper sx={{ p: 1, mb: 2 }}>
             <Tabs
               value={activeTab}
@@ -565,7 +618,7 @@ const TeamDetailPage = () => {
             </Tabs>
           </Paper>
 
-{/* すべて */}
+{/* すべて（動画・ゲーム・サイトを種別ごとにまとめて表示） */}
            {activeTab === 'all' && (
              <>
                {contentLoading ? (
@@ -607,7 +660,7 @@ const TeamDetailPage = () => {
              </>
            )}
 
-          {/* 動画 */}
+          {/* 動画（検索欄は投稿権限のあるメンバーにだけ表示する） */}
           {activeTab === 'videos' && (
             <>
               {canPost && (
@@ -699,6 +752,7 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
 {/* メンバー */}
 {activeTab === 'members' && (
               <>
+                {/* オペレーター以上には承認待ちの参加リクエストを表示する */}
                 {canManageMembers && (
                 <>
                   <Typography variant="h6" gutterBottom>参加リクエスト管理</Typography>
@@ -725,9 +779,11 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
                   <Divider sx={{ my: 2 }} />
                 </>
               )}
+              {/* メンバー一覧と退出ボタン */}
               <Box sx={{ mb: 2 }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <Typography variant="h6" gutterBottom>メンバー管理</Typography>
+                  {/* 無効化したボタンでもツールチップが出るよう span で包む */}
                   {myRole && (
                     <Tooltip title={isLastOwner ? '最後のホストは退出できません。先にホスト権限を他のメンバーに付与するか、チームを削除してください。' : ''}>
                       <span>
@@ -764,6 +820,7 @@ InputProps={{ startAdornment: <SearchIcon sx={{ mr: 1, color: 'text.secondary' }
                           </Box>
                           <Chip size="small" label={ROLE_LABEL[m.role] || m.role} sx={{ ml: 1 }} />
                         </Box>
+                        {/* ロール選択。選択肢は現在のロールと自分が付与できるロールに限る */}
                         {canManageMembers && (
                           <TextField
                             select

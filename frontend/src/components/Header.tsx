@@ -7,6 +7,10 @@ import GroupIcon from '@mui/icons-material/Group';
 import AccountDeletionModal from './AccountDeletionModal';
 import axios from 'axios';
 
+/**
+ * 画面上部に固定表示するヘッダー。ログイン状態に応じて、ナビゲーションとユーザーメニュー、
+ * またはログイン・新規登録ボタンを表示する。
+ */
 const Header = () => {
   const { isAuthenticated, user, logout, token } = useAuth();
   const navigate = useNavigate();
@@ -14,14 +18,18 @@ const Header = () => {
   const [userMenuAnchorEl, setUserMenuAnchorEl] = useState<null | HTMLElement>(null);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
 
+  // ユーザー名部分のクリックでメニューを開く（クリックした要素をメニューの表示位置の基準にする）。
   const handleUserMenu = (event: React.MouseEvent<HTMLElement>) => {
     setUserMenuAnchorEl(event.currentTarget);
   };
 
+  // ユーザーメニューを閉じる。
   const handleClose = () => {
     setUserMenuAnchorEl(null);
   };
 
+  // ログアウト API を呼び（失敗しても続行）、ローカルの認証状態を破棄してトップへ遷移する。
+  // 注意: AuthContext の logout() もログアウト API を呼ぶため API が 2 回呼ばれ、logout() 内の navigate('/login') が後から実行される。
   const handleLogout = async () => {
     handleClose();
     try {
@@ -36,11 +44,13 @@ const Header = () => {
     }
   };
 
+  // メニューを閉じて、アカウント管理ダイアログを開く。
   const handleOpenAccountModal = () => {
     handleClose();
     setIsAccountModalOpen(true);
   };
 
+  // アカウント管理ダイアログを閉じる。
   const handleCloseAccountModal = () => {
     setIsAccountModalOpen(false);
   };
@@ -70,6 +80,7 @@ const Header = () => {
         >
           Atmosidea
         </Typography>
+        {/* ログイン済みならナビゲーションとユーザーメニュー、未ログインならログイン・新規登録ボタンを表示する */}
         {isAuthenticated && user ? (
           <Box sx={{ display: 'flex', alignItems: 'center' }}>
             <Button
@@ -87,6 +98,7 @@ const Header = () => {
 
             <Button component={RouterLink} to="/mypage" sx={{ color: 'text.primary', mr: 2 }}>マイページ</Button>
             
+            {/* アイコンとユーザー名。クリックでユーザーメニューを開く */}
             <Box
               onClick={handleUserMenu}
               sx={{
@@ -114,6 +126,7 @@ const Header = () => {
               />
               <Typography sx={{ color: 'text.primary', ml: 1, mr: 0.5 }}>{user.username}</Typography>
             </Box>
+            {/* ユーザーメニュー（マイページ・プロフィール編集・アカウント管理・ログアウト） */}
             <Menu
               id="menu-appbar"
               anchorEl={userMenuAnchorEl}
@@ -145,6 +158,7 @@ const Header = () => {
           </Box>
         )}
       </Toolbar>
+      {/* ユーザー情報がある場合のみダイアログを配置する。provider が不明なら空文字を渡す */}
       {user && (
         <AccountDeletionModal
           open={isAccountModalOpen}

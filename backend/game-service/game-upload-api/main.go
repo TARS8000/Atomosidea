@@ -1,3 +1,5 @@
+// game-upload-api はゲーム（Unity WebGL ビルドの ZIP）の投稿・一覧・詳細・編集・削除を扱う HTTP サービス。
+// アップロードされたファイルは sfsp-api に転送してスキャンさせ、展開・公開は game-worker が行う。
 package main
 
 import (
@@ -24,6 +26,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/atmosidea/shared/config"
 	"github.com/atmosidea/shared/queue"
+	"github.com/atmosidea/shared/ratelimit"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -34,6 +37,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// サービス全体で共有する接続・設定値。main で環境変数から初期化する。
 var (
 	db             *pgxpool.Pool
 	minioClient    *minio.Client
@@ -76,6 +80,7 @@ func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*te
 	if !teamTokenPattern.MatchString(teamToken) {
 		return &teamPermission{}, nil
 	}
+	// TEAM_SERVICE_URL が未設定なら Docker Compose 内の既定の宛先を使う
 	if teamServiceURL == "" {
 		teamServiceURL = "http://team-service:8080"
 	}
@@ -92,6 +97,7 @@ func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*te
 		return nil, fmt.Errorf("request failed for team %s: %w", teamToken, err)
 	}
 	defer resp.Body.Close()
+	// チームが存在しない場合はエラーではなく「権限なし」として返す
 	if resp.StatusCode == http.StatusNotFound {
 		return &teamPermission{}, nil
 	}
@@ -99,15 +105,17 @@ func fetchTeamPermission(ctx context.Context, teamToken, authHeader string) (*te
 		return nil, fmt.Errorf("team service returned %d for team %s", resp.StatusCode, teamToken)
 	}
 	var body teamPermission
+	// 応答は小さい JSON のはずなので、読み込みを 64 KiB までに制限する
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 	return &body, nil
 }
 
-// teamAccessCheck calls the team-service permission endpoint to verify that the
-// caller is allowed to post to the given team. Returns true if posting is allowed.
-// A missing/empty team_id is treated as a public post (always allowed).
+// teamAccessCheck は team-service の権限エンドポイントを呼び出し、呼び出し元が
+// 指定チームに投稿できるかを確認する。投稿できる場合に true を返す。
+// team_id が空の場合は全体公開の投稿として扱い、常に許可する。
+// 問い合わせに失敗した場合は false（拒否）を返す。
 // authMiddleware を通過したリクエストでのみ呼ぶ（Authorization はそのまま転送する）。
 func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	if teamToken == "" {
@@ -121,6 +129,10 @@ func teamAccessCheck(c *gin.Context, teamToken string) bool {
 	return perm.CanPost
 }
 
+// Game は games テーブルの1行を API 応答用に表したもの。
+// ThumbnailSfspJobID はサムネイルのスキャンジョブ ID、TeamID は限定公開先のチームトークン
+// （全体公開なら空文字）。Scale・OffsetX・OffsetY・NativeWidth・NativeHeight は
+// ゲーム画面の表示調整に使う値。
 type Game struct {
 	ID                 string     `json:"id"`
 	Title              string     `json:"title"`
@@ -141,6 +153,7 @@ type Game struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
+// AdjustPayload は PUT /api/games/adjust/:id で受け取る表示調整値（拡大率とオフセット）。
 type AdjustPayload struct {
 	Scale   float32 `json:"scale"`
 	OffsetX int     `json:"offset_x"`
@@ -162,6 +175,8 @@ type VerificationResult struct {
 	CheckedFile       string `json:"checked_file"`
 }
 
+// generateRandomID は crypto/rand で 5 バイトを生成し、10 文字の16進文字列のゲーム ID を返す。
+// 既存 ID との重複は確認しない。
 func generateRandomID() (string, error) {
 	for {
 		bytes := make([]byte, 5)
@@ -169,14 +184,16 @@ func generateRandomID() (string, error) {
 			return "", err
 		}
 		id := hex.EncodeToString(bytes)
-		// Ensure the ID always contains at least one alphabetic character so it is
-		// unambiguously alphanumeric and never purely numeric.
+		// ID が数字だけにならず、必ず英字を1文字以上含む英数字になるようにする
+		// （含まない場合は生成し直す）。
 		if strings.ContainsAny(id, "abcdef") {
 			return id, nil
 		}
 	}
 }
 
+// envInt64 は環境変数 name を正の int64 として読み取る。未設定なら def を返し、
+// 数値でない・0 以下の場合は警告ログを出して def を返す。
 func envInt64(name string, def int64) int64 {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -199,6 +216,7 @@ func safeFilename(name, fallback string) string {
 	if name == "" || name == "." || name == ".." {
 		return fallback
 	}
+	// 長すぎる名前は末尾 200 バイトだけ残す（拡張子を保つため後ろ側を使う）
 	if len(name) > 200 {
 		name = name[len(name)-200:]
 	}
@@ -211,6 +229,7 @@ func isBodyTooLarge(err error) bool {
 	if errors.As(err, &mbe) {
 		return true
 	}
+	// 型で判別できない形にラップされている場合に備え、エラーメッセージでも判定する
 	return err != nil && strings.Contains(err.Error(), "request body too large")
 }
 
@@ -236,6 +255,7 @@ func checkImageFile(f multipart.File, header *multipart.FileHeader) (int, string
 	if header.Size > maxImageUploadBytes {
 		return http.StatusRequestEntityTooLarge, fmt.Sprintf("Thumbnail exceeds the maximum size of %d bytes", maxImageUploadBytes)
 	}
+	// http.DetectContentType が見るのは先頭 512 バイトまでなので、その分だけ読む
 	buf := make([]byte, 512)
 	n, err := io.ReadFull(f, buf)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -256,6 +276,8 @@ func submitToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// 1. 別 goroutine で multipart 本文（target_service と file）をパイプに書き込む。
+	//    失敗時は CloseWithError で読み込み側（HTTP 送信）にエラーを伝える。
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	done := make(chan struct{})
@@ -282,6 +304,7 @@ func submitToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 		<-done
 	}()
 
+	// 2. パイプの読み込み側を本文にして sfsp-api へ POST する
 	req, err := http.NewRequestWithContext(ctx, "POST", sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SFSP request: %w", err)
@@ -295,6 +318,7 @@ func submitToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	}
 	defer resp.Body.Close()
 
+	// 3. 応答を最大 1 MiB まで読み、2xx 以外はエラー、2xx なら JSON を解析して返す
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SFSP response: %w", err)
@@ -350,7 +374,10 @@ func ensureGameSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// main は環境変数から設定を読み込み、DB・MinIO・Redis に接続してから
+// /api/games 配下のルートを登録し、ポート 8082 で HTTP サーバーを起動する。
 func main() {
+	// 1. ロガーを初期化する
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -358,6 +385,7 @@ func main() {
 	defer zapLogger.Sync()
 	logger = zapLogger.Sugar()
 
+	// 2. 環境変数から設定を読み込む
 	ctx := context.Background()
 	databaseUrl := os.Getenv("DATABASE_URL")
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
@@ -372,6 +400,7 @@ func main() {
 	maxGameUploadBytes = envInt64("MAX_GAME_UPLOAD_BYTES", maxGameUploadBytes)
 	maxImageUploadBytes = envInt64("MAX_IMAGE_UPLOAD_BYTES", maxImageUploadBytes)
 
+	// 3. 必須の設定を確認する（SFSP_API_KEY は未設定でも起動はする）
 	if sfspApiUrl == "" {
 		logger.Fatalf("SFSP_API_URL environment variable is not set")
 	}
@@ -382,6 +411,7 @@ func main() {
 		logger.Fatalf("JWT_SECRET environment variable is not set")
 	}
 
+	// 4. 共通設定を読み込み、DB に接続してスキーマを用意する
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
@@ -399,6 +429,7 @@ func main() {
 		logger.Fatalf("Failed to ensure game schema: %v", err)
 	}
 
+	// 5. MinIO クライアントを作成し、Redis（トークンの blocklist 確認に使う）に接続する
 	minioClient, err = minio.New(minioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
 		Secure: minioUseSSL,
@@ -411,6 +442,13 @@ func main() {
 		logger.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 6. ルートを登録してサーバーを起動する（一覧・詳細は認証任意、更新系は authMiddleware 必須）
+	// 保存量・ディスク・処理待ちの判定と、分割アップロードの準備
+	initUploadGuard(context.Background(), maxGameUploadBytes)
+
+	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
+	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
+	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
 	r := gin.Default()
 	// multipart の解析で 8 MiB を超える部分はディスクへ（parseMultipartLimited と合わせる）
 	r.MaxMultipartMemory = 8 << 20
@@ -418,20 +456,36 @@ func main() {
 	{
 		api.GET("", listGamesHandler)
 		api.GET("/:id", gameDetailsHandler)
-		api.POST("/upload", authMiddleware(), uploadGameHandler)
-		api.PUT("/:id", authMiddleware(), updateGameHandler)
+		api.POST("/upload", authMiddleware(), uploadLimitMiddleware(uploadLimits), uploadGameHandler)
+		// 分割アップロード（Cloudflare の 100 MB 制限への対応）
+		registerChunkRoutes(api, "/upload/chunks", authMiddleware())
+		api.PUT("/:id", authMiddleware(), imageLimitMiddleware(), updateGameHandler)
 		api.DELETE("/:id", authMiddleware(), deleteGameHandler)
 		api.DELETE("/:id/thumbnail", authMiddleware(), deleteThumbnailHandler)
 		api.PUT("/adjust/:id", authMiddleware(), adjustGameHandler)
 	}
 
 	logger.Infof("Game API service (read/write) starting on port 8082 (max game upload %d bytes, max image %d bytes)", maxGameUploadBytes, maxImageUploadBytes)
-	if err := r.Run(":8082"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（大きなアップロードを受けるので本文の読み取りは長めに許す）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8082",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		logger.Fatalf("Failed to run server: %v", err)
 	}
 }
 
+// uploadGameHandler は POST /api/games/upload を処理する。ゲーム ZIP（必須）と
+// サムネイル（任意）を検証し、games に 'scanning' 状態の行を作ってから sfsp-api に
+// スキャンを依頼し、202 とゲーム ID を返す。公開処理はスキャン完了後に game-worker が行う。
 func uploadGameHandler(c *gin.Context) {
+	// 認証済みユーザー ID を取得して UUID として検証する
 	userIDStr := c.GetString("userID")
 	if userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user session"})
@@ -450,6 +504,7 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
+	// フォーム項目を取り出し、タイトル必須とチームへの投稿権限を確認する
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 	teamID := c.PostForm("team_id")
@@ -463,18 +518,22 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
-	gameFile, gameFileHeader, err := c.Request.FormFile("game")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Game ZIP file is required"})
+	// ゲームファイルを取り出し、サイズ上限を確認する（分割アップロードなら upload_id から組み立て済みのファイルを開く）
+	gameFile, gameOrigName, gameFileSize, ok := openMainUpload(c, "game")
+	if !ok {
 		return
 	}
 	defer gameFile.Close()
 
-	if gameFileHeader.Size > maxGameUploadBytes {
+	if gameFileSize > maxGameUploadBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("Game file exceeds the maximum size of %d bytes", maxGameUploadBytes)})
 		return
 	}
-	gameFilename := safeFilename(gameFileHeader.Filename, "game.zip")
+	// 保存量・ディスクの空き・処理待ちを確かめる
+	if !guardUploadSize(c, gameFileSize) {
+		return
+	}
+	gameFilename := safeFilename(gameOrigName, "game.zip")
 
 	// ファイル形式チェック (ZIP)
 	buffer := make([]byte, 512)
@@ -490,6 +549,7 @@ func uploadGameHandler(c *gin.Context) {
 	contentType := http.DetectContentType(buffer[:n])
 	isZipExtension := strings.HasSuffix(strings.ToLower(gameFilename), ".zip")
 
+	// 内容判定と拡張子のどちらか一方が ZIP なら通す（実際に ZIP として読めるかは次の検証で確かめる）
 	if contentType != "application/zip" && !isZipExtension {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{
 			"error":                 "Unsupported file type. Only ZIP files are allowed.",
@@ -501,7 +561,7 @@ func uploadGameHandler(c *gin.Context) {
 	}
 
 	// Unity WebGLビルドのZIPファイルかどうかの検証
-	verificationResult, err := verifyUnityWebGLZip(gameFile, gameFileHeader.Size)
+	verificationResult, err := verifyUnityWebGLZip(gameFile, gameFileSize)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to verify ZIP file: %v", err)})
 		return
@@ -533,6 +593,7 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
+	// ゲーム ID を採番する
 	gameID, err := generateRandomID()
 	if err != nil {
 		logger.Errorf("Error generating random ID: %v", err)
@@ -540,6 +601,7 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
+	// team_id が空なら NULL（全体公開）として保存する
 	teamIDVal := interface{}(teamID)
 	if teamID == "" {
 		teamIDVal = nil
@@ -551,13 +613,14 @@ func uploadGameHandler(c *gin.Context) {
 	_, err = db.Exec(
 		context.Background(),
 		`INSERT INTO games
-        (id, user_id, title, description, status, team_id)
-        VALUES ($1, $2, $3, $4, 'scanning', $5)`,
+        (id, user_id, title, description, status, team_id, upload_bytes)
+        VALUES ($1, $2, $3, $4, 'scanning', $5, $6)`,
 		gameID,
 		userUUID,
 		title,
 		description,
 		teamIDVal,
+		gameFileSize,
 	)
 	if err != nil {
 		logger.Errorf("Error creating initial game record: %v", err)
@@ -573,6 +636,7 @@ func uploadGameHandler(c *gin.Context) {
 		c.JSON(status, gin.H{"error": msg})
 	}
 
+	// ゲーム ZIP を sfsp-api に送ってスキャンを依頼する（タイムアウト 10 分）
 	sfspRespData, err := submitToSFSP(c.Request.Context(), gameFile, gameFilename, "game", 10*time.Minute)
 	if err != nil {
 		logger.Errorf("[GameID: %s] Error forwarding file to SFSP: %v", gameID, err)
@@ -598,6 +662,7 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
+	// サムネイルがあれば同様に sfsp-api へ送り、そのジョブ ID を保存する
 	if hasThumbnail {
 		thumbFilename := safeFilename(thumbnailHeader.Filename, "thumbnail")
 		thumbSfspResp, err := submitToSFSP(c.Request.Context(), thumbnailFile, thumbFilename, "game-thumbnail", 2*time.Minute)
@@ -634,6 +699,9 @@ const maxWasmScanBytes int64 = 512 << 20
 // Unity の wasm に含まれるキーワード
 var unityWasmKeywords = [][]byte{[]byte("il2cpp"), []byte("UnityEngine")}
 
+// verifyUnityWebGLZip は ZIP 内の .wasm / .wasm.br / .wasm.gz を順に調べ、Unity のキーワードを
+// 含むものが見つかれば有効と判定する。CheckedFile には最後に調べた wasm のファイル名が入る。
+// ZIP として読めない場合や wasm の展開に失敗した場合は error を返す。
 func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, error) {
 	result := &VerificationResult{}
 
@@ -643,6 +711,7 @@ func verifyUnityWebGLZip(file multipart.File, size int64) (*VerificationResult, 
 	}
 
 	for _, f := range zipReader.File {
+		// 拡張子から圧縮形式を決める（wasm 以外のファイルは飛ばす）
 		var compression string
 		switch {
 		case strings.HasSuffix(f.Name, ".wasm"):
@@ -698,6 +767,7 @@ func scanWasmForUnity(f *zip.File, compression string) (bool, error) {
 // チャンクの境界をまたぐキーワードを見落とさないよう、前のチャンクの末尾を重ねて検索する。
 // （wasm はバイナリなので、改行区切りの bufio.Scanner だと長い行で ErrTooLong になりうる）
 func containsUnityKeyword(r io.Reader) (bool, error) {
+	// 重ねる長さは「最長キーワードの長さ - 1」
 	overlap := 0
 	for _, kw := range unityWasmKeywords {
 		if len(kw)-1 > overlap {
@@ -708,6 +778,7 @@ func containsUnityKeyword(r io.Reader) (bool, error) {
 	buf := make([]byte, overlap+chunkSize)
 	carry := 0
 	for {
+		// 前回の末尾（carry バイト）の後ろに続きを読み込み、全体を検索窓にする
 		n, err := io.ReadFull(r, buf[carry:])
 		window := buf[:carry+n]
 		for _, kw := range unityWasmKeywords {
@@ -721,10 +792,14 @@ func containsUnityKeyword(r io.Reader) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("error scanning wasm file: %w", err)
 		}
+		// 窓の末尾 overlap バイトをバッファ先頭へ移し、次の読み込みと重ねて検索する
 		carry = copy(buf, window[len(window)-overlap:])
 	}
 }
 
+// listGamesHandler は GET /api/games を処理する。公開中（status = 'public'）のゲームを
+// 新しい順に最大 50 件返す。q でタイトルの部分一致検索（大文字小文字を区別しない）、
+// team でチーム限定ゲームの一覧（閲覧権限が必要）に切り替える。
 func listGamesHandler(c *gin.Context) {
 	searchTerm := c.Query("q")
 	teamToken := c.Query("team")
@@ -736,6 +811,7 @@ func listGamesHandler(c *gin.Context) {
 	argIdx := 1
 	if teamToken != "" {
 		// チーム限定の一覧は閲覧権限（can_view）がある場合だけ返す
+		// 検証に通ったトークンだけを team-service に転送する（無効なら匿名として問い合わせる）
 		authHeader := ""
 		if optionalAuth(c) != nil {
 			authHeader = c.GetHeader("Authorization")
@@ -763,6 +839,7 @@ func listGamesHandler(c *gin.Context) {
 	}
 	whereClause := "WHERE " + strings.Join(whereConds, " AND ")
 
+	// 条件はプレースホルダーで渡すので、検索語や team の値が SQL に直接埋め込まれることはない
 	var rows pgx.Rows
 	var err error
 	rows, err = db.Query(context.Background(),
@@ -778,6 +855,7 @@ func listGamesHandler(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// 空配列で初期化し、該当なしでも null ではなく [] を返す。読み取りに失敗した行は飛ばす。
 	games := []Game{}
 	for rows.Next() {
 		var g Game
@@ -785,12 +863,14 @@ func listGamesHandler(c *gin.Context) {
 			logger.Errorf("Error scanning game row: %v", err)
 			continue
 		}
+		// team_id は SELECT していないが、条件から全行が teamToken（全体公開なら空）と一致する
 		g.TeamID = teamToken
 		games = append(games, g)
 	}
 	c.JSON(http.StatusOK, games)
 }
 
+// gameDetailsHandler は GET /api/games/:id を処理し、ゲーム1件の詳細を返す。
 // gameDetailsHandler の公開範囲:
 //   - 投稿者本人（と管理者）は status に関係なく自分のゲームを見られる
 //   - それ以外は status = 'public' のものだけ（それ以外は 404）
@@ -812,16 +892,19 @@ func gameDetailsHandler(c *gin.Context) {
 		return
 	}
 
+	// 投稿者本人か管理者なら、内部情報も含めてそのまま返す
 	viewer := optionalAuth(c)
 	if viewer != nil && (viewer.UserID == g.UploaderID || viewer.IsAdmin) {
 		c.JSON(http.StatusOK, g)
 		return
 	}
 
+	// 非公開のゲームは存在自体を明かさないよう 404 にする
 	if g.Status != "public" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Game not found"})
 		return
 	}
+	// チーム限定のゲームは team-service に閲覧権限を確認する
 	if g.TeamID != "" {
 		authHeader := ""
 		if viewer != nil {
@@ -844,6 +927,9 @@ func gameDetailsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, g)
 }
 
+// updateGameHandler は PUT /api/games/:id を処理する。投稿者本人だけがタイトルと説明を
+// 更新でき、サムネイルが添付されていれば sfsp-api にスキャンを依頼して 202 を返す
+// （サムネイルの差し替え自体はスキャン完了後に game-worker が行う）。
 func updateGameHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	if gameID == "" {
@@ -851,6 +937,7 @@ func updateGameHandler(c *gin.Context) {
 		return
 	}
 
+	// 投稿者本人かを確認する（管理者でも他人のゲームは編集できない）
 	userID := c.GetString("userID")
 	var uploaderID string
 	err := db.QueryRow(context.Background(), "SELECT user_id FROM games WHERE id = $1", gameID).Scan(&uploaderID)
@@ -882,6 +969,7 @@ func updateGameHandler(c *gin.Context) {
 		}
 	}
 
+	// タイトルと説明を更新する
 	title := c.PostForm("title")
 	description := c.PostForm("description")
 
@@ -894,11 +982,13 @@ func updateGameHandler(c *gin.Context) {
 		return
 	}
 
+	// サムネイルが無ければここで完了
 	if errThumb == http.ErrMissingFile {
 		c.JSON(http.StatusOK, gin.H{"message": "Game details updated successfully"})
 		return
 	}
 
+	// サムネイルを sfsp-api に送り、そのジョブ ID を保存する
 	thumbFilename := safeFilename(thumbnailHeader.Filename, "thumbnail")
 	thumbSfspResp, err := submitToSFSP(c.Request.Context(), thumbnailFile, thumbFilename, "game-thumbnail", 2*time.Minute)
 	if err != nil {
@@ -930,6 +1020,8 @@ func updateGameHandler(c *gin.Context) {
 	})
 }
 
+// adjustGameHandler は PUT /api/games/adjust/:id を処理し、投稿者本人が指定した
+// 表示調整値（scale・offset_x・offset_y）を保存する。値の範囲は検証しない。
 func adjustGameHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	if gameID == "" {
@@ -937,6 +1029,7 @@ func adjustGameHandler(c *gin.Context) {
 		return
 	}
 
+	// 投稿者本人かを確認する
 	userID := c.GetString("userID")
 	var uploaderID string
 	err := db.QueryRow(context.Background(), "SELECT user_id FROM games WHERE id = $1", gameID).Scan(&uploaderID)
@@ -967,6 +1060,8 @@ func adjustGameHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Adjustments saved successfully"})
 }
 
+// deleteGameHandler は DELETE /api/games/:id を処理する。投稿者本人または管理者が、
+// MinIO 上のゲームファイルとサムネイルを削除した後に DB の行を削除する。
 func deleteGameHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	if gameID == "" {
@@ -974,6 +1069,7 @@ func deleteGameHandler(c *gin.Context) {
 		return
 	}
 
+	// 投稿者本人または管理者かを確認する
 	userID := c.GetString("userID")
 	isAdmin := c.GetBool("isAdmin")
 
@@ -992,6 +1088,8 @@ func deleteGameHandler(c *gin.Context) {
 	ctx := context.Background()
 	objectPrefix := fmt.Sprintf("%s/", gameID)
 
+	// バケット内の <gameID>/ 配下のオブジェクトを列挙してチャネルに流し、RemoveObjects でまとめて削除する。
+	// 列挙でエラーが出たらそこで列挙を打ち切る（それまでに流した分だけが削除される）。
 	objectsCh := make(chan minio.ObjectInfo)
 	go func() {
 		defer close(objectsCh)
@@ -1014,8 +1112,8 @@ func deleteGameHandler(c *gin.Context) {
 		return
 	}
 
-	// Thumbnail is stored as a sibling object (thumbnails/<gameID>), not under
-	// games/<gameID>/, so delete it explicitly to avoid orphaned files.
+	// サムネイルはゲーム本体（バケット内の <gameID>/ 配下）ではなく、別のオブジェクト
+	// thumbnails/<gameID> に保存されているので、孤立したファイルが残らないよう明示的に削除する。
 	thumbObjectName := fmt.Sprintf("thumbnails/%s", gameID)
 	if err := minioClient.RemoveObject(ctx, bucketName, thumbObjectName, minio.RemoveObjectOptions{}); err != nil {
 		logger.Errorf("Error deleting thumbnail %s for game %s: %v", thumbObjectName, gameID, err)
@@ -1023,6 +1121,7 @@ func deleteGameHandler(c *gin.Context) {
 		return
 	}
 
+	// ストレージの削除が終わってから DB の行を削除する
 	_, err = db.Exec(ctx, "DELETE FROM games WHERE id = $1", gameID)
 	if err != nil {
 		logger.Errorf("Error deleting game record %s from DB: %v", gameID, err)
@@ -1033,6 +1132,8 @@ func deleteGameHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Game deleted successfully"})
 }
 
+// deleteThumbnailHandler は DELETE /api/games/:id/thumbnail を処理する。投稿者本人だけが、
+// MinIO 上のサムネイルを削除して thumbnail_url を NULL に戻せる。
 func deleteThumbnailHandler(c *gin.Context) {
 	gameID := c.Param("id")
 	if gameID == "" {
@@ -1040,6 +1141,7 @@ func deleteThumbnailHandler(c *gin.Context) {
 		return
 	}
 
+	// 投稿者本人かを確認し、現在のサムネイル URL を取得する
 	userID := c.GetString("userID")
 	var uploaderID string
 	var thumbnailURL sql.NullString
@@ -1058,6 +1160,7 @@ func deleteThumbnailHandler(c *gin.Context) {
 		return
 	}
 
+	// thumbnail_url（"/games/thumbnails/<gameID>" の形式）から先頭の "/games/" を除いて MinIO のオブジェクト名にする
 	if thumbnailURL.Valid && thumbnailURL.String != "" {
 		objectName := strings.TrimPrefix(thumbnailURL.String, "/games/")
 		err := minioClient.RemoveObject(context.Background(), bucketName, objectName, minio.RemoveObjectOptions{})
@@ -1092,6 +1195,7 @@ func validateToken(ctx context.Context, authHeader string) (*authInfo, int, stri
 	if authHeader == "" {
 		return nil, http.StatusUnauthorized, "Authorization header is missing"
 	}
+	// 1. 署名を検証する（アルゴリズムを HS256 に固定し、alg 差し替え攻撃を防ぐ）
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return jwtSecret, nil
@@ -1104,6 +1208,7 @@ func validateToken(ctx context.Context, authHeader string) (*authInfo, int, stri
 		return nil, http.StatusUnauthorized, "Invalid token"
 	}
 
+	// 2. jti が blocklist に載っていないか（ログアウト済みでないか）を Redis で確認する
 	jti, _ := claims["jti"].(string)
 	if jti == "" {
 		return nil, http.StatusUnauthorized, "Invalid token"
@@ -1117,6 +1222,7 @@ func validateToken(ctx context.Context, authHeader string) (*authInfo, int, stri
 		return nil, http.StatusUnauthorized, "Token has been invalidated"
 	}
 
+	// 3. ユーザー ID を sub・userID・user_id・id の順に探して取り出し、UUID 形式であることを確認する
 	var userID string
 	for _, key := range []string{"sub", "userID", "user_id", "id"} {
 		if val, ok := claims[key].(string); ok && val != "" {
@@ -1146,6 +1252,8 @@ func optionalAuth(c *gin.Context) *authInfo {
 	return info
 }
 
+// authMiddleware は認証必須のルート用ミドルウェア。validateToken に失敗したら
+// そのステータスで中断し、成功したら userID と isAdmin を gin.Context に設定する。
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, status, msg := validateToken(c.Request.Context(), c.GetHeader("Authorization"))

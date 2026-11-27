@@ -1,5 +1,5 @@
-# Use the official ClamAV image as a base
-FROM clamav/clamav:latest
+# Use the official ClamAV image as a base（latest だと古いイメージが残り続けるので版を固定する）
+FROM clamav/clamav:1.5.5
 
 # clamscan の一時ファイルは /tmp に書かれる。サンドボックスは /tmp にサイズ上限付きの tmpfs をマウントするため、イメージ側での用意は不要
 

@@ -15,6 +15,10 @@ import {
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
+/**
+ * 新規登録画面。一般ユーザーは Google で登録し、管理者は管理者コードを入力して
+ * メールアドレスとパスワードで登録する（ローカル登録は管理者アカウントのみ）。
+ */
 const RegisterPage = () => {
   const [adminCode, setAdminCode] = useState('');
   const [email, setEmail] = useState('');
@@ -23,10 +27,13 @@ const RegisterPage = () => {
   const [success, setSuccess] = useState('');
   const navigate = useNavigate();
 
+  // Google での登録はログインと同じ OAuth 開始エンドポイントへ遷移する（初回ログイン時にアカウントが作られる）。
   const handleGoogleLogin = () => {
     window.location.href = '/api/auth/google/login';
   };
 
+  // 管理者コード付きで管理者アカウントを登録し、成功したら 2 秒後にログイン画面へ遷移する。
+  // 管理者コードが一致しない場合などはサーバーのエラーメッセージを表示する。
   const handleAdminSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -98,6 +105,7 @@ const RegisterPage = () => {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
+              {/* 管理者コード。バックエンドの設定値と照合され、一致しなければ登録は拒否される */}
               <TextField
                 margin="normal"
                 required
