@@ -6,11 +6,14 @@ import VideocamIcon from '@mui/icons-material/Videocam';
 import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
 import PublicIcon from '@mui/icons-material/Public';
 
+// 一覧に表示するコンテンツ 1 件（動画・ゲーム・静的サイトを共通の形にそろえたもの）。
 interface Content {
   id: string;
   title: string;
   thumbnail_url?: string;
+  // 投稿者 ID（動画・ゲーム）。型は number だが、API は UUID 文字列を返す
   uploader_id: number;
+  // 投稿者 ID（静的サイトはこの名前で返る）
   user_id?: number;
   type: 'video' | 'game' | 'static-site';
   uploader_name?: string;
@@ -19,29 +22,38 @@ interface Content {
   entry_point_path?: string;
 }
 
+/**
+ * トップページ。動画・ゲーム・静的サイトの一覧をまとめて取得し、
+ * タブ（すべて / 種別ごと）とキーワード検索で表示する。
+ */
 const HomePage = () => {
   const [allNewContents, setAllNewContents] = useState<Content[]>([]);
   const [videos, setVideos] = useState<Content[]>([]);
   const [games, setGames] = useState<Content[]>([]);
   const [staticSites, setStaticSites] = useState<Content[]>([]);
+  // 初回読み込み中かどうか（検索による再取得中は isSearching を使う）
   const [loading, setLoading] = useState(true);
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState('');
   const [tabIndex, setTabIndex] = useState(0);
   const [searchTerm, setSearchTerm] = useState('');
+  // 入力が 500ms 止まった時点で確定する検索語（API 呼び出しに使う）
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState('');
   const theme = useTheme();
   // staticSiteDomainはHomePageでは直接使わないため削除
 
+  // 検索語の入力をデバウンスし、入力のたびに API を呼ばないようにする。
   useEffect(() => {
     const handler = setTimeout(() => setDebouncedSearchTerm(searchTerm), 500);
     return () => clearTimeout(handler);
   }, [searchTerm]);
 
+  // 確定した検索語が変わるたびに 3 種類の一覧を取得し、投稿者情報を付けて state に保存する。
   useEffect(() => {
     const fetchContents = async () => {
       try {
         setIsSearching(true);
+        // 1. 3 種類の一覧を並行取得する（Cache-Control: no-store でキャッシュを使わないよう指定する）
         const query = debouncedSearchTerm ? `?q=${encodeURIComponent(debouncedSearchTerm)}` : '';
 
         const [videosRes, gamesRes, staticSitesRes] = await Promise.all([
@@ -50,12 +62,15 @@ const HomePage = () => {
           axios.get(`/api/static-sites${query}`, { headers: { 'Cache-Control': 'no-store' } }),
         ]);
 
+        // 2. 種別を付けて共通の形にそろえる（動画は thumbnail_path をサムネ URL として使う）
         const videoData: Content[] = (videosRes.data || []).map((v: any) => ({ ...v, type: 'video', thumbnail_url: v.thumbnail_path }));
         const gameData: Content[] = (gamesRes.data || []).map((g: any) => ({ ...g, type: 'game' }));
         const staticSiteData: Content[] = (staticSitesRes.data || []).map((s: any) => ({ ...s, type: 'static-site' }));
 
+        // 3. 全種別をまとめて新しい順に並べる
         const combinedContents = [...videoData, ...gameData, ...staticSiteData].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         
+        // 4. 投稿者 ID（uploader_id または user_id）を重複なく集め、プロフィールを取得する
         const uploaderIds = [...new Set(combinedContents.map(c => c.uploader_id || c.user_id).filter(id => id != null && id !== 0))];
 
         if (uploaderIds.length > 0) {
@@ -67,6 +82,7 @@ const HomePage = () => {
           ));
           const profileMap = new Map(profiles.map(p => [p.id, p]));
 
+          // 投稿者名・アイコンと、サムネが無い場合の既定画像を付ける
           const enrich = (content: Content) => ({
             ...content,
             uploader_name: profileMap.get(content.uploader_id || content.user_id)?.username || 'Unknown',
@@ -79,6 +95,7 @@ const HomePage = () => {
           setGames(gameData.map(enrich));
           setStaticSites(staticSiteData.map(enrich));
         } else {
+          // 投稿者 ID が 1 件も無い場合は付与処理をしない（既定サムネも付かない）
           setAllNewContents(combinedContents);
           setVideos(videoData);
           setGames(gameData);
@@ -96,25 +113,28 @@ const HomePage = () => {
     fetchContents();
   }, [debouncedSearchTerm]);
 
+  // タブ切り替えと検索欄入力のハンドラ。
   const handleTabChange = useCallback((_event: React.SyntheticEvent, newValue: number) => setTabIndex(newValue), []);
   const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => setSearchTerm(e.target.value), []);
 
-  // サムネ画像を毎回強制的に取得するためのキャッシュバスタを付与する。
-  // 同一URLをブラウザがキャッシュして、アップロード後の新しいサムネが旧画像のまま
-  // 表示される問題を防ぐ（バックエンドは毎回ランダム名でサムネを差し替える）。
+  // サムネ URL にキャッシュバスタ（v=<URL 自身>）を付与する。
+  // v の値は URL から決まるため、同じ URL なら同じ値になり、毎回の再取得にはならない。
+  // （バックエンドは毎回ランダム名でサムネを差し替えるため、URL が変われば新しい画像が取得される）。
   const withCacheBuster = useCallback((url: string | undefined) => {
     if (!url) return url;
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}v=${encodeURIComponent(url)}`;
   }, []);
 
+  // 初回読み込みが終わるまではスピナーのみ表示する。
   if (loading) return <CircularProgress />;
 
+  // コンテンツのカードをグリッド表示する。カード全体が詳細ページへのリンクになる。
   const renderContentGrid = (contentArray: Content[]) => (
     <Grid container spacing={3}>
       {contentArray.map((content) => {
         const isStaticSite = content.type === 'static-site';
-        // HomePageのカードは常にStaticSiteDetailPageへのリンク
+        // 静的サイトのカードも、サイト本体ではなく詳細ページ（StaticSiteDetailPage）へリンクする
         const linkUrl = isStaticSite 
           ? `/static-sites/${content.id}`
           : `/${content.type}s/${content.id}`;
@@ -135,6 +155,7 @@ const HomePage = () => {
                   <Typography variant="body2" color="text.secondary">{content.uploader_name}</Typography>
                 </Box>
               </CardContent>
+              {/* 右上に種別アイコンを表示する */}
               <Box sx={{ position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(100, 100, 100, 0.7)', borderRadius: 1, p: '2px 4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 {content.type === 'video' ? <VideocamIcon sx={{ fontSize: 18, color: 'white' }} /> : content.type === 'game' ? <SportsEsportsIcon sx={{ fontSize: 18, color: 'white' }} /> : <PublicIcon sx={{ fontSize: 18, color: 'white' }} />}
               </Box>
@@ -159,6 +180,7 @@ const HomePage = () => {
             <Tab label="静的サイト" />
           </Tabs>
         </Box>
+        {/* エラー時はメッセージのみ、それ以外は選択中のタブの一覧を表示する */}
         {error ? <Alert severity="error">{error}</Alert> : (
           <>
             {tabIndex === 0 && renderContentGrid(allNewContents)}

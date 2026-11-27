@@ -4,20 +4,30 @@ import axios from 'axios';
 import { Container, Typography, Box, CircularProgress, Alert, Paper, Button, Slider, Grid } from '@mui/material';
 import { useAuth } from '../context/AuthContext';
 
+/** GET /api/games/:id が返すゲーム情報のうち、表示調整画面で使う項目。 */
 interface Game {
-  id: string; // Changed from number to string
+  id: string; // number から string に変更
   title: string;
   description: string;
   game_url: string;
   status: string;
-  processing_details: string; // Added
+  processing_details: string; // 追加
+  /** 投稿者が保存した拡大率（基準倍率に掛ける係数）。 */
   scale: number;
+  /** 表示位置の横方向オフセット（px）。 */
   offset_x: number;
+  /** 表示位置の縦方向オフセット（px）。 */
   offset_y: number;
+  /** ゲーム本来の幅（px）。未設定なら 0 などの偽値になる。 */
   native_width: number;
+  /** ゲーム本来の高さ（px）。未設定なら 0 などの偽値になる。 */
   native_height: number;
 }
 
+/**
+ * ゲームの表示倍率と位置（オフセット）を調整して保存するページ。
+ * 800x450 の枠内に iframe でゲームを表示し、スライダーの値をリアルタイムにプレビューする。
+ */
 const AdjustGamePage = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -27,11 +37,14 @@ const AdjustGamePage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  // スライダーで編集中の調整値（保存済みの値で初期化される）
   const [scale, setScale] = useState(1.0);
   const [offsetX, setOffsetX] = useState(0);
   const [offsetY, setOffsetY] = useState(0);
 
+  // ゲーム情報を取得し、公開状態（public）になるまで 2 秒ごとにポーリングする。
   useEffect(() => {
+    // ID が無い場合は読み込み中表示のままにする
     if (!id) {
       setLoading(true);
       return;
@@ -39,6 +52,7 @@ const AdjustGamePage = () => {
 
     let pollingInterval: number | null = null;
 
+    // ポーリングを停止する（多重に呼ばれても安全）。
     const stopPolling = () => {
       if (pollingInterval) {
         clearInterval(pollingInterval);
@@ -46,6 +60,7 @@ const AdjustGamePage = () => {
       }
     };
 
+    // ゲーム情報を 1 回取得し、status に応じて状態更新とポーリング停止を行う。
     const fetchGame = async () => {
       try {
         const response = await axios.get(`/api/games/${id}`);
@@ -53,16 +68,19 @@ const AdjustGamePage = () => {
         setGame(fetchedGame);
 
         if (fetchedGame.status === 'public') {
+          // 公開済み: 保存済みの調整値をスライダーに反映して停止する
           setScale(fetchedGame.scale);
           setOffsetX(fetchedGame.offset_x);
           setOffsetY(fetchedGame.offset_y);
           setLoading(false);
           stopPolling();
         } else if (['error', 'failed', 'invalid', 'quarantined'].includes(fetchedGame.status)) {
+          // 失敗系の終端状態: エラーを表示して停止する
           setError(`ゲーム処理に失敗しました: ${fetchedGame.description}`);
           setLoading(false);
           stopPolling();
         } else {
+          // スキャン中・処理中など: 読み込み中表示のままポーリングを続ける
           setLoading(true);
         }
       } catch (err) {
@@ -73,13 +91,15 @@ const AdjustGamePage = () => {
     };
 
     fetchGame();
-    pollingInterval = window.setInterval(fetchGame, 2000); // Poll every 2 seconds
+    pollingInterval = window.setInterval(fetchGame, 2000); // 2 秒ごとにポーリングする
 
+    // アンマウント時や id 変更時にポーリングを止める
     return () => {
       stopPolling();
     };
   }, [id]);
 
+  /** 現在の調整値を PUT /api/games/adjust/:id で保存し、詳細ページへ遷移する。 */
   const handleSave = async () => {
     try {
       await axios.put(
@@ -94,6 +114,7 @@ const AdjustGamePage = () => {
     }
   };
 
+  // 読み込み中・処理中は進捗表示を出す
   if (loading || (game && game.status === 'processing')) {
     return (
       <Container>
@@ -111,11 +132,13 @@ const AdjustGamePage = () => {
   if (error) return <Alert severity="error">{error}</Alert>;
   if (!game) return <Alert severity="warning">ゲームが見つかりません。</Alert>;
 
+  // プレビュー枠のサイズと、ゲーム本来のサイズ（未設定時は 960x720 とみなす）
   const targetDisplayWidth = 800;
   const targetDisplayHeight = 450;
   const nativeWidth = game.native_width || 960;
   const nativeHeight = game.native_height || 720;
 
+  // 枠に収まる基準倍率（縦横比を保つ）に、ユーザー指定の拡大率を掛けた最終倍率を求める
   const baseScale = Math.min(
     targetDisplayWidth / nativeWidth,
     targetDisplayHeight / nativeHeight
@@ -131,6 +154,7 @@ const AdjustGamePage = () => {
         スライダーを使って、ゲームの表示倍率と位置を調整してください。800x450のフレーム内にゲームが完璧に収まるようにします。
       </Typography>
 
+      {/* プレビュー枠: 800x450 の黒背景。はみ出した部分は overflow: hidden で隠す */}
       <Paper
         elevation={3}
         sx={{
@@ -147,6 +171,7 @@ const AdjustGamePage = () => {
           alignItems: 'center',
         }}
       >
+        {/* ゲーム本来のサイズで描画し、CSS transform で移動・拡縮する */}
         <Box
           sx={{
             width: `${nativeWidth}px`,
@@ -168,6 +193,7 @@ const AdjustGamePage = () => {
         </Box>
       </Paper>
 
+      {/* 拡大率・横位置・縦位置の調整スライダー */}
       <Grid container spacing={4} alignItems="center">
         <Grid item xs={12} md={4}>
           <Typography gutterBottom>拡大率 (Scale)</Typography>

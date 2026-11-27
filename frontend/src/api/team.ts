@@ -1,7 +1,9 @@
 import axios from 'axios';
 
+/** team-service が返すチーム情報。 */
 export interface Team {
   id: string;
+  // URL・API のパスでチームを指定するときに使う識別子
   token: string;
   name: string;
   description: string | null;
@@ -10,15 +12,18 @@ export interface Team {
   allow_member_invite?: boolean;
   created_by: string | null;
   created_at: string;
+  // フロントエンド側で付ける「参加済み」フラグ（API の応答には含まれない）
   _joined?: boolean;
 }
 
+/** チームメンバー 1 人分の情報。 */
 export interface TeamMember {
   user_id: string;
   role: string;
   joined_at: string;
 }
 
+/** チームへの参加申請。 */
 export interface JoinRequest {
   id: string;
   team_id: string;
@@ -32,15 +37,21 @@ export interface JoinRequest {
 // axios interceptor (AuthContext) が Authorization ヘッダーを自動付与するため、
 // ここでは相対パスのみを指定する。
 export const teamApi = {
+  // 公開チームの一覧（認証不要）
   listPublic: () => axios.get<Team[]>('/api/teams'),
+  // 自分が所属するチームの一覧
   listMine: () => axios.get<Team[]>('/api/teams/mine'),
   get: (teamToken: string) => axios.get<Team>(`/api/teams/${teamToken}`),
+  // チームを作成する
   create: (data: { name: string; description?: string; is_public?: boolean; auto_approve?: boolean }) =>
     axios.post<Team>('/api/teams', data),
+  // チーム設定を部分更新する（PATCH）
   update: (teamToken: string, data: { name?: string; description?: string; is_public?: boolean; auto_approve?: boolean; allow_member_invite?: boolean }) =>
     axios.patch(`/api/teams/${teamToken}`, data),
   deleteTeam: (teamToken: string) => axios.delete(`/api/teams/${teamToken}`),
+  // メンバー一覧を取得する
   listMembers: (teamToken: string) => axios.get<TeamMember[]>(`/api/teams/${teamToken}/members`),
+  // ユーザー ID とロールを指定してメンバーを追加する
   addMember: (teamToken: string, userId: string, role: string) =>
     axios.post(`/api/teams/${teamToken}/members`, { user_id: userId, role }),
   // 自分の userId を渡すとチームから退出する（最後の owner は 409）
@@ -51,14 +62,18 @@ export const teamApi = {
     axios.post<{ status: 'approved' | 'already_member' | 'pending'; role?: string; request_id?: string }>(
       `/api/teams/${teamToken}/join`
     ),
+  // 参加申請の一覧を取得する
   listJoinRequests: (teamToken: string) =>
     axios.get<JoinRequest[]>(`/api/teams/${teamToken}/join-requests`),
+  // 参加申請を承認または却下する（action はクエリパラメータで渡す）
   reviewJoinRequest: (teamToken: string, requestId: string, action: 'approve' | 'reject') =>
     axios.patch(`/api/teams/${teamToken}/join-requests/${requestId}`, {}, { params: { action } }),
 };
 
+// ロールの強さ。数値が大きいほど権限が強い（未知のロールは呼び出し側で 0 として扱う）。
 export const TEAM_ROLE_RANK: Record<string, number> = { owner: 3, admin: 2, member: 1 };
 
+// ロールの一覧（強い順）。
 export const TEAM_ROLES = ['owner', 'admin', 'member'] as const;
 
 // team-service の canGrantRole と同じ規則: 自分より弱いロールだけ付与できる。
@@ -69,6 +84,7 @@ export const canGrantTeamRole = (myRole: string, role: string): boolean => {
 };
 
 // 自分より弱いロールのメンバーだけ、ロール変更・削除できる。
+// また、自分が admin 以上であることも条件とする。
 export const canManageTeamMember = (myRole: string, targetRole: string): boolean =>
   (TEAM_ROLE_RANK[myRole] ?? 0) >= TEAM_ROLE_RANK.admin &&
   (TEAM_ROLE_RANK[targetRole] ?? 0) < (TEAM_ROLE_RANK[myRole] ?? 0);
@@ -81,6 +97,7 @@ export const canManageTeamMember = (myRole: string, targetRole: string): boolean
 // - 一覧は `?team=<チームトークン>` でそのチーム限定、`?q=<検索語>` でタイトル検索。
 // - 投稿時は multipart フォームの `team_id` フィールドにチームトークンを含める。
 
+/** チーム共有コンテンツ一覧の 1 件（動画・ゲーム・静的サイト共通の形）。 */
 export interface TeamContentItem {
   id: string;
   title: string;
@@ -103,6 +120,7 @@ export interface TeamContentItem {
 // コンテンツ種別
 export type TeamContentType = 'videos' | 'games' | 'sites';
 
+// チーム共有コンテンツの一覧取得・削除 API。
 export const contentApi = {
   // 一覧 (チーム限定 + 検索)
   listVideos: (teamToken: string, search?: string) =>

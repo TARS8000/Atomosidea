@@ -30,18 +30,29 @@ import (
 	"go.uber.org/zap"
 )
 
+// プロセス全体で共有する接続・設定値。main で環境変数から初期化し、ハンドラーとワーカーから参照する。
 var (
-	db                   *pgxpool.Pool
-	minioClient          *minio.Client
-	jwtSecret            []byte
-	bucketName           string
-	sfspApiUrl           string
-	sfspApiKey           string
-	internalApiKey       string
-	maxImageUploadBytes  int64 = 10 << 20
+	// db は profile-db（users テーブル）への接続プール。
+	db *pgxpool.Pool
+	// minioClient はプロフィール画像を公開配信するバケット（MINIO_BUCKET_NAME）用のクライアント。
+	minioClient *minio.Client
+	// jwtSecret は HS256 の JWT 署名検証に使う共有鍵。
+	jwtSecret []byte
+	// bucketName はプロフィール画像の保存先バケット名。
+	bucketName string
+	// sfspApiUrl / sfspApiKey はファイルスキャン基盤 sfsp-api の URL と API キー。
+	sfspApiUrl string
+	sfspApiKey string
+	// internalApiKey は /internal 配下の API を呼ぶための共有鍵。
+	internalApiKey string
+	// maxImageUploadBytes は画像 1 ファイルの上限サイズ（既定 10MiB、MAX_IMAGE_UPLOAD_BYTES で上書き可）。
+	maxImageUploadBytes int64 = 10 << 20
+	// sfspCleanMinioClient はスキャン済み（clean）ファイルを置く SFSP 側 MinIO のクライアント。
 	sfspCleanMinioClient *minio.Client
-	sfspCleanBucketName  = "clean-files"
-	sfspHTTPClient       = &http.Client{Timeout: 10 * time.Minute}
+	// sfspCleanBucketName は SFSP 側でスキャン済みファイルが置かれるバケット名。
+	sfspCleanBucketName = "clean-files"
+	// sfspHTTPClient は sfsp-api への送信用。ファイルをストリーミング送信するためタイムアウトを長めにしている。
+	sfspHTTPClient = &http.Client{Timeout: 10 * time.Minute}
 )
 
 // multipartOverheadBytes は multipart の境界やヘッダー分として、リクエスト全体の上限に上乗せする量。
@@ -55,6 +66,8 @@ type SfspUploadResponse struct {
 	JobID string `json:"job_id"`
 }
 
+// ProfileResponse はプロフィール取得 API の応答。NULL のカラムは空文字列で返す。
+// IconSFSPJobID / BackgroundSFSPJobID が空でなければ、その画像はスキャン待ちである。
 type ProfileResponse struct {
 	ID                  string `json:"id"`
 	Username            string `json:"username"`
@@ -75,11 +88,13 @@ var imageExtensions = map[string]string{
 	"image/webp": ".webp",
 }
 
+// main は環境変数・DB・MinIO・Redis を初期化し、スキャン完了イベントを処理するワーカーを起動したうえで、
+// プロフィール API の HTTP サーバーをポート 8084 で起動する。
 func main() {
 	var err error
 	ctx := context.Background()
 
-	// 必須環境変数の検証
+	// 1. 必須環境変数の検証
 	databaseUrl := os.Getenv("DATABASE_URL")
 	if databaseUrl == "" {
 		log.Fatal("DATABASE_URL environment variable is not set")
@@ -112,6 +127,7 @@ func main() {
 		log.Println("Warning: INTERNAL_API_KEY is not set; all internal endpoints will reject requests")
 	}
 
+	// 画像サイズ上限の上書き。不正な値なら起動を止める
 	if v := os.Getenv("MAX_IMAGE_UPLOAD_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
@@ -120,19 +136,20 @@ func main() {
 		maxImageUploadBytes = n
 	}
 
+	// スキャン済みファイルを取得する SFSP 側 MinIO の接続情報
 	sfspCleanMinioEndpoint := os.Getenv("SFSP_CLEAN_MINIO_ENDPOINT")
 	sfspCleanMinioAccessKey := os.Getenv("SFSP_CLEAN_MINIO_ACCESS_KEY_ID")
 	sfspCleanMinioSecretKey := os.Getenv("SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY")
 	sfspCleanMinioUseSSL := os.Getenv("SFSP_CLEAN_MINIO_USE_SSL") == "true"
 
-	// DB 接続の設定
+	// 2. DB 接続の設定
 	db, err = pgxpool.New(ctx, databaseUrl)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
 	}
 	defer db.Close()
 
-	// MinIO クライアントの初期化
+	// 3. MinIO クライアントの初期化（公開用と SFSP の clean バケット用の 2 つ）
 	minioClient, err = minio.New(minioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
 		Secure: minioUseSSL,
@@ -149,7 +166,7 @@ func main() {
 		log.Fatalf("Unable to connect to SFSP MinIO: %v", err)
 	}
 
-	// MinIO バケットの自動生成処理
+	// 4. MinIO バケットの自動生成処理
 	exists, err := minioClient.BucketExists(ctx, bucketName)
 	if err != nil {
 		log.Fatalf("Failed to check MinIO bucket existence: %v", err)
@@ -163,6 +180,7 @@ func main() {
 	}
 
 	// バケットの読み取りポリシーを公開 (Public Read) に設定
+	// プロフィール画像は "/<bucket>/<key>" の URL で直接配信するため、GetObject のみ匿名で許可する。失敗しても起動は続ける
 	policy := fmt.Sprintf(`{
        "Version": "2012-10-17",
        "Statement": [
@@ -182,6 +200,7 @@ func main() {
 		log.Printf("Successfully set public read policy for bucket: %s\n", bucketName)
 	}
 
+	// 5. ロガー・共通設定・Redis（キューとトークンのブロックリストで使う）の初期化
 	zapLogger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -198,9 +217,10 @@ func main() {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
+	// 6. スキャン完了イベントを処理するワーカーをバックグラウンドで起動
 	go profileWorker(ctx)
 
-	// ルーティング設定
+	// 7. ルーティング設定
 	r := gin.Default()
 
 	// 内部 API（Nginx からは到達させない。X-Internal-Key 必須）
@@ -210,6 +230,7 @@ func main() {
 		internal.DELETE("/users/:userId", deleteInternalUserHandler)
 	}
 
+	// 公開 API。他人のプロフィール取得（GET /:userId）以外は JWT 認証が必要
 	api := r.Group("/api/profile")
 	{
 		api.GET("/me", authMiddleware(), getMyProfileHandler)
@@ -221,7 +242,17 @@ func main() {
 	}
 
 	log.Println("Profile service starting on port 8084")
-	if err := r.Run(":8084"); err != nil {
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（本文は画像程度までなので読み取りは短め）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8084",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
 	}
 }
@@ -240,7 +271,8 @@ func internalAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// 内部サービス用の初期プロフィール作成ハンドラー
+// createInternalProfileHandler は内部サービス（auth-service）から呼ばれ、user_id と username で初期プロフィールを作成する。
+// 既にユーザー名が設定済みの行は上書きしない。
 func createInternalProfileHandler(c *gin.Context) {
 	var req struct {
 		UserID   string `json:"user_id" binding:"required"`
@@ -289,7 +321,9 @@ func deleteInternalUserHandler(c *gin.Context) {
 	ctx := c.Request.Context()
 	uid := userID.String()
 
+	// 1. 削除対象のオブジェクトを集める
 	// 削除対象のオブジェクト: DB に記録された URL と、icons/<id>- / backgrounds/<id>- で始まるもの
+	// （map を集合として使い、重複を除く）
 	objects := map[string]struct{}{}
 	var iconURL, bgURL string
 	err = db.QueryRow(ctx,
@@ -305,6 +339,7 @@ func deleteInternalUserHandler(c *gin.Context) {
 			objects[key] = struct{}{}
 		}
 	}
+	// DB に記録されていない過去の画像も残さないよう、ユーザー ID のプレフィックスで一覧して追加する
 	for _, prefix := range []string{"icons/" + uid + "-", "backgrounds/" + uid + "-"} {
 		for obj := range minioClient.ListObjects(ctx, bucketName, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 			if obj.Err != nil {
@@ -316,6 +351,7 @@ func deleteInternalUserHandler(c *gin.Context) {
 		}
 	}
 
+	// 2. 画像を削除する。既に無いオブジェクトは成功扱いにして冪等にする
 	for key := range objects {
 		if err := minioClient.RemoveObject(ctx, bucketName, key, minio.RemoveObjectOptions{}); err != nil {
 			if minio.ToErrorResponse(err).Code == "NoSuchKey" {
@@ -327,6 +363,7 @@ func deleteInternalUserHandler(c *gin.Context) {
 		}
 	}
 
+	// 3. 画像の削除がすべて成功してから DB の行を削除する（途中で失敗しても再呼び出しで残りを消せるようにするため）
 	if _, err := db.Exec(ctx, "DELETE FROM users WHERE id = $1", userID); err != nil {
 		log.Printf("Failed to delete profile row %s: %v", uid, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete profile"})
@@ -338,6 +375,7 @@ func deleteInternalUserHandler(c *gin.Context) {
 }
 
 // objectKeyFromURL は "/user-profiles/<key>" 形式の URL からオブジェクトキーを取り出す。
+// 実際には "/<bucketName>/" で始まるかで判定し、このバケット以外を指す URL や空のキーは false を返す。
 func objectKeyFromURL(u string) (string, bool) {
 	prefix := "/" + bucketName + "/"
 	if u == "" || !strings.HasPrefix(u, prefix) {
@@ -350,6 +388,8 @@ func objectKeyFromURL(u string) (string, bool) {
 	return key, true
 }
 
+// getStatusHandler は認証済みユーザーのプロフィールの status（'active' / 'pending' など）を返す。
+// 行が無い場合を含め、取得に失敗したときは 404 を返す。
 func getStatusHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	var status string
@@ -362,6 +402,7 @@ func getStatusHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": status})
 }
 
+// getMyProfileHandler は認証済みユーザー自身のプロフィールを返す。行が無ければ先に作成する。
 func getMyProfileHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	var response ProfileResponse
@@ -381,6 +422,7 @@ func getMyProfileHandler(c *gin.Context) {
 		return
 	}
 
+	// NULL のカラムは空文字列に変換して取得する
 	err := db.QueryRow(c.Request.Context(),
 		"SELECT id, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(icon_url, ''), COALESCE(background_image_url, ''), COALESCE(icon_sfsp_job_id::text, ''), COALESCE(background_sfsp_job_id::text, ''), status FROM users WHERE id = $1",
 		userID,
@@ -395,6 +437,7 @@ func getMyProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// getProfileHandler は任意のユーザーのプロフィールを返す（認証不要）。userId は UUID 形式のみ受け付ける。
 func getProfileHandler(c *gin.Context) {
 	userIdStr := c.Param("userId")
 	if _, err := uuid.Parse(userIdStr); err != nil {
@@ -417,6 +460,7 @@ func getProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// updateProfileHandler は認証済みユーザーのユーザー名と自己紹介（bio）を更新する。
 func updateProfileHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	var req struct {
@@ -440,10 +484,12 @@ func updateProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Profile updated successfully"})
 }
 
+// updateIconHandler はアイコン画像のアップロードを受け付け、スキャンに回す。
 func updateIconHandler(c *gin.Context) {
 	handleProfileImageUpload(c, "icon", "icon_sfsp_job_id", "Icon")
 }
 
+// updateBackgroundHandler は背景画像のアップロードを受け付け、スキャンに回す。
 func updateBackgroundHandler(c *gin.Context) {
 	handleProfileImageUpload(c, "background", "background_sfsp_job_id", "Background")
 }
@@ -454,6 +500,8 @@ func updateBackgroundHandler(c *gin.Context) {
 func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string) {
 	userID := c.GetString("userID")
 
+	// 1. リクエスト全体のサイズを制限する
+	// Content-Length で明らかに大きいものは先に弾き、申告が無い・偽りの場合に備えて本文も MaxBytesReader で制限する
 	if c.Request.ContentLength > maxImageUploadBytes+multipartOverheadBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File is too large"})
 		return
@@ -466,6 +514,8 @@ func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string
 		return
 	}
 
+	// 2. 対象のファイルパートを探す
+	// ParseMultipartForm を使わず MultipartReader で順に読むことで、ファイル全体をメモリや一時ファイルに展開しない
 	var part *multipart.Part
 	for {
 		p, err := mr.NextPart()
@@ -500,7 +550,8 @@ func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string
 	}
 	defer part.Close()
 
-	// 先頭 512 バイトで画像形式を判定する（スキャン後にワーカーでも再確認する）
+	// 3. 先頭 512 バイトで画像形式を判定する（スキャン後にワーカーでも再確認する）
+	// 512 バイトは http.DetectContentType が参照する最大長
 	head := make([]byte, 512)
 	n, err := io.ReadFull(part, head)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -522,6 +573,8 @@ func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string
 		return
 	}
 
+	// 4. 読み済みの先頭部分と残りを連結し、ファイル単体の上限を掛けて sfsp-api に転送する
+	// ファイル名はクライアント指定のものを使わず、フィールド名と判定した拡張子から組み立てる
 	src := &limitedReader{r: io.MultiReader(bytes.NewReader(head), part), remaining: maxImageUploadBytes}
 
 	var sfspResp SfspUploadResponse
@@ -535,6 +588,8 @@ func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string
 		return
 	}
 
+	// 5. 返ってきたジョブ ID を保存する。スキャン完了後、ワーカーはこの ID でユーザーを特定する
+	// （新しいアップロードで上書きされた場合、古いジョブの結果は反映されない）
 	sfspJobID, err := uuid.Parse(sfspResp.JobID)
 	if err != nil {
 		log.Printf("Invalid Job ID from SFSP: %v", err)
@@ -559,11 +614,14 @@ func handleProfileImageUpload(c *gin.Context, fieldName, jobColumn, label string
 }
 
 // limitedReader は remaining バイトを超えて読もうとすると errFileTooLarge を返す。
+// io.LimitReader と違い、上限ちょうどで黙って打ち切らず、超過をエラーとして呼び出し元に知らせる。
 type limitedReader struct {
 	r         io.Reader
 	remaining int64
 }
 
+// Read は最大 remaining+1 バイトまで読み、1 バイトでも上限を超えた時点で errFileTooLarge を返す。
+// 上限ちょうどのファイルと超過したファイルを区別するため、1 バイト余分に読ませている。
 func (l *limitedReader) Read(p []byte) (int, error) {
 	if l.remaining < 0 {
 		return 0, errFileTooLarge
@@ -579,6 +637,7 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// isTooLarge は err がサイズ超過（limitedReader の errFileTooLarge か、MaxBytesReader の MaxBytesError）かを判定する。
 func isTooLarge(err error) bool {
 	if err == nil {
 		return false
@@ -588,7 +647,9 @@ func isTooLarge(err error) bool {
 }
 
 // uploadToSFSP は src を multipart で sfsp-api にストリーミング送信する（全体をメモリに載せない）。
+// targetService は完了イベントの配送先キュー（"profile" なら sfsp:completed:profile）を決める値で、応答の job_id を resp に格納する。
 func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService string, resp *SfspUploadResponse) error {
+	// io.Pipe の書き込み側で multipart 本文を生成し、読み込み側をそのままリクエスト本文にする
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
@@ -614,6 +675,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 
 	sfspRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, sfspApiUrl+"/api/v1/files", pr)
 	if err != nil {
+		// 読み手がいないと書き込み goroutine が止まったままになるため、パイプを閉じて終了を待つ
 		pr.CloseWithError(err)
 		<-writeErrCh
 		return fmt.Errorf("failed to create SFSP request: %w", err)
@@ -625,6 +687,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	// sfsp-api が途中で応答した場合でも書き込み goroutine を終わらせる
 	pr.CloseWithError(errors.New("request finished"))
 	writeErr := <-writeErrCh
+	// サイズ超過は送信エラーより優先して返す（呼び出し元で 413 にするため）
 	if isTooLarge(writeErr) {
 		if sfspResponse != nil {
 			sfspResponse.Body.Close()
@@ -636,6 +699,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	}
 	defer sfspResponse.Body.Close()
 
+	// 応答本文は 1MiB までに制限して読む
 	respBytes, err := io.ReadAll(io.LimitReader(sfspResponse.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("failed to read SFSP response: %w", err)
@@ -644,6 +708,7 @@ func uploadToSFSP(ctx context.Context, src io.Reader, filename, targetService st
 	if sfspResponse.StatusCode < 200 || sfspResponse.StatusCode >= 300 {
 		return fmt.Errorf("SFSP returned non-2xx status %d: %s", sfspResponse.StatusCode, string(respBytes))
 	}
+	// 2xx でも本文を送り切れていなければ失敗とする
 	if writeErr != nil {
 		return fmt.Errorf("failed to send file to SFSP: %w", writeErr)
 	}
@@ -668,6 +733,7 @@ func profileWorker(ctx context.Context) {
 
 	log.Println("Profile Worker started. Waiting for scan completion events...")
 	for {
+		// タイムアウト 0 でイベントが来るまでブロックする。取り出したイベントは処理中リストに移される
 		payload, err := queue.DequeueReliable(ctx, profileCompletionQueue, 0)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -680,6 +746,7 @@ func profileWorker(ctx context.Context) {
 
 		processProfileEventWithRetry(ctx, payload)
 
+		// 成功・失敗にかかわらず処理を終えたイベントは Ack し、処理中リストから取り除く（失敗したイベントも再処理しない）
 		if err := queue.Ack(ctx, profileCompletionQueue, payload); err != nil {
 			log.Printf("Failed to ack profile event: %v", err)
 		}
@@ -687,11 +754,16 @@ func profileWorker(ctx context.Context) {
 }
 
 // errTransient は再試行で回復しうる失敗（DB・MinIO の一時的なエラー）を示す。
+// errTransient で包まれていないエラーは恒久的な失敗（画像形式不正・サイズ超過など）として扱い、再試行しない。
 type errTransient struct{ err error }
 
+// Error は内側のエラーのメッセージを返す。
 func (e errTransient) Error() string { return e.err.Error() }
+
+// Unwrap は errors.Is / errors.As のために内側のエラーを返す。
 func (e errTransient) Unwrap() error { return e.err }
 
+// transient は fmt.Errorf と同じ書式でエラーを作り、一時的な失敗として errTransient で包む。
 func transient(format string, args ...any) error {
 	return errTransient{fmt.Errorf(format, args...)}
 }
@@ -699,12 +771,14 @@ func transient(format string, args ...any) error {
 // processProfileEventWithRetry は一時的な失敗なら数回再試行し、それでも失敗したら
 // ジョブ ID をクリアして終端状態にする（フロントエンドのポーリングを終わらせるため）。
 func processProfileEventWithRetry(ctx context.Context, payload string) {
+	// 解析できないイベントは再試行しても直らないため、ログだけ残して捨てる
 	var ev event.ScanCompletionEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 		log.Printf("ERROR: Unmarshalling event payload: %v", err)
 		return
 	}
 
+	// 最大 3 回試行する。待ち時間は 2 秒、4 秒と試行ごとに延ばす
 	const maxAttempts = 3
 	for attempt := 1; ; attempt++ {
 		err := processProfileEvent(ctx, ev)
@@ -740,7 +814,10 @@ func clearProfileJob(ctx context.Context, jobID uuid.UUID) {
 
 // processProfileEvent は 1 件の完了イベントを処理する。defer はこの関数の終了時に実行されるため、
 // ループ内でファイルディスクリプタや一時ファイルが溜まらない。
+// clean なら SFSP 側からファイルを取得して再検証し、公開バケットへ保存してプロフィールの URL を差し替える。
+// 再試行すべき失敗は errTransient、それ以外の失敗は通常のエラーで返す。
 func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) error {
+	// 1. ジョブ ID からユーザーと、アイコン・背景のどちらのジョブかを特定する
 	var userID string
 	var isIcon bool
 	err := db.QueryRow(ctx,
@@ -755,11 +832,13 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return transient("failed to look up user for job %s: %w", ev.JobID, err)
 	}
 
+	// SQL に連結するカラム名は、ここで選ぶ固定値だけを使う
 	jobColumn, urlColumn, objectPrefix := "background_sfsp_job_id", "background_image_url", "backgrounds"
 	if isIcon {
 		jobColumn, urlColumn, objectPrefix = "icon_sfsp_job_id", "icon_url", "icons"
 	}
 
+	// 2. clean 以外の結果なら、画像は反映せずジョブ ID だけクリアする（同じジョブのままの場合のみ）
 	if ev.FinalStatus != "clean" {
 		if _, err := db.Exec(ctx, "UPDATE users SET "+jobColumn+" = NULL WHERE id = $1 AND "+jobColumn+" = $2", userID, ev.JobID); err != nil {
 			return transient("failed to clear scan job for user %s: %w", userID, err)
@@ -768,6 +847,7 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return nil
 	}
 
+	// 3. clean バケット上のオブジェクトキーの候補を並べる（取得できるまで順に試す）
 	fileIDStr := ev.FileID.String()
 	candidateKeys := []string{
 		fileIDStr,
@@ -780,6 +860,7 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		candidateKeys = append(candidateKeys, ev.Filename)
 	}
 
+	// 4. 一時ファイルにダウンロードする
 	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("profile-%s-%s", userID, fileIDStr))
 	defer os.Remove(tmpPath)
 
@@ -796,6 +877,7 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return transient("failed to download clean file for user %s: %w", userID, downloadErr)
 	}
 
+	// 5. サイズと画像形式を再検証する（アップロード時の判定とは別に、実際に保存する中身で確認する）
 	f, err := os.Open(tmpPath)
 	if err != nil {
 		return transient("failed to open downloaded file: %w", err)
@@ -821,6 +903,7 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return transient("failed to reset file: %w", err)
 	}
 
+	// 6. 公開バケットへ保存する。キーは "<icons|backgrounds>/<userID>-<ランダムUUID><拡張子>" で、毎回別のキーになる
 	objectName := fmt.Sprintf("%s/%s-%s%s", objectPrefix, userID, uuid.New().String(), ext)
 	profileURL := fmt.Sprintf("/%s/%s", bucketName, objectName)
 
@@ -830,7 +913,9 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return transient("failed to upload profile image to MinIO: %w", err)
 	}
 
-	// ジョブ ID が一致する場合だけ URL を差し替え、古い URL を受け取る
+	// 7. ジョブ ID が一致する場合だけ URL を差し替え、古い URL を受け取る
+	// 副問い合わせで行を FOR UPDATE ロックし、更新前の URL を RETURNING で返す
+	// （UPDATE ... RETURNING だけでは更新後の値しか得られないため）
 	var oldURL string
 	err = db.QueryRow(ctx, `
 		UPDATE users u SET `+urlColumn+` = $1, `+jobColumn+` = NULL, updated_at = NOW()
@@ -847,6 +932,7 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 		return transient("failed to update user profile URL for %s: %w", userID, err)
 	}
 
+	// 8. 差し替え前の画像を削除する。失敗しても新しい画像は反映済みなのでログのみ
 	if key, ok := objectKeyFromURL(oldURL); ok && key != objectName {
 		if err := minioClient.RemoveObject(ctx, bucketName, key, minio.RemoveObjectOptions{}); err != nil {
 			log.Printf("Failed to remove old profile image %s: %v", key, err)
@@ -855,7 +941,8 @@ func processProfileEvent(ctx context.Context, ev event.ScanCompletionEvent) erro
 	return nil
 }
 
-// クレームから safe に string 型 (UUID) の User ID を抽出するヘルパー関数
+// parseUserIDFromClaims はクレームから string 型 (UUID) の User ID を安全に抽出する。
+// "sub"、"userID"、"user_id"、"id" の順に探し、最初に見つかった UUID として正しい値を返す。
 func parseUserIDFromClaims(claims jwt.MapClaims) (string, bool) {
 	keys := []string{"sub", "userID", "user_id", "id"}
 
@@ -874,7 +961,8 @@ func parseUserIDFromClaims(claims jwt.MapClaims) (string, bool) {
 	return "", false
 }
 
-// 認証用ミドルウェア (UUID対応版)。署名を検証した後、ログアウト済み (blocklist:<jti>) のトークンを拒否する
+// authMiddleware は認証用ミドルウェア (UUID対応版)。署名を検証した後、ログアウト済み (blocklist:<jti>) のトークンを拒否する。
+// 成功時は userID（と、あれば username）を gin のコンテキストに設定する。
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -890,6 +978,7 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// 署名アルゴリズムを HS256 に固定し、alg を差し替える攻撃（none や RS/HS の取り違え）を防ぐ
 		tokenString := strings.TrimSpace(parts[1])
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			return jwtSecret, nil

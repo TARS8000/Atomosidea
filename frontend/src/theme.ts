@@ -1,6 +1,6 @@
 import { createTheme } from '@mui/material/styles';
 
-// Create a theme instance.
+// アプリ全体で使う MUI テーマを作成する（App.tsx の ThemeProvider に渡す）。
 const theme = createTheme({
   palette: {
     primary: {
@@ -10,6 +10,7 @@ const theme = createTheme({
       main: '#19857b',
     },
     error: {
+      // 注意: '#red' は有効な 16 進カラーコードではない。
       main: '#red',
     },
     background: {
@@ -18,6 +19,7 @@ const theme = createTheme({
     },
   },
   typography: {
+    // OS 標準のシステムフォントを優先し、最後に絵文字用フォントを指定する。
     fontFamily: [
       '-apple-system',
       'BlinkMacSystemFont',
@@ -35,6 +37,7 @@ const theme = createTheme({
       fontSize: '2.2rem',
     },
   },
+  // MUI コンポーネントの既定スタイルを上書きする。
   components: {
     MuiPaper: {
       styleOverrides: {
@@ -43,6 +46,7 @@ const theme = createTheme({
         },
       },
     },
+    // カードにホバー時の拡大と影のアニメーションを付ける（HomePage・MyPage では sx の指定で上書きされる）。
     MuiCard: {
       styleOverrides: {
         root: {

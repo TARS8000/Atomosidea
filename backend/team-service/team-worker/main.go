@@ -27,6 +27,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// プロセス全体で共有する接続・設定。main で起動時に初期化する。
+//   - dbTeam: チーム DB の接続プール。
+//   - redisClient: ログアウト済みトークンのブロックリスト確認用（REDIS_ADDR 未設定なら nil）。
+//   - jwtSecret: JWT の HS256 署名検証に使う共有鍵。
+//   - internalAPIKey: /internal API の X-Internal-Key と照合する鍵（空なら内部 API は無効）。
+//   - profileServiceURL: 表示名の取得先となる profile-service のベース URL。
+//   - httpClient: profile-service 呼び出し用（3 秒でタイムアウト）。
 var (
 	dbTeam            *pgxpool.Pool
 	redisClient       *redis.Client
@@ -36,21 +43,28 @@ var (
 	httpClient        = &http.Client{Timeout: 3 * time.Second}
 )
 
+// tokenAlphabet はチームトークンに使う文字（英小文字と数字）。
 const tokenAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
+// maxTeamNameLen はチーム名の最大文字数（バイト数ではなくルーン数で数える）。
 const maxTeamNameLen = 255
 
+// generateToken はチームを URL で識別するための 24 文字のランダムなトークンを生成する。
+// 乱数の取得に失敗した場合はプロセスを終了する。
 func generateToken() string {
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {
 		log.Fatalf("Failed to read random bytes: %v", err)
 	}
+	// 各バイトを剰余でアルファベットの文字に変換する
 	for i := range b {
 		b[i] = tokenAlphabet[int(b[i])%len(tokenAlphabet)]
 	}
 	return string(b)
 }
 
+// connectDB はチーム DB への接続プールを作成し、Ping で疎通を確認する（10 秒でタイムアウト）。
+// 接続できなければプロセスを終了する。
 func connectDB(dsn string) *pgxpool.Pool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -68,6 +82,7 @@ func connectDB(dsn string) *pgxpool.Pool {
 // 認証（JWT + ログアウトのブロックリスト）
 // ------------------------------------------------------------------
 
+// authResult は verifyToken の判定結果を表す。
 type authResult int
 
 const (
@@ -76,6 +91,8 @@ const (
 	authError                   // ブロックリストを確認できなかった（Redis エラー）
 )
 
+// errNoRedis は Redis が未設定のときに isTokenBlocked が返すエラー。
+// 呼び出し側では authError として扱い、認証付きリクエストを拒否する（fail closed）。
 var errNoRedis = errors.New("redis is not configured")
 
 // isTokenBlocked は auth-service の logoutHandler が登録する "blocklist:<jti>" を確認する。
@@ -94,14 +111,17 @@ func isTokenBlocked(ctx context.Context, jti string) (bool, error) {
 // 署名（HS256 固定）・有効期限・jti・ブロックリストを確認し、成功時は "userID" をセットする。
 // Redis のエラー時は authError を返す（呼び出し側で拒否する = fail closed）。
 func verifyToken(c *gin.Context) authResult {
+	// 同じリクエスト内で検証済みなら再検証しない
 	if uid := c.GetString("userID"); uid != "" {
 		return authOK
 	}
+	// 1. Authorization: Bearer ヘッダーからトークンを取り出す
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 		return authNone
 	}
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+	// 2. 署名と有効期限を検証する（alg を HS256 に限定し、alg すり替え攻撃を防ぐ）
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
 		return jwtSecret, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
@@ -112,10 +132,12 @@ func verifyToken(c *gin.Context) authResult {
 	if !ok {
 		return authNone
 	}
+	// 3. jti が無いトークンはブロックリストで失効を確認できないので拒否する
 	jti, _ := claims["jti"].(string)
 	if jti == "" {
 		return authNone
 	}
+	// 4. ユーザー ID を sub → userID → user_id の順に探し、UUID として解釈できるものだけ受け付ける
 	var userIDStr string
 	for _, k := range []string{"sub", "userID", "user_id"} {
 		if s, ok := claims[k].(string); ok && s != "" {
@@ -127,6 +149,7 @@ func verifyToken(c *gin.Context) authResult {
 	if err != nil {
 		return authNone
 	}
+	// 5. ログアウト済み（ブロックリスト登録済み）でないかを確認する
 	blocked, err := isTokenBlocked(c.Request.Context(), jti)
 	if err != nil {
 		log.Printf("Redis error checking blocklist: %v", err)
@@ -135,10 +158,13 @@ func verifyToken(c *gin.Context) authResult {
 	if blocked {
 		return authNone
 	}
+	// 正規化した UUID 文字列を後続のハンドラへ渡す
 	c.Set("userID", parsed.String())
 	return authOK
 }
 
+// authMiddleware は JWT 認証を必須にするミドルウェア。
+// 無効なトークンは 401、ブロックリストを確認できない場合は 500 で中断する。
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		switch verifyToken(c) {
@@ -163,6 +189,7 @@ type NullableString struct {
 	sql.NullString
 }
 
+// MarshalJSON は値があればその文字列を、NULL なら空文字列を JSON として出力する。
 func (v NullableString) MarshalJSON() ([]byte, error) {
 	if v.Valid {
 		return json.Marshal(v.String)
@@ -170,6 +197,7 @@ func (v NullableString) MarshalJSON() ([]byte, error) {
 	return json.Marshal("")
 }
 
+// Team は teams テーブルの1行を表す。Token は URL でチームを識別する公開用の文字列。
 type Team struct {
 	ID                string         `json:"id"`
 	Token             string         `json:"token"`
@@ -182,12 +210,15 @@ type Team struct {
 	CreatedAt         time.Time      `json:"created_at"`
 }
 
+// teamColumns は Team を取得する SELECT/RETURNING の列リスト。scanTeam の Scan 順と一致させること。
 const teamColumns = "id, token, name, description, is_public, auto_approve, allow_member_invite, created_by, created_at"
 
+// scanTeam は teamColumns の順で取得した1行を Team に読み込む。
 func scanTeam(row pgx.Row, t *Team) error {
 	return row.Scan(&t.ID, &t.Token, &t.Name, &t.Description, &t.IsPublic, &t.AutoApprove, &t.AllowMemberInvite, &t.CreatedBy, &t.CreatedAt)
 }
 
+// Member はチームメンバーの1人分（ユーザー ID・ロール・参加日時）を表す。
 type Member struct {
 	UserID   string    `json:"user_id"`
 	Role     string    `json:"role"`
@@ -205,7 +236,8 @@ type JoinRequest struct {
 	ReviewedBy  NullableString `json:"reviewed_by"`
 }
 
-// Post is a team-native content item.
+// Post はチーム内の投稿（team_posts の1行）を表す。
+// AuthorName は DB には無く、profile-service から取得した表示名を後から詰める。
 type Post struct {
 	ID         string    `json:"id"`
 	TeamID     string    `json:"team_id"`
@@ -220,6 +252,7 @@ type Post struct {
 // ロール
 // ------------------------------------------------------------------
 
+// roleRank はロールの強さを数値で返す（owner=3 > admin=2 > member=1）。未知のロールは 0。
 func roleRank(r string) int {
 	switch r {
 	case "owner":
@@ -233,9 +266,10 @@ func roleRank(r string) int {
 	}
 }
 
+// isValidRole は r が owner / admin / member のいずれかなら true を返す。
 func isValidRole(r string) bool { return roleRank(r) > 0 }
 
-// canGrantRole: 自分より弱いロールだけを付与できる。
+// canGrantRole は callerRole の利用者が role を付与できるかを返す。自分より弱いロールだけを付与できる。
 // 例外として owner は owner を付与できる（オーナー権限の移譲・共同オーナー化のため。
 // これが無いと「最後のオーナーは退出できない」状態を解消する手段がチーム削除しかなくなる）。
 func canGrantRole(callerRole, role string) bool {
@@ -245,6 +279,8 @@ func canGrantRole(callerRole, role string) bool {
 	return roleRank(role) < roleRank(callerRole)
 }
 
+// querier は QueryRow を持つ型の共通インターフェース。
+// プール（*pgxpool.Pool）とトランザクション（pgx.Tx）のどちらでも memberRole を呼べるようにする。
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
@@ -262,7 +298,8 @@ func memberRole(ctx context.Context, q querier, teamID, userID string) (string, 
 	return role, true, nil
 }
 
-// resolveTeam: no auth. Fetch a team by token. Returns nil and writes a response if not found.
+// resolveTeam はトークンでチームを取得する（認証なし）。
+// 見つからない場合や DB エラー時はレスポンス（404 / 500）を書いて nil を返す。
 func resolveTeam(c *gin.Context, token string) *Team {
 	t := &Team{}
 	err := scanTeam(dbTeam.QueryRow(c.Request.Context(), "SELECT "+teamColumns+" FROM teams WHERE token = $1", token), t)
@@ -300,6 +337,8 @@ func requireTeamRole(c *gin.Context, required string) (teamID string, role strin
 	return team.ID, role, true
 }
 
+// internalError はエラーの詳細をログにだけ出力し、クライアントには汎用的な 500 を返す
+// （DB エラーの内容などを外部に漏らさないため）。
 func internalError(c *gin.Context, err error) {
 	log.Printf("internal error on %s %s: %v", c.Request.Method, c.FullPath(), err)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
@@ -309,22 +348,28 @@ func internalError(c *gin.Context, err error) {
 // 表示名（profile-service から取得し、短時間キャッシュする）
 // ------------------------------------------------------------------
 
+// nameCacheEntry は表示名キャッシュの1件（表示名と有効期限）。
 type nameCacheEntry struct {
 	name    string
 	expires time.Time
 }
 
+// 表示名キャッシュ本体（user_id → エントリ）と、それを保護するミューテックス。
 var (
 	nameCacheMu sync.Mutex
 	nameCache   = map[string]nameCacheEntry{}
 )
 
+// 表示名キャッシュの設定。
+// nameCacheTTL は取得に成功した表示名の保持期間、nameCacheFailTTL は取得に失敗したときの保持期間
+// （profile-service への再試行を抑える）、nameCacheMax はキャッシュの最大件数（達したら全件破棄する）。
 const (
 	nameCacheTTL     = 5 * time.Minute
 	nameCacheFailTTL = 30 * time.Second
 	nameCacheMax     = 10000
 )
 
+// cachedName はキャッシュから期限内の表示名を返す。無いか期限切れなら ok=false。
 func cachedName(id string) (string, bool) {
 	nameCacheMu.Lock()
 	defer nameCacheMu.Unlock()
@@ -335,15 +380,18 @@ func cachedName(id string) (string, bool) {
 	return e.name, true
 }
 
+// storeName は表示名を ttl の期間だけキャッシュに保存する。
 func storeName(id, name string, ttl time.Duration) {
 	nameCacheMu.Lock()
 	defer nameCacheMu.Unlock()
+	// メモリが無制限に増えないよう、上限に達したらキャッシュ全体を作り直す（簡易的な追い出し）
 	if len(nameCache) >= nameCacheMax {
 		nameCache = map[string]nameCacheEntry{}
 	}
 	nameCache[id] = nameCacheEntry{name: name, expires: time.Now().Add(ttl)}
 }
 
+// forgetName は指定ユーザーの表示名をキャッシュから削除する（アカウント削除時に使う）。
 func forgetName(id string) {
 	nameCacheMu.Lock()
 	defer nameCacheMu.Unlock()
@@ -351,6 +399,7 @@ func forgetName(id string) {
 }
 
 // fetchProfileName は profile-service の GET /api/profile/:userId から username を取得する。
+// プロフィールが存在しない（404）場合はエラーにせず空文字列を返す。
 func fetchProfileName(ctx context.Context, userID string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileServiceURL+"/api/profile/"+url.PathEscape(userID), nil)
 	if err != nil {
@@ -379,6 +428,7 @@ func fetchProfileName(ctx context.Context, userID string) (string, error) {
 // displayNames は user_id → 表示名 を返す。取得できなかったものは空文字列（エラーにはしない）。
 func displayNames(ctx context.Context, ids []string) map[string]string {
 	result := make(map[string]string, len(ids))
+	// 1. 重複と空 ID を除き、キャッシュに無いものだけを取得対象として集める
 	var missing []string
 	seen := map[string]bool{}
 	for _, id := range ids {
@@ -395,6 +445,7 @@ func displayNames(ctx context.Context, ids []string) map[string]string {
 	if len(missing) == 0 || profileServiceURL == "" {
 		return result
 	}
+	// 2. 未キャッシュの ID を並列に取得する（セマフォで同時実行数を 8 に制限し、profile-service への負荷を抑える）
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
@@ -407,6 +458,7 @@ func displayNames(ctx context.Context, ids []string) map[string]string {
 			name, err := fetchProfileName(ctx, id)
 			if err != nil {
 				log.Printf("display name lookup failed for %s: %v", id, err)
+				// 失敗も短時間キャッシュし、障害中に毎回 profile-service を叩かないようにする
 				storeName(id, "", nameCacheFailTTL)
 				return
 			}
@@ -424,7 +476,8 @@ func displayNames(ctx context.Context, ids []string) map[string]string {
 // チーム
 // ------------------------------------------------------------------
 
-// createTeamHandler: JWT auth. Create a team and return it with token.
+// createTeamHandler はチームを作成し、トークンを含むチーム情報を返す（JWT 認証必須）。
+// 作成者は同じトランザクションで owner として team_members に登録される。
 func createTeamHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	var req struct {
@@ -434,6 +487,7 @@ func createTeamHandler(c *gin.Context) {
 		AutoApprove       *bool  `json:"auto_approve"`
 		AllowMemberInvite *bool  `json:"allow_member_invite"`
 	}
+	// 1. 入力を検証する（真偽値の項目は省略時 false）
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
@@ -444,10 +498,12 @@ func createTeamHandler(c *gin.Context) {
 		return
 	}
 	isPublic := req.IsPublic != nil && *req.IsPublic
-	// 自動認証は公開チームのみ有効。非公開チームでは強制的に false。
+	// 自動承認は公開チームのみ有効。非公開チームでは強制的に false。
 	autoApprove := isPublic && req.AutoApprove != nil && *req.AutoApprove
 	allowMemberInvite := req.AllowMemberInvite != nil && *req.AllowMemberInvite
 
+	// 2. チームと owner の登録を1トランザクションで行う。
+	//    トークンが既存と衝突した（一意制約違反）場合は新しいトークンで最大 5 回まで作り直す。
 	ctx := c.Request.Context()
 	var team Team
 	created := false
@@ -487,7 +543,7 @@ func createTeamHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, team)
 }
 
-// getTeamByTokenHandler: no auth. Get a team by its token.
+// getTeamByTokenHandler はトークンでチーム情報を取得する（認証なし。非公開チームでも返す）。
 func getTeamByTokenHandler(c *gin.Context) {
 	t := resolveTeam(c, c.Param("token"))
 	if t == nil {
@@ -496,6 +552,8 @@ func getTeamByTokenHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, t)
 }
 
+// listTeams は query を実行し、teamColumns と同じ列順の結果を Team の配列として JSON で返す。
+// 0 件のときは null ではなく空配列を返す。
 func listTeams(c *gin.Context, query string, args ...any) {
 	rows, err := dbTeam.Query(c.Request.Context(), query, args...)
 	if err != nil {
@@ -519,19 +577,19 @@ func listTeams(c *gin.Context, query string, args ...any) {
 	c.JSON(http.StatusOK, teams)
 }
 
-// listPublicTeamsHandler: no auth. List public teams.
+// listPublicTeamsHandler は公開チームを新しい順に一覧する（認証なし）。
 func listPublicTeamsHandler(c *gin.Context) {
 	listTeams(c, "SELECT "+teamColumns+" FROM teams WHERE is_public = true ORDER BY created_at DESC")
 }
 
-// listMyTeamsHandler: JWT auth. List teams the user is a member of.
+// listMyTeamsHandler は呼び出し元が所属するチームを新しい順に一覧する（JWT 認証必須）。
 func listMyTeamsHandler(c *gin.Context) {
 	listTeams(c,
 		"SELECT t.id, t.token, t.name, t.description, t.is_public, t.auto_approve, t.allow_member_invite, t.created_by, t.created_at FROM teams t JOIN team_members m ON m.team_id = t.id WHERE m.user_id = $1 ORDER BY t.created_at DESC",
 		c.GetString("userID"))
 }
 
-// updateTeamHandler: JWT auth, owner role. Update team metadata.
+// updateTeamHandler はチームの名前・説明・公開設定などを更新する（JWT 認証必須、owner のみ）。
 // PATCH の意味論: 送られたフィールドだけを更新する（省略したフィールドは変更しない）。
 func updateTeamHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "owner")
@@ -549,6 +607,8 @@ func updateTeamHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
+	// SET 句を動的に組み立てる。$1 は WHERE の teamID で、next は値を args に追加して
+	// 対応するプレースホルダ（$2, $3, ...）を返す（値は常にバインドし、SQL に埋め込まない）。
 	var set []string
 	args := []any{teamID}
 	next := func(v any) string {
@@ -596,7 +656,8 @@ func updateTeamHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "team updated"})
 }
 
-// deleteTeamHandler: JWT auth, owner role. Delete a team and its members.
+// deleteTeamHandler はチームを削除する（JWT 認証必須、owner のみ）。
+// メンバー・加入申請・投稿は外部キーの ON DELETE CASCADE で一緒に消える。
 func deleteTeamHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "owner")
 	if !ok {
@@ -613,7 +674,7 @@ func deleteTeamHandler(c *gin.Context) {
 // メンバー
 // ------------------------------------------------------------------
 
-// getMembersHandler: JWT auth, member role. List members of a team.
+// getMembersHandler はチームのメンバーを参加順に一覧する（JWT 認証必須、member 以上）。
 func getMembersHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "member")
 	if !ok {
@@ -649,7 +710,8 @@ func lockTeam(ctx context.Context, tx pgx.Tx, token string) (string, error) {
 	return teamID, err
 }
 
-// addMemberHandler: JWT auth, admin role. Add a member to a team, or change a member's role.
+// addMemberHandler はチームにメンバーを追加するか、既存メンバーのロールを変更する（JWT 認証必須、admin 以上）。
+// 追加時は 201、ロール変更時は 200 を返す。
 // - role は owner / admin / member のいずれか（省略時 member）。
 // - 付与できるのは自分より弱いロールだけ（owner は owner の付与＝オーナー権限の移譲も可）。
 // - 自分と同じか強いロールの既存メンバーのロールは変更できない。自分自身のロールも変更できない。
@@ -659,6 +721,7 @@ func addMemberHandler(c *gin.Context) {
 		UserID string `json:"user_id" binding:"required"`
 		Role   string `json:"role"`
 	}
+	// 1. 入力を検証する（user_id は UUID として正規化し、自分自身の変更は拒否する）
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id is required"})
 		return
@@ -682,6 +745,7 @@ func addMemberHandler(c *gin.Context) {
 		return
 	}
 
+	// 2. トランザクションを開始してチーム行をロックする（同時のロール変更・退出と競合させない）
 	ctx := c.Request.Context()
 	tx, err := dbTeam.Begin(ctx)
 	if err != nil {
@@ -699,6 +763,7 @@ func addMemberHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 3. 呼び出し元が admin 以上で、指定ロールを付与できるかを確認する
 	callerRole, isMember, err := memberRole(ctx, tx, teamID, callerID)
 	if err != nil {
 		internalError(c, err)
@@ -716,6 +781,7 @@ func addMemberHandler(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "you can only grant roles lower than your own"})
 		return
 	}
+	// 4. 対象が既存メンバーなら、自分より弱いロールの場合だけ変更を許す
 	existingRole, exists, err := memberRole(ctx, tx, teamID, targetID)
 	if err != nil {
 		internalError(c, err)
@@ -725,6 +791,7 @@ func addMemberHandler(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "you cannot change the role of a member whose role is equal to or higher than yours"})
 		return
 	}
+	// 5. 既存メンバーならロールを更新し、そうでなければメンバーとして追加する
 	if exists {
 		_, err = tx.Exec(ctx, "UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3", role, teamID, targetID)
 	} else {
@@ -751,7 +818,7 @@ func addMemberHandler(c *gin.Context) {
 	c.JSON(status, gin.H{"user_id": targetID, "role": role})
 }
 
-// removeMemberHandler: JWT auth. Remove a member from a team (or leave the team).
+// removeMemberHandler はチームからメンバーを削除する、または自分が退出する（JWT 認証必須）。
 // - 自分自身: 誰でも退出できる。ただし最後の owner は 409（移譲かチーム削除が先）。
 // - 他人: admin 以上で、対象のロールが自分より弱い場合だけ削除できる。
 func removeMemberHandler(c *gin.Context) {
@@ -763,6 +830,8 @@ func removeMemberHandler(c *gin.Context) {
 	}
 	targetID := target.String()
 
+	// 1. トランザクションを開始してチーム行をロックする
+	//    （最後の owner の判定と削除の間に、別リクエストで owner が減る競合を防ぐ）
 	ctx := c.Request.Context()
 	tx, err := dbTeam.Begin(ctx)
 	if err != nil {
@@ -780,6 +849,7 @@ func removeMemberHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 2. 呼び出し元と対象のロールを取得する
 	callerRole, isMember, err := memberRole(ctx, tx, teamID, callerID)
 	if err != nil {
 		internalError(c, err)
@@ -799,7 +869,9 @@ func removeMemberHandler(c *gin.Context) {
 		return
 	}
 
+	// 3. 権限を確認する（自分の退出と他人の削除で条件が異なる）
 	if targetID == callerID {
+		// 自分の退出: 最後の owner だとチームの管理者がいなくなるので拒否する
 		if targetRole == "owner" {
 			var owners int
 			if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM team_members WHERE team_id = $1 AND role = 'owner'", teamID).Scan(&owners); err != nil {
@@ -815,6 +887,7 @@ func removeMemberHandler(c *gin.Context) {
 			}
 		}
 	} else {
+		// 他人の削除: admin 以上で、対象が自分より弱いロールの場合のみ
 		if roleRank(callerRole) < roleRank("admin") {
 			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission"})
 			return
@@ -825,6 +898,7 @@ func removeMemberHandler(c *gin.Context) {
 		}
 	}
 
+	// 4. メンバーを削除してコミットする
 	if _, err := tx.Exec(ctx, "DELETE FROM team_members WHERE team_id = $1 AND user_id = $2", teamID, targetID); err != nil {
 		internalError(c, err)
 		return
@@ -840,9 +914,9 @@ func removeMemberHandler(c *gin.Context) {
 // 投稿
 // ------------------------------------------------------------------
 
-// contentAccessAllowed: decides if the caller may view a team's content.
-// Public teams: no auth. Private teams: JWT + member role.
-// Returns nil (after writing a response) if access is denied.
+// contentAccessAllowed は呼び出し元がチームのコンテンツを閲覧できるかを判定する。
+// 公開チームは認証なしで閲覧できる。非公開チームは JWT 認証と member 以上のロールが必要。
+// アクセスを拒否する場合はレスポンスを書いてから nil を返す。
 func contentAccessAllowed(c *gin.Context, token string) *Team {
 	team := resolveTeam(c, token)
 	if team == nil {
@@ -851,6 +925,7 @@ func contentAccessAllowed(c *gin.Context, token string) *Team {
 	if team.IsPublic {
 		return team
 	}
+	// 非公開チーム: ルートに authMiddleware が無いので、ここで任意認証のトークンを検証する
 	switch verifyToken(c) {
 	case authError:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify token"})
@@ -871,7 +946,8 @@ func contentAccessAllowed(c *gin.Context, token string) *Team {
 	return team
 }
 
-// createPostHandler: JWT auth, member role. Create a post in a team.
+// createPostHandler はチームに投稿を作成する（JWT 認証必須、member 以上）。
+// レスポンスには投稿者の表示名も含める。
 func createPostHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "member")
 	if !ok {
@@ -903,7 +979,7 @@ func createPostHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, post)
 }
 
-// listPostsHandler: auth depends on team.is_public. List posts in a team.
+// listPostsHandler はチームの投稿を新しい順に一覧する（認証の要否は team.is_public による）。
 func listPostsHandler(c *gin.Context) {
 	team := contentAccessAllowed(c, c.Param("token"))
 	if team == nil {
@@ -932,6 +1008,7 @@ func listPostsHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 投稿者の表示名をまとめて取得して埋める（重複 ID は displayNames 側で1回にまとめる）
 	names := displayNames(c.Request.Context(), authorIDs)
 	for i := range posts {
 		posts[i].AuthorName = names[posts[i].AuthorID]
@@ -939,13 +1016,14 @@ func listPostsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, posts)
 }
 
-// getPostHandler: auth depends on team.is_public. Get a single post.
+// getPostHandler はチームの投稿を1件取得する（認証の要否は team.is_public による）。
 func getPostHandler(c *gin.Context) {
 	team := contentAccessAllowed(c, c.Param("token"))
 	if team == nil {
 		return
 	}
 	contentID := c.Param("contentID")
+	// UUID でない ID は DB の型エラー（500）にせず、404 として扱う
 	if _, err := uuid.Parse(contentID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "post not found"})
 		return
@@ -970,9 +1048,10 @@ func getPostHandler(c *gin.Context) {
 // 加入申請
 // ------------------------------------------------------------------
 
-// joinRequestHandler: JWT auth. Join a team.
-// Public + auto_approve: immediately inserts into team_members.
-// Otherwise: creates a pending join request. 却下・取り消し済み（または承認後に脱退した）
+// joinRequestHandler はチームへの加入を申し込む（JWT 認証必須）。
+// 既にメンバーなら already_member を返す。非公開チームは 403。
+// 公開かつ auto_approve のチーム: 即座に team_members へ追加する。
+// それ以外の公開チーム: 保留中（pending）の加入申請を作成する。却下・取り消し済み（または承認後に脱退した）
 // 申請は pending に戻して再申請できる。保留中の申請があれば 409。
 func joinRequestHandler(c *gin.Context) {
 	team := resolveTeam(c, c.Param("token"))
@@ -1012,6 +1091,7 @@ func joinRequestHandler(c *gin.Context) {
 
 	// 公開チームかつ手動承認: 申請を作成、または終了済みの申請を pending に戻す。
 	// メンバーでないことは確認済みなので、approved の行は「承認後に脱退・削除された」ケース。
+	// 既存の行が pending の場合は DO UPDATE の WHERE に一致せず行が返らないため、ErrNoRows を 409 にする。
 	var reqID string
 	err = dbTeam.QueryRow(ctx,
 		`INSERT INTO team_join_requests (team_id, user_id, status) VALUES ($1,$2,'pending')
@@ -1031,7 +1111,7 @@ func joinRequestHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "pending", "request_id": reqID})
 }
 
-// listJoinRequestsHandler: JWT auth, owner/admin only.
+// listJoinRequestsHandler はチームの加入申請を全ステータス分、新しい順に一覧する（JWT 認証必須、owner/admin のみ）。
 func listJoinRequestsHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "admin")
 	if !ok {
@@ -1061,12 +1141,14 @@ func listJoinRequestsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, reqs)
 }
 
-// reviewJoinRequestHandler: JWT auth, owner/admin only. Approve or reject a join request.
+// reviewJoinRequestHandler は加入申請を承認または却下する（JWT 認証必須、owner/admin のみ）。
+// クエリパラメータ action=approve|reject で操作を指定する。
 func reviewJoinRequestHandler(c *gin.Context) {
 	teamID, _, ok := requireTeamRole(c, "admin")
 	if !ok {
 		return
 	}
+	// 1. 入力を検証する（UUID でない ID は 404 として扱う）
 	requestID := c.Param("requestId")
 	if _, err := uuid.Parse(requestID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "pending join request not found"})
@@ -1091,7 +1173,8 @@ func reviewJoinRequestHandler(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	// 保留中の申請のみを対象にし、追加するのは申請者（requester）本人
+	// 2. 保留中の申請のみを対象にし、追加するのは申請者（requester）本人
+	//    （status = 'pending' を条件に UPDATE するので、同じ申請を二重に処理しない）
 	var requesterID string
 	err = tx.QueryRow(ctx,
 		"UPDATE team_join_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3 AND status = 'pending' AND team_id = $4 RETURNING user_id",
@@ -1104,6 +1187,7 @@ func reviewJoinRequestHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 3. 承認ならメンバーに追加する
 	if action == "approve" {
 		// 既にメンバーの場合は既存ロールを維持する（降格させない）
 		if _, err = tx.Exec(ctx,
@@ -1120,7 +1204,8 @@ func reviewJoinRequestHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": newStatus, "user_id": requesterID})
 }
 
-// cancelJoinRequestHandler: JWT auth. Cancel own pending join request.
+// cancelJoinRequestHandler は自分の保留中の加入申請を取り消す（JWT 認証必須）。
+// 該当する申請やチームが無くても 200 を返す。
 func cancelJoinRequestHandler(c *gin.Context) {
 	userID := c.GetString("userID")
 	_, err := dbTeam.Exec(c.Request.Context(),
@@ -1137,7 +1222,7 @@ func cancelJoinRequestHandler(c *gin.Context) {
 // 権限の問い合わせ（フロントエンドと各アップロード API が使う）
 // ------------------------------------------------------------------
 
-// teamPermissionHandler: returns what the caller can do with a team.
+// teamPermissionHandler は呼び出し元がチームに対してできること（閲覧・投稿）とロールを返す。
 // 認証は任意。JWT を先に評価してから判定する:
 //   - can_view: 公開チームは誰でも true。非公開チームはメンバーだけ true。
 //   - can_post: メンバー（member 以上）だけ true。
@@ -1176,12 +1261,15 @@ func teamPermissionHandler(c *gin.Context) {
 // 内部 API（auth-service のアカウント削除から呼ばれる。/api/teams の外なので Nginx からは届かない）
 // ------------------------------------------------------------------
 
+// internalKeyMiddleware は X-Internal-Key ヘッダーを INTERNAL_API_KEY と照合し、一致しなければ 403 で中断する。
+// 鍵が未設定なら内部 API 全体を無効にする。
 func internalKeyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if internalAPIKey == "" {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "internal API is disabled"})
 			return
 		}
+		// 両方を SHA-256 で同じ長さにしてから定数時間で比較する（タイミング攻撃と長さの漏洩を防ぐ）
 		got := sha256.Sum256([]byte(c.GetHeader("X-Internal-Key")))
 		want := sha256.Sum256([]byte(internalAPIKey))
 		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
@@ -1192,7 +1280,7 @@ func internalKeyMiddleware() gin.HandlerFunc {
 	}
 }
 
-// deleteUserDataHandler: DELETE /internal/users/:userId
+// deleteUserDataHandler は DELETE /internal/users/:userId のハンドラ（X-Internal-Key による内部認証）。
 // ユーザーのメンバー情報・加入申請・チーム投稿を削除する。
 // そのユーザーが唯一の owner のチームは、残りのメンバーのうちロールが最も強く、
 // 最も早く参加したメンバーに owner を移譲する。メンバーがいなければチームごと削除する
@@ -1221,6 +1309,7 @@ func deleteUserDataHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 同じトランザクションで次のクエリを発行する前に、結果を読み切ってから rows を閉じる
 	var ownedTeams []string
 	for rows.Next() {
 		var id string
@@ -1237,6 +1326,7 @@ func deleteUserDataHandler(c *gin.Context) {
 		return
 	}
 
+	// 唯一の owner になっているチームごとに、owner の移譲またはチームの削除を行う
 	transferred, deleted := 0, 0
 	for _, teamID := range ownedTeams {
 		var otherOwners int
@@ -1246,9 +1336,11 @@ func deleteUserDataHandler(c *gin.Context) {
 			internalError(c, err)
 			return
 		}
+		// 他にも owner がいるチームは何もしなくてよい
 		if otherOwners > 0 {
 			continue
 		}
+		// 後継者を選ぶ: ロールが強い順 → 参加が早い順（同時刻なら id 順で決定的にする）
 		var successor string
 		err := tx.QueryRow(ctx,
 			`SELECT user_id FROM team_members WHERE team_id = $1 AND user_id <> $2
@@ -1256,6 +1348,7 @@ func deleteUserDataHandler(c *gin.Context) {
 			 LIMIT 1`,
 			teamID, userID).Scan(&successor)
 		if errors.Is(err, pgx.ErrNoRows) {
+			// 他にメンバーがいなければチームごと削除する
 			if _, err := tx.Exec(ctx, "DELETE FROM teams WHERE id = $1", teamID); err != nil {
 				internalError(c, err)
 				return
@@ -1275,6 +1368,7 @@ func deleteUserDataHandler(c *gin.Context) {
 		transferred++
 	}
 
+	// ユーザー本人のデータ（加入申請・メンバー情報・投稿）を全チームから削除する
 	for _, q := range []string{
 		"DELETE FROM team_join_requests WHERE user_id = $1",
 		"DELETE FROM team_members WHERE user_id = $1",
@@ -1289,6 +1383,7 @@ func deleteUserDataHandler(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
+	// 削除済みユーザーの表示名が残らないよう、キャッシュからも消す
 	forgetName(userID)
 	log.Printf("deleted team data for user %s (ownership transferred: %d, teams deleted: %d)", userID, transferred, deleted)
 	c.Status(http.StatusNoContent)
@@ -1296,6 +1391,8 @@ func deleteUserDataHandler(c *gin.Context) {
 
 // ------------------------------------------------------------------
 
+// connectRedis は REDIS_ADDR の Redis に接続し、3 秒間隔で最大 5 回 Ping を試みる。
+// 未設定・接続不能でも起動は止めない（その間、認証付きリクエストは拒否される）。
 func connectRedis() {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
@@ -1318,7 +1415,9 @@ func connectRedis() {
 	log.Println("WARNING: Redis is unreachable; authenticated requests will fail until it recovers")
 }
 
+// main は環境変数から設定を読み込んで DB・Redis に接続し、ルーティングを登録して :8080 で待ち受ける。
 func main() {
+	// 1. 接続と設定を初期化する（JWT_SECRET が無ければ起動しない）
 	dbTeam = connectDB(os.Getenv("TEAM_DATABASE_URL"))
 	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 	if len(jwtSecret) == 0 {
@@ -1334,6 +1433,8 @@ func main() {
 	}
 	connectRedis()
 
+	// 2. 公開 API のルーティングを登録する。
+	//    authMiddleware の無いルートは認証不要か、ハンドラ内で任意認証（verifyToken）を行う。
 	r := gin.Default()
 	api := r.Group("/api/teams")
 	{
@@ -1362,5 +1463,15 @@ func main() {
 	}
 
 	log.Println("team-service listening on :8080")
-	log.Fatal(r.Run(":8080"))
+	// DoS 対策：r.Run はタイムアウト無しで待ち続けるため、http.Server で上限を付ける。
+	// ヘッダーをゆっくり送る接続・つないだまま放置する接続を切る（本文は画像程度までなので読み取りは短め）。
+	// WriteTimeout は付けない（アップロード後の処理が長いと、応答を返す前に切れてしまうため）
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

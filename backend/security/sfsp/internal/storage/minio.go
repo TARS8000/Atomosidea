@@ -1,3 +1,5 @@
+// Package storage は SFSP が使う2つの MinIO（スキャン前のファイルを置く Raw と、
+// スキャン後のファイルを置く Clean）へのアクセスを提供する。
 package storage
 
 import (
@@ -13,18 +15,21 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// パッケージ全体で共有する MinIO クライアント。ConnectMinIO で初期化される。
+// rawBucketName は、バケット名からどちらのクライアントを使うかを判定するために保持する。
 var (
 	RawMinIOClient   *minio.Client
 	CleanMinIOClient *minio.Client
 	rawBucketName    string
 )
 
-// ConnectMinIO initializes both Raw and Clean MinIO clients
+// ConnectMinIO は Raw / Clean 両方の MinIO クライアントを初期化する。
+// それぞれ ListBuckets が成功するまでリトライし、認証情報と疎通を確認する（バケットの作成は行わない）。
 func ConnectMinIO(cfg config.Config) error {
 	var err error
 	rawBucketName = cfg.MinIO.Buckets.RawFiles
 
-	// 1. Raw MinIO Client Initialization
+	// 1. Raw MinIO クライアントの初期化
 	err = config.Retry(5, 2*time.Second, func() error {
 		RawMinIOClient, err = minio.New(cfg.MinIO.RawEndpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(cfg.MinIO.RawAccessKeyID, cfg.MinIO.RawSecretAccessKey, ""),
@@ -43,7 +48,7 @@ func ConnectMinIO(cfg config.Config) error {
 		return fmt.Errorf("unable to connect to Raw MinIO after retries: %w", err)
 	}
 
-	// 2. Clean MinIO Client Initialization
+	// 2. Clean MinIO クライアントの初期化
 	err = config.Retry(5, 2*time.Second, func() error {
 		CleanMinIOClient, err = minio.New(cfg.MinIO.CleanEndpoint, &minio.Options{
 			Creds:  credentials.NewStaticV4(cfg.MinIO.CleanAccessKeyID, cfg.MinIO.CleanSecretAccessKey, ""),
@@ -66,7 +71,8 @@ func ConnectMinIO(cfg config.Config) error {
 	return nil
 }
 
-// UploadFile uploads a file to the appropriate MinIO instance based on bucketName
+// UploadFile はローカルの filePath を bucketName に応じた MinIO にアップロードする。
+// bucketName が raw バケットなら Raw MinIO、それ以外（clean / quarantine など）は Clean MinIO を使う。
 func UploadFile(ctx context.Context, bucketName, objectName, filePath, contentType string) (minio.UploadInfo, error) {
 	client := CleanMinIOClient
 	if bucketName == rawBucketName {
@@ -80,12 +86,13 @@ func UploadFile(ctx context.Context, bucketName, objectName, filePath, contentTy
 	return info, nil
 }
 
-// streamPartSize bounds the memory used by PutObject when the size is unknown (-1).
-// Without it minio-go picks a part size of ~576 MiB for unknown-length uploads.
+// streamPartSize はサイズ不明（-1）のときに PutObject が使うメモリ量を抑えるためのパートサイズ。
+// 指定しないと、minio-go はサイズ不明のアップロードに約 576 MiB のパートサイズを選ぶ。
 const streamPartSize = 16 * 1024 * 1024
 
-// UploadStream streams r to MinIO without buffering the whole object.
-// Pass size = -1 when the length is unknown (memory use is bounded by streamPartSize).
+// UploadStream はオブジェクト全体をバッファせずに r を MinIO へストリーミングでアップロードする。
+// 長さが不明な場合は size = -1 を渡す（メモリ使用量は streamPartSize で抑えられる）。
+// 使用するクライアントの選び方は UploadFile と同じ。
 func UploadStream(ctx context.Context, bucketName, objectName string, r io.Reader, size int64, contentType string) (minio.UploadInfo, error) {
 	client := CleanMinIOClient
 	if bucketName == rawBucketName {
@@ -103,7 +110,8 @@ func UploadStream(ctx context.Context, bucketName, objectName string, r io.Reade
 	return info, nil
 }
 
-// DownloadFile downloads a file from Raw MinIO
+// DownloadFile は Raw MinIO からオブジェクトをローカルの filePath にダウンロードする。
+// bucketName にかかわらず常に Raw MinIO を使う。
 func DownloadFile(ctx context.Context, bucketName, objectName, filePath string) error {
 	err := RawMinIOClient.FGetObject(ctx, bucketName, objectName, filePath, minio.GetObjectOptions{})
 	if err != nil {
@@ -112,7 +120,7 @@ func DownloadFile(ctx context.Context, bucketName, objectName, filePath string) 
 	return nil
 }
 
-// DeleteObject deletes an object from either Raw or Clean MinIO depending on the target bucket
+// DeleteObject は対象バケットに応じて Raw または Clean MinIO からオブジェクトを削除する。
 func DeleteObject(ctx context.Context, bucketName, objectName string) error {
 	client := CleanMinIOClient
 	if bucketName == rawBucketName {
@@ -126,7 +134,7 @@ func DeleteObject(ctx context.Context, bucketName, objectName string) error {
 	return nil
 }
 
-// IsNotFound reports whether err is a MinIO "object/bucket does not exist" error.
+// IsNotFound は err が MinIO の「オブジェクトまたはバケットが存在しない」エラーかどうかを返す。
 func IsNotFound(err error) bool {
 	var resp minio.ErrorResponse
 	if errors.As(err, &resp) {

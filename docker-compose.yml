@@ -26,6 +26,13 @@ x-sfsp-client-env: &sfsp-client-env
   SFSP_API_URL: http://sfsp-api:8080
   SFSP_API_KEY: ${SFSP_API_KEY:?SFSP_API_KEY must be set in .env}
 
+# ユーザーごとのアップロード制限（backend/shared/ratelimit。ゲーム・静的サイト・動画の合計で数える。0 で無効）
+# アップロードを受ける game-upload-api / static-site-upload-api / video-upload-api が読む
+x-upload-limit-env: &upload-limit-env
+  UPLOAD_LIMIT_PER_HOUR: ${UPLOAD_LIMIT_PER_HOUR:-20}
+  UPLOAD_LIMIT_PER_DAY: ${UPLOAD_LIMIT_PER_DAY:-50}
+  UPLOAD_LIMIT_CONCURRENT: ${UPLOAD_LIMIT_CONCURRENT:-2}
+
 # PostgreSQL の起動完了チェック。初期化中（init.sql 実行中）の一時サーバーは TCP を listen しないため、
 # 127.0.0.1 に接続できた時点で init.sql の適用が終わっている
 x-postgres-healthcheck: &postgres-healthcheck
@@ -168,8 +175,11 @@ services:
   # ==========================================
   # Storage Service (Unified MinIO, bucket-level separation)
   # ==========================================
+  # MinIO は公式イメージの配布をやめたので、backend/minio/Dockerfile でソースからビルドする（minio-init も同じイメージ）
   minio:
-    image: minio/minio:latest
+    build:
+      context: ./backend/minio
+    image: atmosidea-minio:RELEASE.2025-09-07T16-13-09Z
     container_name: atmosidea-minio
     restart: always
     command: server /data --console-address ":9001"
@@ -190,8 +200,10 @@ services:
   # ==========================================
   # MinIO バケット自動初期化サービス
   # ==========================================
+  # minio サービスがビルドしたイメージ（mc と sh も入っている）を使う。レジストリへは取りに行かない
   minio-init:
-    image: minio/mc:latest
+    image: atmosidea-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
     container_name: atmosidea-minio-init
     restart: "no"
     environment:
@@ -481,7 +493,7 @@ services:
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_WORKER_CLEAN_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_WORKER_CLEAN_SECRET_KEY}
       SFSP_CLEAN_MINIO_USE_SSL: "false"
-      <<: [*redis-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env, *upload-limit-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_VIDEO_UPLOAD_BYTES: ${MAX_VIDEO_UPLOAD_BYTES:-1073741824}
     volumes:
@@ -549,7 +561,7 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${GAME_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: games
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      <<: [*redis-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env, *upload-limit-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_GAME_UPLOAD_BYTES: ${MAX_GAME_UPLOAD_BYTES:-1073741824}
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
@@ -617,7 +629,7 @@ services:
       MINIO_SECRET_ACCESS_KEY: ${STATIC_SITE_MINIO_SECRET_ACCESS_KEY}
       MINIO_BUCKET_NAME: static-sites
       MINIO_USE_SSL: ${MINIO_USE_SSL}
-      <<: [*redis-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env, *upload-limit-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_SITE_UPLOAD_BYTES: ${MAX_SITE_UPLOAD_BYTES:-524288000}
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}

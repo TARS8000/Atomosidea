@@ -13,11 +13,13 @@ const LoginSuccessPage = () => {
   // コードは 1 回しか使えないため、StrictMode などによる 2 回目の実行では交換しない
   const handledRef = useRef(false);
 
+  // マウント時に 1 回だけ、URL のコードをトークンに交換してログインを完了する。
   useEffect(() => {
     if (handledRef.current) return;
     handledRef.current = true;
 
     const handleLoginSuccess = async () => {
+      // URL からワンタイムコードを取り出す
       const params = new URLSearchParams(location.search);
       const code = params.get('code');
 
@@ -30,6 +32,7 @@ const LoginSuccessPage = () => {
         return;
       }
 
+      // コードをトークンに交換する。失敗したらエラーコード付きでログイン画面へ戻す
       let token: string;
       try {
         const exchangeRes = await axios.post('/api/auth/oauth/exchange', { code });

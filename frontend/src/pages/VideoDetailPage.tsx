@@ -27,7 +27,8 @@ import FullscreenIcon from '@mui/icons-material/Fullscreen';
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import Hls from 'hls.js';
 
-// --- Styled Components for Custom Controls ---
+// --- 独自プレイヤーコントロール用のスタイル付きコンポーネント ---
+// 動画の下端に重ねて表示する半透明のコントロールバー。opacity で表示/非表示を切り替える。
 const ControlBar = styled(Box)(({ theme }) => ({
   position: 'absolute',
   bottom: 0,
@@ -40,12 +41,14 @@ const ControlBar = styled(Box)(({ theme }) => ({
   transition: 'opacity 0.3s',
 }));
 
+// 再生位置・総時間を表示する白文字のテキスト
 const TimeText = styled(Typography)({
   color: 'white',
   minWidth: '50px',
   textAlign: 'center',
 });
 
+/** GET /api/videos/:id が返す動画情報（この画面で使う項目のみ）。 */
 interface Video {
   id: string;
   title: string;
@@ -53,10 +56,13 @@ interface Video {
   filename: string;
   uploader_id: string;
   created_at: string;
+  /** 処理状態（scanning / processing / public / error など） */
   status: string;
+  /** 処理中の進捗説明や失敗理由 */
   processing_details: string | null;
 }
 
+/** GET /api/profile/:id が返す投稿者情報（この画面では名前だけを使う）。 */
 interface Uploader {
   username: string;
 }
@@ -64,15 +70,23 @@ interface Uploader {
 // これ以上変化しない状態（ポーリングを止める）。'failed' / 'invalid' はスキャン結果がそのまま入る。
 const TERMINAL_STATUSES = ['public', 'error', 'failed', 'invalid', 'rejected', 'quarantined'];
 
+// 秒数を「MM:SS」形式の文字列にする（60分以上は分の桁が増える）
 const formatTime = (timeInSeconds: number) => {
   const minutes = Math.floor(timeInSeconds / 60);
   const seconds = Math.floor(timeInSeconds % 60);
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 };
 
+/**
+ * 動画詳細ページ。
+ * 動画情報を取得し、処理が終わるまで 5 秒ごとにポーリングする。公開状態になったら
+ * HLS.js で再生し、独自のコントロールバー（再生/シーク/音量/画質/フルスクリーン）を表示する。
+ * 投稿者本人または管理者には編集・削除ボタンを表示する。
+ */
 const VideoDetailPage = () => {
   const { id } = useParams<{ id: string }>();
   const location = useLocation();
+  // 遷移元が router の state で渡した初期ステータス（無ければ 'unknown'）
   const initialStatus = (location.state as { initialStatus?: string })?.initialStatus || 'unknown';
 
   const [video, setVideo] = useState<Video | null>(null);
@@ -83,11 +97,12 @@ const VideoDetailPage = () => {
   const { user, token } = useAuth();
   const navigate = useNavigate();
 
+  // フルスクリーン対象のコンテナ、video 要素、HLS インスタンスへの参照
   const videoContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
 
-  // Player State
+  // プレイヤーの状態
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -96,7 +111,7 @@ const VideoDetailPage = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
 
-  // HLS Quality State
+  // HLS の画質選択の状態（level -1 は「自動」を表す）
   const [availableQualities, setAvailableQualities] = useState<{ level: number, label: string }[]>([]);
   const [currentQuality, setCurrentQuality] = useState<number | 'auto'>('auto');
   const [activeQualityLabel, setActiveQualityLabel] = useState('');
@@ -108,6 +123,7 @@ const VideoDetailPage = () => {
 
     let pollingInterval: number | null = null;
 
+    // ポーリング用のタイマーを止める（二重に呼んでも安全）
     const stopPolling = () => {
       if (pollingInterval) {
         clearInterval(pollingInterval);
@@ -115,14 +131,17 @@ const VideoDetailPage = () => {
       }
     };
 
+    // 動画情報と投稿者情報を取得し、終端ステータスならポーリングを止める
     const fetchDetails = async () => {
       try {
+        // 1. 動画情報を取得する
         const videoApiUrl = `/api/videos/${id}`;
         const videoRes = await axios.get(videoApiUrl);
 
         setVideo(videoRes.data);
         setCurrentStatus(videoRes.data.status);
 
+        // 2. 終端ステータスならローディングを解除してポーリングを止め、それ以外は待機表示を続ける
         if (TERMINAL_STATUSES.includes(videoRes.data.status)) {
           setLoading(false);
           stopPolling();
@@ -130,6 +149,7 @@ const VideoDetailPage = () => {
           setLoading(true);
         }
 
+        // 3. 投稿者のプロフィールを取得する（失敗しても動画の表示は続ける）
         const uploaderId = videoRes.data?.uploader_id;
         if (uploaderId != null) {
           try {
@@ -154,6 +174,9 @@ const VideoDetailPage = () => {
       }
     };
 
+    // 初回取得を行い、続けて 5 秒間隔のポーリングを開始する。
+    // 注: この中の currentStatus は effect 実行時の値（初期ステータス）のまま更新されないため、
+    // 実際の停止は fetchDetails 内の stopPolling に任せている。
     fetchDetails();
 
     pollingInterval = window.setInterval(() => {
@@ -162,6 +185,7 @@ const VideoDetailPage = () => {
       }
     }, 5000);
 
+    // アンマウント時・ID 変更時にタイマーを止める
     return () => {
       stopPolling();
     };
@@ -171,6 +195,7 @@ const VideoDetailPage = () => {
 
   // --- [2] HLS.js のセットアップ ---
   useEffect(() => {
+    // 公開済みで video 要素が描画されてからでないと再生準備ができない
     if (loading || !video || video.status !== 'public' || !videoRef.current) return;
 
     // 💡 すでに HLS インスタンスが存在する場合は再初期化しない（再レンダリング対策）
@@ -179,10 +204,12 @@ const VideoDetailPage = () => {
     const videoEl = videoRef.current;
     const streamUrl = `/api/videos/${video.id}/stream/playlist.m3u8`;
 
+    // MSE が使えるブラウザでは HLS.js で再生する
     if (Hls.isSupported()) {
       const hls = new Hls({ debug: true });
       hlsRef.current = hls;
 
+      // マニフェスト解析後、利用可能な画質の一覧を作る（先頭に「自動」を加える）
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         const qualities = data.levels.map((level, index) => ({
           level: index,
@@ -192,6 +219,7 @@ const VideoDetailPage = () => {
         setCurrentQuality('auto');
       });
 
+      // 画質が切り替わったら、「自動」の横に出す実際の画質ラベルを更新する
       hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
         const currentLevel = hls.levels[data.level];
         if (currentLevel) {
@@ -200,6 +228,8 @@ const VideoDetailPage = () => {
         }
       });
 
+      // 致命的エラー時の復旧: ネットワークエラーは読み込みを再開し、メディアエラーは復旧を試み、
+      // それ以外はインスタンスを破棄する
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
           switch (data.type) {
@@ -216,6 +246,7 @@ const VideoDetailPage = () => {
       hls.loadSource(streamUrl);
       hls.attachMedia(videoEl);
 
+      // アンマウント時などに HLS インスタンスを破棄する
       return () => {
         if (hlsRef.current) {
           hlsRef.current.destroy();
@@ -223,6 +254,7 @@ const VideoDetailPage = () => {
         }
       };
     } else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari など HLS をネイティブ再生できるブラウザでは src に直接指定する（画質選択は出ない）
       videoEl.src = streamUrl;
     } else {
       setError('お使いのブラウザはHLS動画の再生に対応していません。');
@@ -232,6 +264,7 @@ const VideoDetailPage = () => {
   }, [loading, video?.id, video?.status]);
 
   // --- [3] フルスクリーンハンドリング ---
+  // Esc キーなどボタン以外で解除された場合も含め、フルスクリーン状態を document と同期する
   useEffect(() => {
     const handleFullscreenChange = () => {
       setIsFullscreen(!!document.fullscreenElement);
@@ -240,7 +273,8 @@ const VideoDetailPage = () => {
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, []);
 
-  // --- Player Control Handlers ---
+  // --- プレイヤー操作のハンドラ ---
+  // 再生/一時停止を切り替える（video の onPlay / onPause でも状態は同期される）
   const togglePlayPause = () => {
     if (videoRef.current) {
       isPlaying ? videoRef.current.pause() : videoRef.current.play();
@@ -248,6 +282,7 @@ const VideoDetailPage = () => {
     }
   };
 
+  // シークバーの操作で再生位置を移動する
   const handleSeek = (_event: Event, newValue: number | number[]) => {
     if (videoRef.current) {
       videoRef.current.currentTime = newValue as number;
@@ -255,6 +290,7 @@ const VideoDetailPage = () => {
     }
   };
 
+  // 音量スライダーの操作を反映する。0 にしたときはミュート扱いにする
   const handleVolumeChange = (_event: Event, newValue: number | number[]) => {
     if (videoRef.current) {
       const newVolume = newValue as number;
@@ -264,6 +300,8 @@ const VideoDetailPage = () => {
     }
   };
 
+  // ミュートを切り替える。音量 0 のまま解除した場合は 0.5 に戻す。
+  // 注: ここでは isMuted の state を更新していない
   const toggleMute = () => {
     if (videoRef.current) {
       const newMuted = !isMuted;
@@ -275,6 +313,7 @@ const VideoDetailPage = () => {
     }
   };
 
+  // コンテナ（動画とコントロールバー）をフルスクリーン表示にする／解除する
   const toggleFullscreen = () => {
     if (!videoContainerRef.current) return;
     if (!isFullscreen) {
@@ -284,6 +323,7 @@ const VideoDetailPage = () => {
     }
   };
 
+  // 画質を選択する。'auto' は HLS.js の自動切り替え（currentLevel = -1）に対応する
   const handleQualityChange = (event: SelectChangeEvent<number | 'auto'>) => {
     const selectedQuality = event.target.value as number | 'auto';
     setCurrentQuality(selectedQuality);
@@ -292,6 +332,8 @@ const VideoDetailPage = () => {
     }
   };
 
+  // 確認ダイアログの後に動画を削除し、トップページへ戻る。
+  // /api/videos/delete/:id は nginx で video-upload-api の DELETE /api/videos/:id に書き換えられる
   const handleDelete = async () => {
     if (window.confirm('本当にこの動画を削除しますか？')) {
       try {
@@ -304,6 +346,7 @@ const VideoDetailPage = () => {
     }
   };
 
+  // 読み込み中、またはスキャン・変換処理中は待機画面を表示する
   if (loading || (video && (video.status === 'scanning' || video.status === 'processing'))) {
     let message = '動画を準備中...';
     if (video?.status === 'scanning') {
@@ -320,18 +363,21 @@ const VideoDetailPage = () => {
     );
   }
 
+  // エラー・未取得・処理失敗（public 以外の終端ステータス）の表示
   if (error) return <Container><Alert severity="error">{error}</Alert></Container>;
   if (!video) return <Container><Alert severity="warning">動画が見つかりません。</Alert></Container>;
   if (video.status !== 'public' && TERMINAL_STATUSES.includes(video.status)) {
     return <Container><Alert severity="error">動画の処理に失敗しました: {video.processing_details || video.status}</Alert></Container>;
   }
 
+  // 投稿者本人または管理者なら編集・削除ボタンを出す（表示制御のみ。実際の権限判定はバックエンドで行う）
   const canEdit = user && (String(user.userID) === String(video.uploader_id) || user.isAdmin);
 
   return (
       <Container>
         <Typography variant="h4" component="h1" gutterBottom>{video.title}</Typography>
 
+        {/* プレイヤー本体。マウスが乗っている間だけコントロールバーを表示する */}
         <Box
             ref={videoContainerRef}
             sx={{ width: '800px', height: '450px', maxWidth: '100%', mx: 'auto', mb: 3, backgroundColor: 'black', position: 'relative' }}
@@ -369,6 +415,7 @@ const VideoDetailPage = () => {
                 onChange={handleVolumeChange}
                 sx={{ width: 100, color: 'white', mx: 1 }}
             />
+            {/* 画質選択（「自動」以外の画質がある場合のみ）。メニューはフルスクリーン中も見えるようコンテナ内に描画する */}
             {availableQualities.length > 1 && (
                 <FormControl variant="standard" size="small" sx={{ minWidth: 120, ml: 1 }}>
                   <Select
@@ -398,6 +445,7 @@ const VideoDetailPage = () => {
           </ControlBar>
         </Box>
 
+        {/* 投稿者・投稿日と、編集・削除ボタン */}
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 2 }}>
           <Typography variant="subtitle1" color="text.secondary">
             投稿者: {uploader?.username || 'Unknown User'} | 投稿日: {new Date(video.created_at).toLocaleDateString()}

@@ -1,8 +1,9 @@
 ﻿package scanner
 
-// ScanResult represents the result of a single scan operation
+// ScanResult は1回のスキャン（ClamAV または YARA）の結果を表す。
+// RawOutput にはサンドボックスで実行したコマンドの stdout / stderr が入る。
 type ScanResult struct {
-	Result    string          `json:"result"` // e.g., clean, suspicious, malicious, error
+	Result    string          `json:"result"` // 例: clean, suspicious, malicious, error
 	Details   string          `json:"details,omitempty"`
 	RawOutput *map[string]any `json:"raw_output,omitempty"`
 }

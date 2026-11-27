@@ -1,11 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Monitoring Dashboard</title>
+  <title>Atomosidea Monitor</title>
   <!-- Tailwind は CDN 版のみを使う（ビルド時の PostCSS 処理はしていない） -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- HUD 用のフォント（見出し: Orbitron / UI: Rajdhani / 数値・ログ: Share Tech Mono）。読み込めなければ index.css の代替フォントになる -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
 </head>
 <body>
 <div id="root"></div>

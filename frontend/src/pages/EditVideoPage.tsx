@@ -4,14 +4,22 @@ import axios from 'axios';
 import { Container, TextField, Button, Typography, Box, CircularProgress, Alert } from '@mui/material';
 import { useAuth } from '../context/AuthContext';
 
+/** サムネイルのスキャン完了を待つ最大時間（ミリ秒）。超えたらタイムアウトとして reject する。 */
 const MAX_POLL_MS = 120000;
 
+/**
+ * 動画のタイトル・説明・サムネイルを編集するページ。
+ * サムネイルは SFSP のセキュリティスキャンを経て保存されるため、送信後にスキャン完了を待つ。
+ */
 const EditVideoPage = () => {
   const { id } = useParams();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  // 新しく選択されたサムネイル画像（未選択なら null）
   const [thumbnail, setThumbnail] = useState<File | null>(null);
+  // サーバーに保存済みのサムネイル URL（動画 API では thumbnail_path という名前）
   const [existingThumbnailUrl, setExistingThumbnailUrl] = useState('');
+  // 画面に表示中のサムネイル URL（選択直後はローカルの blob URL になる）
   const [thumbnailUrl, setThumbnailUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
@@ -21,6 +29,7 @@ const EditVideoPage = () => {
   const navigate = useNavigate();
   const { token } = useAuth();
 
+  // 初回表示時に現在の動画情報を取得してフォームに反映する。
   useEffect(() => {
     const fetchVideo = async () => {
       try {
@@ -40,6 +49,7 @@ const EditVideoPage = () => {
     fetchVideo();
   }, [id, token]);
 
+  /** ファイル選択時に、選んだ画像を保持してローカルプレビューを表示する。 */
   const handleThumbnailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
@@ -48,6 +58,10 @@ const EditVideoPage = () => {
     }
   };
 
+  /**
+   * 2 秒ごとに動画情報を取得し、thumbnail_sfsp_job_id が空になった（スキャン処理が終わった）時点で
+   * サムネイルの URL を返して解決する。タイムアウト・中断時は reject する。
+   */
   const pollVideo = async (signal: AbortSignal): Promise<{ thumbnailUrl?: string }> => {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
@@ -64,12 +78,14 @@ const EditVideoPage = () => {
             console.error('Polling video failed:', err);
           }
         }
+        // 最大待機時間を超えたらポーリングを止めて reject する（解決済みなら reject は無視される）
         if (Date.now() - startTime > MAX_POLL_MS) {
           clearInterval(pollInterval);
           reject(new Error('サムネイルアップロードの待機がタイムアウトしました。'));
         }
       }, 2000);
 
+      // 中断（AbortController.abort）されたらポーリングを止めて reject する
       signal.addEventListener('abort', () => {
         clearInterval(pollInterval);
         reject(new Error('Polling aborted'));
@@ -77,6 +93,7 @@ const EditVideoPage = () => {
     });
   };
 
+  /** フォーム送信時の処理。サムネイルがあれば PUT /api/videos/:id で送信し、スキャン完了を待ってから詳細ページへ遷移する。 */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setUpdating(true);
@@ -85,6 +102,7 @@ const EditVideoPage = () => {
 
     const controller = new AbortController();
 
+    // 1. 送信するフォームデータを組み立てる
     const formData = new FormData();
     formData.append('title', title);
     formData.append('description', description);
@@ -95,6 +113,7 @@ const EditVideoPage = () => {
     try {
       let newThumbnailUrl = thumbnailUrl;
 
+      // 2. サムネイルが選択されている場合のみ PUT を送り、スキャン中なら完了を待って新しい URL を得る
       if (thumbnail) {
         setIsScanningThumbnail(true);
         const res = await axios.put(`/api/videos/${id}`, formData, {
@@ -113,13 +132,14 @@ const EditVideoPage = () => {
         }
       }
 
-// Preload the freshly-written thumbnail (cache-buster to bypass any stale
-      // browser cache of the old image) and keep the overlay up until it has
-      // loaded, then swap the displayed image only once it is fully ready, so
-      // the old thumbnail never flashes during the transition.
+      // 3. 書き込まれたばかりのサムネイルを先読みする（旧画像のブラウザキャッシュを
+      // 避けるためにキャッシュバスターを付ける）。読み込みが終わるまでオーバーレイを
+      // 表示したままにし、完全に準備できてから表示画像を差し替えることで、
+      // 切り替え中に旧サムネイルが一瞬表示されないようにする。
       const bust = newThumbnailUrl.includes('?') ? '&' : '?';
       const freshUrl = newThumbnailUrl + bust + 't=' + Date.now();
       const preload = new Image();
+      // 先読み完了（成功・失敗とも）で表示を切り替え、2 秒後に詳細ページへ遷移する
       const reveal = () => {
         setIsScanningThumbnail(false);
         setThumbnailUrl(freshUrl);
@@ -139,6 +159,7 @@ const EditVideoPage = () => {
     }
   };
 
+  /** 確認ダイアログの後、DELETE /api/videos/:id/thumbnail でサムネイルを削除する。 */
   const handleDeleteThumbnail = async () => {
     if (!window.confirm('本当にサムネイルを削除しますか？')) {
       return;
@@ -196,6 +217,7 @@ const EditVideoPage = () => {
           </Button>
           {thumbnail && <Typography sx={{ ml: 2, display: 'inline' }}>{thumbnail.name}</Typography>}
         </Box>
+        {/* 表示中のサムネイル。スキャン中は画像の上に半透明のオーバーレイを重ねる */}
         {thumbnailUrl && (
           <Box mb={2}>
             <Typography variant="subtitle1">現在のサムネイル</Typography>

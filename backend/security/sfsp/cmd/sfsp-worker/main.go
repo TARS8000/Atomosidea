@@ -1,3 +1,5 @@
+// sfsp-worker は SFSP のスキャンワーカー。Redis のスキャンキューからジョブを取り出し、
+// MinIO 上のファイルをスキャンして結果を DB に記録する。
 package main
 
 import (
@@ -18,7 +20,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// main は設定を読み込み、sfsp-db・app-db（任意）・MinIO・Redis に接続した後、
+// ワーカーループを別 goroutine で起動し、終了シグナルまたはループの異常終了を待つ。
 func main() {
+	// ロガーを初期化する
 	logger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("can't initialize zap logger: %v", err)
@@ -40,6 +45,7 @@ func main() {
 	// REDIS_URL（redis://:<pw>@redis:6379）があればそれを使い、URL にパスワードが無ければ REDIS_PASSWORD を補う
 	sharedCfg.RedisAddr = config.ResolveRedisAddr(sharedCfg.RedisAddr, sharedCfg.RedisPassword)
 
+	// 起動時に有効なスキャン・展開の上限値をログに残す
 	sugar.Infow("SFSP worker limits",
 		"clamav_max_filesize", cfg.ClamAV.MaxFileSize,
 		"clamav_max_scansize", cfg.ClamAV.MaxScanSize,
@@ -56,6 +62,7 @@ func main() {
 	}
 	defer database.Close()
 
+	// ワーカー全体の停止に使うコンテキスト
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,13 +95,15 @@ func main() {
 	sugar.Info("SFSP Worker started. Waiting for jobs...")
 
 	// 5. ワーカープロセスの起動
+	// ループが終了したら done を閉じて main に知らせる
 	done := make(chan struct{})
 	go func() {
 		worker.StartWorker(ctx, cfg, appDB, sugar)
 		close(done)
 	}()
 
-	// Graceful Shutdown
+	// グレースフルシャットダウン
+	// SIGINT/SIGTERM の受信、またはワーカーループの予期しない終了のどちらかを待つ
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	unexpected := false
@@ -106,6 +115,7 @@ func main() {
 	}
 	sugar.Info("Shutting down SFSP Worker...")
 
+	// コンテキストをキャンセルしてワーカーに停止を伝え、最大5秒だけ終了を待つ
 	cancel()
 	// 処理中のジョブは Ack していないので sfsp:scan_queue:processing に残り、次回起動時に回収される
 	select {
@@ -113,6 +123,7 @@ func main() {
 	case <-time.After(5 * time.Second):
 	}
 	sugar.Info("SFSP Worker stopped.")
+	// 異常終了の場合は終了コード 1 で終える（os.Exit は defer を実行しないため先にログをフラッシュする）
 	if unexpected {
 		logger.Sync()
 		os.Exit(1)
