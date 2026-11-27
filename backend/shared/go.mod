@@ -1,6 +1,6 @@
 module github.com/atmosidea/shared
 
-go 1.25
+go 1.27.4
 
 require (
 	github.com/go-redis/redis/v8 v8.11.5
@@ -23,6 +23,7 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sys v0.29.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )

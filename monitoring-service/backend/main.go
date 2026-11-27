@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -254,7 +253,7 @@ var monitorProject = strings.TrimSpace(os.Getenv("MONITOR_PROJECT"))
 
 // resolveProject は監視対象のプロジェクト名を返す。MONITOR_PROJECT を優先し、未設定なら
 // 一覧の中の atmosidea-frontend コンテナのプロジェクトラベルを使う。どちらも無ければ空（絞り込まない）。
-func resolveProject(containers []types.Container) string {
+func resolveProject(containers []container.Summary) string {
 	if monitorProject != "" {
 		return monitorProject
 	}
@@ -275,13 +274,13 @@ func inProject(labels map[string]string, project string) bool {
 
 // listProjectContainers は停止中を含む全コンテナを取得し、監視対象のプロジェクトのものだけを返す。
 // プロジェクトの判定に atmosidea-frontend を探すため、絞り込みは取得後に行う。
-func listProjectContainers(ctx context.Context, cli *client.Client) ([]types.Container, string, error) {
+func listProjectContainers(ctx context.Context, cli *client.Client) ([]container.Summary, string, error) {
 	all, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
 		return nil, "", err
 	}
 	project := resolveProject(all)
-	filtered := make([]types.Container, 0, len(all))
+	filtered := make([]container.Summary, 0, len(all))
 	for _, c := range all {
 		if inProject(c.Labels, project) {
 			filtered = append(filtered, c)
@@ -330,7 +329,7 @@ func getContainerStats(cli *client.Client) http.HandlerFunc {
 			}
 			// stats の取得は 1 件ごとに時間がかかるため、コンテナごとに goroutine で並行実行する
 			wg.Add(1)
-			go func(c types.Container) {
+			go func(c container.Summary) {
 				defer wg.Done()
 				// stream=false で 1 回分のスナップショットだけを受け取る
 				stats, err := cli.ContainerStats(ctx, c.ID, false)
@@ -340,7 +339,7 @@ func getContainerStats(cli *client.Client) http.HandlerFunc {
 				}
 				defer stats.Body.Close()
 
-				var v types.StatsJSON
+				var v container.StatsResponse
 				if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
 					log.Printf("Failed to decode stats for container %s: %v", c.ID, err)
 					return
@@ -370,7 +369,7 @@ func getContainerStats(cli *client.Client) http.HandlerFunc {
 
 // calculateCPUPercent は docker stats と同じ式で CPU 使用率を求める。
 // cgroup v2 では PercpuUsage が空になるため、OnlineCPUs を優先し、無ければ PercpuUsage の数、それも無ければ 1 とする。
-func calculateCPUPercent(v *types.StatsJSON) float64 {
+func calculateCPUPercent(v *container.StatsResponse) float64 {
 	cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage) - float64(v.PreCPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(v.CPUStats.SystemUsage) - float64(v.PreCPUStats.SystemUsage)
 
@@ -470,7 +469,7 @@ func getContainers(cli *client.Client) http.HandlerFunc {
 
 		for _, c := range containers {
 			wg.Add(1)
-			go func(c types.Container) {
+			go func(c container.Summary) {
 				defer wg.Done()
 				name := strings.TrimPrefix(c.Names[0], "/")
 				createdTime := time.Unix(c.Created, 0)
