@@ -1,0 +1,4 @@
+# 手元（Windows など）の node_modules をイメージに持ち込まない（npm ci で入れたものを COPY . . で上書きしてしまい、
+# esbuild などのネイティブバイナリが合わずにビルドが失敗する）。ビルド結果の dist も不要
+node_modules
+dist
