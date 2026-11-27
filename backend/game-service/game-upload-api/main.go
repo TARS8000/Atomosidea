@@ -443,6 +443,9 @@ func main() {
 	}
 
 	// 6. ルートを登録してサーバーを起動する（一覧・詳細は認証任意、更新系は authMiddleware 必須）
+	// 保存量・ディスク・処理待ちの判定と、分割アップロードの準備
+	initUploadGuard(context.Background(), maxGameUploadBytes)
+
 	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
 	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
 	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
@@ -454,7 +457,9 @@ func main() {
 		api.GET("", listGamesHandler)
 		api.GET("/:id", gameDetailsHandler)
 		api.POST("/upload", authMiddleware(), uploadLimitMiddleware(uploadLimits), uploadGameHandler)
-		api.PUT("/:id", authMiddleware(), updateGameHandler)
+		// 分割アップロード（Cloudflare の 100 MB 制限への対応）
+		registerChunkRoutes(api, "/upload/chunks", authMiddleware())
+		api.PUT("/:id", authMiddleware(), imageLimitMiddleware(), updateGameHandler)
 		api.DELETE("/:id", authMiddleware(), deleteGameHandler)
 		api.DELETE("/:id/thumbnail", authMiddleware(), deleteThumbnailHandler)
 		api.PUT("/adjust/:id", authMiddleware(), adjustGameHandler)
@@ -513,19 +518,22 @@ func uploadGameHandler(c *gin.Context) {
 		return
 	}
 
-	// ゲームファイルを取り出し、サイズ上限を確認する
-	gameFile, gameFileHeader, err := c.Request.FormFile("game")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Game ZIP file is required"})
+	// ゲームファイルを取り出し、サイズ上限を確認する（分割アップロードなら upload_id から組み立て済みのファイルを開く）
+	gameFile, gameOrigName, gameFileSize, ok := openMainUpload(c, "game")
+	if !ok {
 		return
 	}
 	defer gameFile.Close()
 
-	if gameFileHeader.Size > maxGameUploadBytes {
+	if gameFileSize > maxGameUploadBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("Game file exceeds the maximum size of %d bytes", maxGameUploadBytes)})
 		return
 	}
-	gameFilename := safeFilename(gameFileHeader.Filename, "game.zip")
+	// 保存量・ディスクの空き・処理待ちを確かめる
+	if !guardUploadSize(c, gameFileSize) {
+		return
+	}
+	gameFilename := safeFilename(gameOrigName, "game.zip")
 
 	// ファイル形式チェック (ZIP)
 	buffer := make([]byte, 512)
@@ -553,7 +561,7 @@ func uploadGameHandler(c *gin.Context) {
 	}
 
 	// Unity WebGLビルドのZIPファイルかどうかの検証
-	verificationResult, err := verifyUnityWebGLZip(gameFile, gameFileHeader.Size)
+	verificationResult, err := verifyUnityWebGLZip(gameFile, gameFileSize)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to verify ZIP file: %v", err)})
 		return
@@ -605,13 +613,14 @@ func uploadGameHandler(c *gin.Context) {
 	_, err = db.Exec(
 		context.Background(),
 		`INSERT INTO games
-        (id, user_id, title, description, status, team_id)
-        VALUES ($1, $2, $3, $4, 'scanning', $5)`,
+        (id, user_id, title, description, status, team_id, upload_bytes)
+        VALUES ($1, $2, $3, $4, 'scanning', $5, $6)`,
 		gameID,
 		userUUID,
 		title,
 		description,
 		teamIDVal,
+		gameFileSize,
 	)
 	if err != nil {
 		logger.Errorf("Error creating initial game record: %v", err)
@@ -1254,31 +1263,6 @@ func authMiddleware() gin.HandlerFunc {
 		}
 		c.Set("userID", info.UserID)
 		c.Set("isAdmin", info.IsAdmin)
-		c.Next()
-	}
-}
-
-// uploadLimitMiddleware はユーザーごとのアップロード制限（shared/ratelimit）をかける。authMiddleware の後に置く。
-// ゲーム・静的サイト・動画で同じ Redis のキーを使うので、本数は 3 種類の合計で数える。
-// 管理者は制限しない。Redis に届かないときはログを出して通す（サーバー全体の同時数は nginx でも制限している）。
-func uploadLimitMiddleware(limits ratelimit.UploadLimits) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if c.GetBool("isAdmin") {
-			c.Next()
-			return
-		}
-		userID := c.GetString("userID")
-		d, err := ratelimit.CheckUpload(c.Request.Context(), queue.RedisClient, limits, userID)
-		if err != nil {
-			logger.Warnf("Upload rate limit check failed, allowing the request: %v", err)
-		}
-		if !d.Allowed {
-			logger.Warnf("Upload rejected by per-user rate limit: user=%s reason=%s", userID, d.Reason)
-			c.Header("Retry-After", strconv.Itoa(int(d.RetryAfter/time.Second)+1))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": d.Reason})
-			return
-		}
-		defer d.Release()
 		c.Next()
 	}
 }

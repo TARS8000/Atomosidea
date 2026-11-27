@@ -26,12 +26,39 @@ x-sfsp-client-env: &sfsp-client-env
   SFSP_API_URL: http://sfsp-api:8080
   SFSP_API_KEY: ${SFSP_API_KEY:?SFSP_API_KEY must be set in .env}
 
-# ユーザーごとのアップロード制限（backend/shared/ratelimit。ゲーム・静的サイト・動画の合計で数える。0 で無効）
-# アップロードを受ける game-upload-api / static-site-upload-api / video-upload-api が読む
+# アップロードの DoS 対策（backend/shared の ratelimit / uploadguard。0 で無効。管理者は本数・保存量の対象外）
+# アップロードを受ける game-upload-api / static-site-upload-api / video-upload-api と、
+# 画像を差し替える profile-service / video-worker が読む（使わない値は無視される）
 x-upload-limit-env: &upload-limit-env
+  # ユーザーごとの本数（ゲーム・静的サイト・動画の合計）と同時数
   UPLOAD_LIMIT_PER_HOUR: ${UPLOAD_LIMIT_PER_HOUR:-20}
   UPLOAD_LIMIT_PER_DAY: ${UPLOAD_LIMIT_PER_DAY:-50}
   UPLOAD_LIMIT_CONCURRENT: ${UPLOAD_LIMIT_CONCURRENT:-2}
+  # 作ってから NEW_ACCOUNT_DAYS 日未満のアカウントの本数と保存量
+  NEW_ACCOUNT_DAYS: ${NEW_ACCOUNT_DAYS:-7}
+  UPLOAD_LIMIT_NEW_ACCOUNT_PER_HOUR: ${UPLOAD_LIMIT_NEW_ACCOUNT_PER_HOUR:-5}
+  UPLOAD_LIMIT_NEW_ACCOUNT_PER_DAY: ${UPLOAD_LIMIT_NEW_ACCOUNT_PER_DAY:-10}
+  UPLOAD_QUOTA_NEW_ACCOUNT_BYTES: ${UPLOAD_QUOTA_NEW_ACCOUNT_BYTES:-1073741824}
+  # ユーザーごとの保存量の上限（既定 5 GiB）
+  UPLOAD_QUOTA_BYTES: ${UPLOAD_QUOTA_BYTES:-5368709120}
+  # ディスクの空きがこれ（＋今回のファイルの 2 倍）を下回ったら受け付けない（既定 10 GiB）
+  UPLOAD_MIN_FREE_DISK_BYTES: ${UPLOAD_MIN_FREE_DISK_BYTES:-10737418240}
+  # 検査待ち・動画の変換待ちがこれ以上なら受け付けない
+  UPLOAD_MAX_SCAN_BACKLOG: ${UPLOAD_MAX_SCAN_BACKLOG:-20}
+  UPLOAD_MAX_TRANSCODE_BACKLOG: ${UPLOAD_MAX_TRANSCODE_BACKLOG:-10}
+  # 画像（アイコン・背景・サムネイル）の差し替えは 1 時間あたりこの回数まで
+  IMAGE_UPLOAD_LIMIT_PER_HOUR: ${IMAGE_UPLOAD_LIMIT_PER_HOUR:-30}
+
+# リソースの上限（DoS 対策：1 つのサービスが CPU・メモリを使い切って、VM 全体が止まるのを防ぐ）。
+# VM は 4 vCPU / 16 GB。DB には付けない（メモリ不足で DB が落ちるほうが困るため）
+x-limits-small: &limits-small
+  resources:
+    limits:
+      memory: 512m
+x-limits-medium: &limits-medium
+  resources:
+    limits:
+      memory: 1g
 
 # PostgreSQL の起動完了チェック。初期化中（init.sql 実行中）の一時サーバーは TCP を listen しないため、
 # 127.0.0.1 に接続できた時点で init.sql の適用が終わっている
@@ -158,6 +185,7 @@ services:
     image: redis:7-alpine
     container_name: atmosidea-redis
     restart: always
+    deploy: *limits-medium
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
     # パスワードを compose の command に展開しないよう、コンテナ内の環境変数から渡す。
@@ -182,6 +210,10 @@ services:
     image: atmosidea-minio:RELEASE.2025-09-07T16-13-09Z
     container_name: atmosidea-minio
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 2g
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -332,6 +364,7 @@ services:
         VITE_STATIC_SITE_DOMAIN: ${STATIC_SITE_DOMAIN}
     container_name: atmosidea-frontend
     restart: always
+    deploy: *limits-small
     ports:
       - "3001:80"
     volumes:
@@ -365,6 +398,7 @@ services:
       dockerfile: backend/auth/auth-worker/Dockerfile
     container_name: atmosidea-auth-service
     restart: always
+    deploy: *limits-small
     depends_on:
       auth-db:
         condition: service_started
@@ -381,6 +415,9 @@ services:
       db-role-init:
         condition: service_completed_successfully
     environment:
+      # 同じアカウントへのログインに LOGIN_MAX_FAILURES 回失敗したら、LOGIN_LOCKOUT_MINUTES 分ロックする（総当たり対策）
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-10}
+      LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-15}
       PROFILE_SERVICE_URL: "http://profile-service:8084"
       DATABASE_URL: "postgres://auth_service_user:${AUTH_SERVICE_DB_PASSWORD}@auth-db:5432/auth_db?sslmode=disable"
       APP_DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@app-db:5432/app_db?sslmode=disable"
@@ -414,6 +451,7 @@ services:
       dockerfile: backend/profile-service/profile-worker/Dockerfile
     container_name: atmosidea-profile-service
     restart: always
+    deploy: *limits-medium
     depends_on:
       profile-db:
         condition: service_started
@@ -437,7 +475,7 @@ services:
       SFSP_CLEAN_MINIO_ACCESS_KEY_ID: ${SFSP_PROFILE_WORKER_ACCESS_KEY}
       SFSP_CLEAN_MINIO_SECRET_ACCESS_KEY: ${SFSP_PROFILE_WORKER_SECRET_KEY}
       SFSP_CLEAN_MINIO_USE_SSL: "false"
-      <<: [*redis-env, *internal-api-env, *sfsp-client-env]
+      <<: [*redis-env, *internal-api-env, *sfsp-client-env, *upload-limit-env]
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
     networks:
       - atmosidea-network
@@ -450,6 +488,7 @@ services:
       dockerfile: backend/team-service/team-worker/Dockerfile
     container_name: atmosidea-team-service
     restart: always
+    deploy: *limits-small
     depends_on:
       team-db:
         condition: service_started
@@ -471,6 +510,11 @@ services:
       dockerfile: backend/video-service/video-upload-api/Dockerfile
     container_name: atmosidea-video-upload-api
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
     depends_on:
       app-db:
         condition: service_started
@@ -509,6 +553,7 @@ services:
       dockerfile: backend/video-service/video-worker/Dockerfile
     container_name: atmosidea-video-worker
     restart: always
+    deploy: *limits-medium
     depends_on:
       app-db:
         condition: service_started
@@ -524,7 +569,7 @@ services:
       VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY_ID: ${VIDEO_MINIO_ACCESS_KEY_ID}
       VIDEO_MINIO_SECRET_ACCESS_KEY: ${VIDEO_MINIO_SECRET_ACCESS_KEY}
-      <<: [*redis-env, *sfsp-client-env]
+      <<: [*redis-env, *sfsp-client-env, *upload-limit-env]
       TEAM_SERVICE_URL: http://team-service:8080
       MAX_IMAGE_UPLOAD_BYTES: ${MAX_IMAGE_UPLOAD_BYTES:-10485760}
       SFSP_CLEAN_MINIO_ENDPOINT: minio:9000
@@ -542,6 +587,11 @@ services:
       dockerfile: backend/game-service/game-upload-api/Dockerfile
     container_name: atmosidea-game-upload-api
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
     depends_on:
       app-db:
         condition: service_started
@@ -576,6 +626,11 @@ services:
       dockerfile: backend/game-service/game-worker/Dockerfile
     container_name: atmosidea-game-worker
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
     depends_on:
       app-db:
         condition: service_started
@@ -610,6 +665,11 @@ services:
       dockerfile: backend/static-site-service/static-site-upload-api/Dockerfile
     container_name: atmosidea-static-site-upload-api
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
     depends_on:
       app-db:
         condition: service_started
@@ -644,6 +704,11 @@ services:
       dockerfile: backend/static-site-service/static-site-worker/Dockerfile
     container_name: atmosidea-static-site-worker
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
     depends_on:
       app-db:
         condition: service_started
@@ -678,6 +743,7 @@ services:
       dockerfile: backend/profile-service/mypage-worker/Dockerfile
     container_name: atmosidea-mypage-service
     restart: always
+    deploy: *limits-small
     depends_on:
       # 以前は db-role-init（app-db の healthy を待つ）経由で待っていたので、app-db の healthy を直接待つ
       app-db:
@@ -701,6 +767,7 @@ services:
       dockerfile: backend/security/sfsp/docker/api/Dockerfile
     container_name: sfsp-api
     restart: always
+    deploy: *limits-medium
     depends_on:
       sfsp-db:
         condition: service_started

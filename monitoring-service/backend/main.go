@@ -222,6 +222,10 @@ func main() {
 	router.HandleFunc("/api/topology", getTopology(cli)).Methods("GET")
 	router.HandleFunc("/api/volumes", listVolumes(cli)).Methods("GET")
 
+	// DoS 対策の状態（ディスクの空き・処理待ち・429 などの件数）。1 分ごとに集め、しきい値を超えたら Discord に知らせる
+	guard := startGuardWatcher(cli)
+	router.HandleFunc("/api/guard/status", guard.handler()).Methods("GET")
+
 	// ログのストリーミング（対象は ?container=<名前または ID>）
 	router.HandleFunc("/ws/logs", serveWs(cli)).Methods("GET")
 

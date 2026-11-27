@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS public.videos (
      processing_details TEXT,
      -- team_idがNULLの動画が全体公開、チームトークンを保持する動画がそのチーム限定公開になる
      team_id VARCHAR(24),
+     -- アップロードした本体の大きさ（ユーザーごとの保存量の上限に使う。backend/shared/uploadguard）
+     upload_bytes BIGINT NOT NULL DEFAULT 0,
      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
                               );
@@ -39,6 +41,8 @@ CREATE TABLE IF NOT EXISTS public.games (
      offset_y INTEGER DEFAULT 0 NOT NULL,
      native_width INTEGER DEFAULT 1280 NOT NULL,
      native_height INTEGER DEFAULT 720 NOT NULL,
+     -- アップロードした本体の大きさ（ユーザーごとの保存量の上限に使う。backend/shared/uploadguard）
+     upload_bytes BIGINT NOT NULL DEFAULT 0,
      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
                               );
@@ -58,6 +62,8 @@ CREATE TABLE IF NOT EXISTS public.static_sites (
      minio_path VARCHAR(255) NOT NULL,
      entry_point_path VARCHAR(255) DEFAULT 'index.html' NOT NULL,
      thumbnail_url VARCHAR(255),
+     -- アップロードした本体の大きさ（ユーザーごとの保存量の上限に使う。backend/shared/uploadguard）
+     upload_bytes BIGINT NOT NULL DEFAULT 0,
      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
                               );

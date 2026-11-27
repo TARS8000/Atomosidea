@@ -27,13 +27,13 @@ var (
 
 // スキャン完了イベントの配信先キュー名。TargetService ごとに別のリストへ振り分ける。
 const (
-	StaticSiteCompletionQueue = "sfsp:completed:static-site"
-	GameCompletionQueue       = "sfsp:completed:game"
-	StreamCompletionQueue     = "sfsp:completed:stream"
-	ProfileCompletionQueue    = "sfsp:completed:profile"
+	StaticSiteCompletionQueue     = "sfsp:completed:static-site"
+	GameCompletionQueue           = "sfsp:completed:game"
+	StreamCompletionQueue         = "sfsp:completed:stream"
+	ProfileCompletionQueue        = "sfsp:completed:profile"
 	VideoThumbnailCompletionQueue = "sfsp:completed:video-thumbnail"
 	GameThumbnailCompletionQueue  = "sfsp:completed:game-thumbnail"
-	SiteThumbnailCompletionQueue = "sfsp:completed:site-thumbnail"
+	SiteThumbnailCompletionQueue  = "sfsp:completed:site-thumbnail"
 )
 
 // ConnectRedis は Redis クライアントを初期化し、Ping が通るまでリトライしてから

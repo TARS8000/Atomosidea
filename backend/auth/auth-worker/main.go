@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -557,6 +559,13 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	// 0. 同じアカウントへのログインの失敗が続いていたら、しばらく受け付けない（パスワードの総当たり対策）
+	if blocked, retry := loginLockedOut(c.Request.Context(), req.Email); blocked {
+		c.Header("Retry-After", strconv.Itoa(int(retry/time.Second)+1))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("ログインの失敗が続いたため、このアカウントには %d 分ほどログインできません。", int((retry+time.Minute-1)/time.Minute))})
+		return
+	}
+
 	// 1. メールアドレスでローカルアカウントを検索する（password_hash は NULL の可能性があるため NullString で受ける）
 	var user User
 	var status string
@@ -566,6 +575,7 @@ func loginHandler(c *gin.Context) {
 	user.PasswordHash = passwordHash.String
 	if err != nil {
 		if err == pgx.ErrNoRows {
+			recordLoginFailure(c.Request.Context(), req.Email)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			return
 		}
@@ -576,9 +586,11 @@ func loginHandler(c *gin.Context) {
 
 	// 2. パスワードを照合する（ユーザー不在と同じ "Invalid credentials" を返し、どちらで失敗したかを区別させない）
 	if user.PasswordHash == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		recordLoginFailure(c.Request.Context(), req.Email)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
+	clearLoginFailures(c.Request.Context(), req.Email)
 
 	// 削除済み・無効なアカウントはログインさせない（パスワード照合後に判定し、存在の有無を漏らさない）
 	if !isLoginAllowedStatus(status) {
@@ -1093,7 +1105,7 @@ func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error
 	userIDStr := userID.String()
 
 	// トークンを読む側の互換性のため、同じユーザー ID を sub / userID / user_id / id に重複して入れている
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	claims := jwt.MapClaims{
 		"sub":      userIDStr,
 		"userID":   userIDStr,
 		"user_id":  userIDStr,
@@ -1102,7 +1114,21 @@ func generateJWT(userID uuid.UUID, username string, isAdmin bool) (string, error
 		"isAdmin":  isAdmin,
 		"exp":      time.Now().Add(time.Hour * 24 * 7).Unix(),
 		"jti":      jti.String(),
-	})
+	}
+	// アカウントを作った時刻（Unix 秒）。アップロード API が「作ったばかりのアカウント」の制限に使う。
+	// 読めなければ入れない（読む側は、無ければ既存のアカウントとして扱う）
+	var createdAt time.Time
+	if dbAuth != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := dbAuth.QueryRow(ctx, "SELECT created_at FROM users WHERE id = $1", userID).Scan(&createdAt); err != nil {
+			log.Printf("WARN: could not read created_at for %s: %v", userIDStr, err)
+		}
+	}
+	if !createdAt.IsZero() {
+		claims["acctCreated"] = createdAt.Unix()
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(jwtSecret)
 }
 
@@ -1151,4 +1177,71 @@ func getGoogleUserData(parent context.Context, code string) (*googleUserInfo, er
 		return nil, errors.New("google email is not verified")
 	}
 	return &info, nil
+}
+
+// ---- ログインの失敗が続いたアカウントのロック（パスワードの総当たり対策） ----
+// nginx の制限は接続元 IP ごとなので、IP を変えながら 1 つのアカウントを狙う攻撃はここで止める。
+// LOGIN_MAX_FAILURES 回（既定 10）失敗すると、最初の失敗から LOGIN_LOCKOUT_MINUTES 分（既定 15）は受け付けない。
+// Redis に届かないときは判定せずに通す。キーはメールアドレスそのものではなくハッシュにする
+
+func loginFailureKey(email string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
+	return "login_fail:" + hex.EncodeToString(sum[:])
+}
+
+func loginLimitSettings() (maxFailures int64, window time.Duration) {
+	maxFailures, window = 10, 15*time.Minute
+	if v, err := strconv.ParseInt(os.Getenv("LOGIN_MAX_FAILURES"), 10, 64); err == nil && v > 0 {
+		maxFailures = v
+	}
+	if v, err := strconv.ParseInt(os.Getenv("LOGIN_LOCKOUT_MINUTES"), 10, 64); err == nil && v > 0 {
+		window = time.Duration(v) * time.Minute
+	}
+	return
+}
+
+// loginLockedOut は、このアカウントがロック中なら true と残り時間を返す。
+func loginLockedOut(ctx context.Context, email string) (bool, time.Duration) {
+	if redisClient == nil || email == "" {
+		return false, 0
+	}
+	maxFailures, _ := loginLimitSettings()
+	key := loginFailureKey(email)
+	n, err := redisClient.Get(ctx, key).Int64()
+	if err != nil || n < maxFailures {
+		return false, 0
+	}
+	ttl, err := redisClient.TTL(ctx, key).Result()
+	if err != nil || ttl <= 0 {
+		return false, 0
+	}
+	return true, ttl
+}
+
+// recordLoginFailure はログインの失敗を 1 回数える（最初の失敗から window のあいだ数える）。
+func recordLoginFailure(ctx context.Context, email string) {
+	if redisClient == nil || email == "" {
+		return
+	}
+	maxFailures, window := loginLimitSettings()
+	key := loginFailureKey(email)
+	n, err := redisClient.Incr(ctx, key).Result()
+	if err != nil {
+		log.Printf("WARN: failed to record login failure: %v", err)
+		return
+	}
+	if n == 1 {
+		redisClient.Expire(ctx, key, window)
+	}
+	if n == maxFailures {
+		log.Printf("WARN: login locked for %s after %d failures", key, n)
+	}
+}
+
+// clearLoginFailures はログインに成功したら失敗の数を消す。
+func clearLoginFailures(ctx context.Context, email string) {
+	if redisClient == nil || email == "" {
+		return
+	}
+	redisClient.Del(ctx, loginFailureKey(email))
 }

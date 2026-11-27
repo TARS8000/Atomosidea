@@ -82,6 +82,17 @@ services:
       MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
       # 許可ホストの追加（カンマ区切り、任意）。localhost / 127.0.0.1 / ::1 は常に許可。空・未設定なら追加なし
       MONITORING_ALLOWED_HOSTS: ${MONITORING_ALLOWED_HOSTS:-}
+      # DoS 対策の見張り（backend/guard.go）。処理待ちの件数を Redis から読む
+      REDIS_ADDR: atmosidea-redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # しきい値を超えたら Discord に知らせる（未設定ならダッシュボードに出すだけ）
+      ALERT_DISCORD_WEBHOOK_URL: ${ALERT_DISCORD_WEBHOOK_URL:-}
+      ALERT_MIN_FREE_DISK_BYTES: ${ALERT_MIN_FREE_DISK_BYTES:-16106127360}
+      ALERT_SCAN_BACKLOG: ${ALERT_SCAN_BACKLOG:-15}
+      ALERT_TRANSCODE_BACKLOG: ${ALERT_TRANSCODE_BACKLOG:-8}
+      ALERT_429_PER_5MIN: ${ALERT_429_PER_5MIN:-300}
+      ALERT_5XX_PER_5MIN: ${ALERT_5XX_PER_5MIN:-50}
+      ALERT_COOLDOWN_MINUTES: ${ALERT_COOLDOWN_MINUTES:-30}
       # 監視対象の compose プロジェクト（Atomosidea 本体）。表示・ログ・MinIO 操作をこのプロジェクトのコンテナに限る。
       # 未設定なら mon-backend が atmosidea-frontend コンテナのプロジェクトを使う
       MONITOR_PROJECT: ${COMPOSE_PROJECT_NAME:-}

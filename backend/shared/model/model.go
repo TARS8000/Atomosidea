@@ -9,15 +9,15 @@ import (
 
 // File はシステムにアップロードされたファイルのメタデータを表す。
 type File struct {
-	ID           uuid.UUID `json:"file_id"`
-	Filename     string    `json:"filename"`
-	Filesize     int64     `json:"filesize"`
-	MimeType     string    `json:"mime_type"`
-	SHA256       string    `json:"sha256"`
-	StoragePath  string    `json:"storage_path"`
-	FileType     string    `json:"file_type"` // 例: "video", "html", "zip", "other"
+	ID            uuid.UUID `json:"file_id"`
+	Filename      string    `json:"filename"`
+	Filesize      int64     `json:"filesize"`
+	MimeType      string    `json:"mime_type"`
+	SHA256        string    `json:"sha256"`
+	StoragePath   string    `json:"storage_path"`
+	FileType      string    `json:"file_type"`      // 例: "video", "html", "zip", "other"
 	TargetService string    `json:"target_service"` // 例: "static-site", "game", "stream", "other"
-	CreatedAt    time.Time `json:"created_at"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // ScanJob はファイル1件に対するスキャンジョブを表す。

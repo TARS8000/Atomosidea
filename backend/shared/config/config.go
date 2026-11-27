@@ -40,7 +40,7 @@ func LoadConfig() (config Config, err error) {
 	// SetDefault でキーを登録しておくことで、環境変数の値も Unmarshal 対象になる。
 	viper.SetDefault("REDIS_ADDR", "redis:6379") // REDIS_ADDR のデフォルト値を追加（環境変数がない場合やViperマッピング用）
 	viper.SetDefault("REDIS_PASSWORD", "")       // REDIS_PASSWORD のバインド用デフォルト値
-	viper.SetDefault("REDIS_DB", 0)               // RedisDB のデフォルト値を追加
+	viper.SetDefault("REDIS_DB", 0)              // RedisDB のデフォルト値を追加
 
 	err = viper.Unmarshal(&config)
 	return

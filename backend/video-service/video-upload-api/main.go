@@ -506,6 +506,9 @@ func main() {
 	go videoWorker(ctx)
 
 	// 7. ルーティングを設定して HTTP サーバーを起動する（/api 配下はすべて JWT 認証が必要）
+	// 保存量・ディスク・処理待ちの判定と、分割アップロードの準備
+	initUploadGuard(context.Background(), maxVideoUploadBytes)
+
 	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
 	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
 	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
@@ -516,6 +519,8 @@ func main() {
 	api.Use(authMiddleware())
 	{
 		api.POST("/videos/upload", uploadLimitMiddleware(uploadLimits), uploadHandler)
+		// 分割アップロード（Cloudflare の 100 MB 制限への対応）
+		registerChunkRoutes(api, "/videos/upload/chunks")
 		api.DELETE("/videos/:id", deleteHandler)
 		api.DELETE("/videos/:id/thumbnail", deleteThumbnailHandler)
 	}
@@ -577,16 +582,19 @@ func uploadHandler(c *gin.Context) {
 		}
 	}()
 
-	// 3. 動画ファイルを取り出し、ファイル単体のサイズを確認する
-	file, header, err := c.Request.FormFile("video")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Video file is required"})
+	// 3. 動画ファイルを取り出し、ファイル単体のサイズを確認する（分割アップロードなら upload_id から組み立て済みのファイルを開く）
+	file, videoOrigName, videoSize, ok := openMainUpload(c, "video")
+	if !ok {
 		return
 	}
 	defer file.Close()
 
-	if header.Size > maxVideoUploadBytes {
+	if videoSize > maxVideoUploadBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, tooLarge)
+		return
+	}
+	// 保存量・ディスクの空き・処理待ち（検査・変換）を確かめる
+	if !guardUploadSize(c, videoSize) {
 		return
 	}
 
@@ -620,7 +628,7 @@ func uploadHandler(c *gin.Context) {
 	}
 
 	// 6. SFSP へファイルを送ってスキャンを依頼する（接続できない場合は 503、それ以外の失敗は 500）
-	originalFilename := displayFilename(header.Filename)
+	originalFilename := displayFilename(videoOrigName)
 
 	sfspRespData, sfspStatus, sfspBody, err := postFileToSFSP(c.Request.Context(), file, originalFilename, "stream")
 	if err != nil {
@@ -677,8 +685,8 @@ func uploadHandler(c *gin.Context) {
 		teamIDVal = nil
 	}
 	_, err = db.Exec(context.Background(),
-		"INSERT INTO videos (id, title, description, filename, uploader_id, team_id, status, sfsp_job_id, processing_details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-		videoID, title, description, originalFilename, uploaderUUID, teamIDVal, videoStatus, sfspJobID, processingDetails)
+		"INSERT INTO videos (id, title, description, filename, uploader_id, team_id, status, sfsp_job_id, processing_details, upload_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+		videoID, title, description, originalFilename, uploaderUUID, teamIDVal, videoStatus, sfspJobID, processingDetails, videoSize)
 	if err != nil {
 		logger.Errorf("Error creating initial video record: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create video record"})
@@ -1466,29 +1474,4 @@ func removeHLSMinIO(ctx context.Context, videoID string) error {
 		}
 	}
 	return firstErr
-}
-
-// uploadLimitMiddleware はユーザーごとのアップロード制限（shared/ratelimit）をかける。authMiddleware の後に置く。
-// ゲーム・静的サイト・動画で同じ Redis のキーを使うので、本数は 3 種類の合計で数える。
-// 管理者は制限しない。Redis に届かないときはログを出して通す（サーバー全体の同時数は nginx でも制限している）。
-func uploadLimitMiddleware(limits ratelimit.UploadLimits) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if c.GetBool("isAdmin") {
-			c.Next()
-			return
-		}
-		userID := c.GetString("userID")
-		d, err := ratelimit.CheckUpload(c.Request.Context(), queue.RedisClient, limits, userID)
-		if err != nil {
-			logger.Warnf("Upload rate limit check failed, allowing the request: %v", err)
-		}
-		if !d.Allowed {
-			logger.Warnf("Upload rejected by per-user rate limit: user=%s reason=%s", userID, d.Reason)
-			c.Header("Retry-After", strconv.Itoa(int(d.RetryAfter/time.Second)+1))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": d.Reason})
-			return
-		}
-		defer d.Release()
-		c.Next()
-	}
 }

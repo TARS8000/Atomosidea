@@ -26,6 +26,7 @@ import LockIcon from '@mui/icons-material/Lock';
 import GroupIcon from '@mui/icons-material/Group';
 import axios from 'axios';
 import { teamApi, Team } from '../api/team';
+import { uploadInChunks } from '../api/chunkedUpload';
 
 // 公開範囲。'public' は全体公開、'team' は選択したチーム限定の投稿。
 type Scope = 'public' | 'team';
@@ -34,7 +35,7 @@ type Scope = 'public' | 'team';
 interface UploadField {
   /** 画面に表示する種別名 */
   label: string;
-  /** multipart フォームでファイル本体を入れるフィールド名（バックエンドごとに異なる） */
+  /** multipart でファイル本体を直接送るときのフィールド名（今は分割アップロードで送るので使わない。バックエンドは両方受け付ける） */
   fileField: string;
   /** アップロード先の API エンドポイント */
   endpoint: string;
@@ -230,7 +231,6 @@ const UnifiedUploadPage = () => {
     if (scope === 'team') {
       formData.append('team_id', selectedTeam);
     }
-    formData.append(UPLOAD_TYPES[type].fileField, file);
     if (thumbnail) {
       formData.append('thumbnail', thumbnail);
     }
@@ -241,14 +241,21 @@ const UnifiedUploadPage = () => {
     setSuccess('');
     setUploadProgress(0);
 
-    // 4. アップロードし、進捗をプログレスバーへ反映する
+    // 4. アップロードし、進捗をプログレスバーへ反映する。
+    // ファイル本体は分割して送り（Cloudflare の 1 リクエスト 100 MB 制限への対応）、最後にフォーム項目と
+    // upload_id を送る。進捗はファイル本体の送信を 0〜95%、最後の送信を 95〜100% として表示する
     try {
+      const token = localStorage.getItem('token');
+      const uploadId = await uploadInChunks(UPLOAD_TYPES[type].endpoint, file, token, (loaded, total) => {
+        setUploadProgress(Math.round((loaded * 95) / Math.max(total, 1)));
+      });
+      formData.append('upload_id', uploadId);
       const response = await axios.post(UPLOAD_TYPES[type].endpoint, formData, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+        headers: { Authorization: `Bearer ${token}` },
         onUploadProgress: (progressEvent) => {
           // total が取れない場合に 0 除算しないよう 1 で代用する
-          const percentCompleted = Math.round((progressEvent.loaded * 100) / (progressEvent.total ?? 1));
-          setUploadProgress(percentCompleted);
+          const ratio = progressEvent.loaded / (progressEvent.total ?? 1);
+          setUploadProgress(95 + Math.round(ratio * 5));
         },
       });
       setSuccess('アップロードが開始されました。処理が完了するまでしばらくお待ちください。');

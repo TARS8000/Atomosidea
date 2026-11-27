@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Folder, FileText, Database, ChevronRight, ChevronDown, ArrowLeft, Upload, Trash2, HardDrive,
-  X, Activity, Users, Cpu, Search, Boxes, AlertTriangle, RotateCcw
+  X, Activity, Users, Cpu, Search, Boxes, AlertTriangle, RotateCcw, ShieldAlert, ListOrdered
 } from 'lucide-react';
 
 // --- 分類 ---
@@ -725,6 +725,8 @@ export default function App() {
   const [volumes, setVolumes] = useState([]);
   const [showVolumes, setShowVolumes] = useState(false);
   const [activeUsers, setActiveUsers] = useState(0);
+  // DoS 対策の状態（/api/guard/status。ディスクの空き・処理待ち・429 などの件数・超えているしきい値）
+  const [guard, setGuard] = useState(null);
 
   // フローチャートと選択の UI 状態
   // hoveredName: マウスを乗せているコンテナ / showSharedEdges: 共通基盤への矢印を常に出すか
@@ -789,6 +791,7 @@ export default function App() {
   const fetchActiveUsers = useCallback(() => fetchJson('/api/connections/count', (d) => setActiveUsers(d.count)), [fetchJson]);
   const fetchTopology = useCallback(() => fetchJson('/api/topology', (d) => setTopology(Array.isArray(d) ? d : [])), [fetchJson]);
   const fetchVolumes = useCallback(() => fetchJson('/api/volumes', (d) => setVolumes(Array.isArray(d) ? d : [])), [fetchJson]);
+  const fetchGuard = useCallback(() => fetchJson('/api/guard/status', (d) => setGuard(d || null)), [fetchJson]);
 
   // 初回に全データを取得し、その後はデータごとの間隔で定期的に取り直す
   useEffect(() => {
@@ -797,20 +800,24 @@ export default function App() {
     fetchContainerStats();
     fetchTopology();
     fetchVolumes();
+    fetchGuard();
     const containerInterval = setInterval(fetchContainers, 3000);
     const statsInterval = setInterval(fetchContainerStats, 3000);
     const userInterval = setInterval(fetchActiveUsers, 10000);
     // コンテナの追加・削除やネットワーク・ボリュームの変化を反映するため、トポロジーとボリュームも定期的に取り直す
     const topologyInterval = setInterval(fetchTopology, 15000);
     const volumeInterval = setInterval(fetchVolumes, 15000);
+    // バックエンドは 1 分ごとに集めるので、それより少し短い間隔で読む
+    const guardInterval = setInterval(fetchGuard, 30000);
     return () => {
       clearInterval(containerInterval);
       clearInterval(statsInterval);
       clearInterval(userInterval);
       clearInterval(topologyInterval);
       clearInterval(volumeInterval);
+      clearInterval(guardInterval);
     };
-  }, [fetchContainers, fetchActiveUsers, fetchContainerStats, fetchTopology, fetchVolumes]);
+  }, [fetchContainers, fetchActiveUsers, fetchContainerStats, fetchTopology, fetchVolumes, fetchGuard]);
 
   // フローチャート領域の幅を監視する（ウィンドウのリサイズや詳細ペインの開閉で変わる）
   useEffect(() => {
@@ -1172,12 +1179,27 @@ export default function App() {
           <Metric icon={Users} label="Users" value={activeUsers} sub="5min" title="atmosidea-frontend のログに出た IP の数（推定）" />
           <Metric icon={Cpu} label="CPU" value={`${load.cpu.toFixed(0)}%`} title="コンテナ合計（1 コア = 100%）" />
           <Metric icon={HardDrive} label="Memory" value={formatBytes(load.mem)} sub={load.host ? `/ ${formatBytes(load.host)}` : ''} title="コンテナ合計 / ホストのメモリ" />
+          {guard && (
+            <>
+              <Metric icon={HardDrive} label="Disk" value={formatBytes(guard.disk_free)} sub={guard.disk_total ? `/ ${formatBytes(guard.disk_total)}` : ''} title="ディスクの空き / 全体（Docker のデータ領域）。空きが少ないとアップロードを断る" />
+              <Metric icon={ListOrdered} label="Queue" value={`${guard.scan_backlog < 0 ? '-' : guard.scan_backlog} / ${guard.transcode_backlog < 0 ? '-' : guard.transcode_backlog}`} sub="検査/変換" title="検査待ち / 動画の変換待ち（処理中を含む）。多いとアップロードを断る" />
+              <Metric icon={ShieldAlert} label="429" value={guard.last_5m?.['429'] ?? 0} sub={`5min · 1h ${guard.last_1h?.['429'] ?? 0}`} title={`回数制限で断った件数（nginx のログ）。5xx: 5min ${guard.last_5m?.['5xx'] ?? 0} / 1h ${guard.last_1h?.['5xx'] ?? 0}`} />
+            </>
+          )}
           <button onClick={() => setShowVolumes(true)} className="hud-cut-sm text-[13px] font-bold tracking-wider px-3 py-2.5 border border-cyan-500/35 text-cyan-200 hover:border-cyan-300 hover:bg-cyan-500/10 flex items-center gap-1.5 shrink-0">
             <HardDrive size={14} />VOLUMES
           </button>
           <Clock />
         </div>
       </header>
+
+      {/* DoS 対策の警告（ディスク・処理待ち・429 / 5xx の件数がしきい値を超えているとき） */}
+      {guard?.alerts?.length > 0 && (
+        <div className="mx-4 mt-2 px-3 py-2 border border-rose-500/60 bg-rose-500/10 text-rose-200 text-sm flex flex-wrap items-center gap-x-4 gap-y-1">
+          <span className="flex items-center gap-1.5 font-bold tracking-wider"><ShieldAlert size={15} />GUARD</span>
+          {guard.alerts.map((a) => <span key={a}>{a}</span>)}
+        </div>
+      )}
 
       {/* 概要バー: 件数・要確認・表示の切り替え・検索 */}
       <SummaryBar

@@ -222,7 +222,7 @@ func main() {
 	{
 		api.GET("", listVideosHandler)
 		api.GET("/:id", videoDetailsHandler)
-		api.PUT("/:id", authMiddleware(), updateVideoHandler)
+		api.PUT("/:id", authMiddleware(), imageLimitMiddleware(), updateVideoHandler)
 	}
 
 	logger.Info("Stream service (metadata) starting on port 8081")

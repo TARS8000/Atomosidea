@@ -279,6 +279,9 @@ func main() {
 	}
 
 	// 7. ルーティングを設定する（閲覧系は認証不要、作成・更新・削除は authMiddleware を通す）
+	// 保存量・ディスク・処理待ちの判定と、分割アップロードの準備
+	initUploadGuard(context.Background(), maxSiteUploadBytes)
+
 	// ユーザーごとのアップロード制限（UPLOAD_LIMIT_*、未設定なら既定値）
 	uploadLimits := ratelimit.LoadUploadLimitsFromEnv()
 	logger.Infof("Per-user upload limits: %d/hour, %d/day, %d concurrent", uploadLimits.PerHour, uploadLimits.PerDay, uploadLimits.Concurrent)
@@ -292,7 +295,9 @@ func main() {
 	auth.Use(authMiddleware)
 	{
 		auth.POST("/api/static-sites/upload", uploadLimitMiddleware(uploadLimits), uploadStaticSiteHandler)
-		auth.PUT("/api/static-sites/:id", updateStaticSiteHandler)
+		// 分割アップロード（Cloudflare の 100 MB 制限への対応）
+		registerChunkRoutes(auth, "/api/static-sites/upload/chunks")
+		auth.PUT("/api/static-sites/:id", imageLimitMiddleware(), updateStaticSiteHandler)
 		auth.DELETE("/api/static-sites/:id", deleteStaticSiteHandler)
 		auth.DELETE("/api/static-sites/:id/thumbnail", deleteThumbnailHandler)
 	}
@@ -576,22 +581,20 @@ func uploadStaticSiteHandler(c *gin.Context) {
 		return
 	}
 
-	// 3. サイト本体のファイルを取り出し、サイズを確認して開く
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Failed to get file: %v", err)})
-		return
-	}
-	if fileHeader.Size > maxSiteUploadBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("File too large (max %d bytes)", maxSiteUploadBytes)})
-		return
-	}
-	file, err := fileHeader.Open()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to open uploaded file: %v", err)})
+	// 3. サイト本体のファイルを開いてサイズを確認する（分割アップロードなら upload_id から組み立て済みのファイルを開く）
+	file, fileName, fileSize, ok := openMainUpload(c, "file")
+	if !ok {
 		return
 	}
 	defer file.Close()
+	if fileSize > maxSiteUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("File too large (max %d bytes)", maxSiteUploadBytes)})
+		return
+	}
+	// 保存量・ディスクの空き・処理待ちを確かめる
+	if !guardUploadSize(c, fileSize) {
+		return
+	}
 
 	// 4. ファイル形式チェック（中身から判定し、ZIP 以外は拒否する）
 	contentType, err := sniffContentType(file)
@@ -631,8 +634,8 @@ func uploadStaticSiteHandler(c *gin.Context) {
 	// 行を先に作成し、sfsp-api の応答を受けたらすぐに job_id を書き込む。
 	// こうすることで完了イベントが届いた時点で行が必ず存在する（残る隙間はワーカーの再試行で吸収する）。
 	_, err = db.ExecContext(reqCtx,
-		"INSERT INTO static_sites (id, user_id, title, description, status, minio_path, team_id, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, NOW(), NOW())",
-		siteID, userUUID, title, description, "", teamIDVal)
+		"INSERT INTO static_sites (id, user_id, title, description, status, minio_path, team_id, upload_bytes, created_at, updated_at) VALUES ($1, $2, $3, $4, 'scanning', $5, $6, $7, NOW(), NOW())",
+		siteID, userUUID, title, description, "", teamIDVal, fileSize)
 	if err != nil {
 		logger.Errorf("ERROR: Failed to insert static site into DB: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register static site"})
@@ -671,7 +674,7 @@ func uploadStaticSiteHandler(c *gin.Context) {
 	}
 
 	// 9. サイト ZIP を sfsp-api へ送り、job_id を行に記録する
-	sfspRespData, err := uploadToSFSP(reqCtx, file, fileHeader.Filename, "static-site")
+	sfspRespData, err := uploadToSFSP(reqCtx, file, fileName, "static-site")
 	if err != nil {
 		logger.Errorf("Error forwarding file to SFSP: %v", err)
 		abort(http.StatusServiceUnavailable, "File scanning service is unavailable")
@@ -1024,29 +1027,4 @@ func deleteThumbnailHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Thumbnail deleted successfully"})
-}
-
-// uploadLimitMiddleware はユーザーごとのアップロード制限（shared/ratelimit）をかける。authMiddleware の後に置く。
-// ゲーム・静的サイト・動画で同じ Redis のキーを使うので、本数は 3 種類の合計で数える。
-// 管理者は制限しない。Redis に届かないときはログを出して通す（サーバー全体の同時数は nginx でも制限している）。
-func uploadLimitMiddleware(limits ratelimit.UploadLimits) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if c.GetBool("isAdmin") {
-			c.Next()
-			return
-		}
-		userID := c.GetString("userID")
-		d, err := ratelimit.CheckUpload(c.Request.Context(), queue.RedisClient, limits, userID)
-		if err != nil {
-			logger.Warnf("Upload rate limit check failed, allowing the request: %v", err)
-		}
-		if !d.Allowed {
-			logger.Warnf("Upload rejected by per-user rate limit: user=%s reason=%s", userID, d.Reason)
-			c.Header("Retry-After", strconv.Itoa(int(d.RetryAfter/time.Second)+1))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": d.Reason})
-			return
-		}
-		defer d.Release()
-		c.Next()
-	}
 }

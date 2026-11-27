@@ -237,8 +237,8 @@ func main() {
 		api.GET("/status", authMiddleware(), getStatusHandler)
 		api.GET("/:userId", getProfileHandler)
 		api.PUT("", authMiddleware(), updateProfileHandler)
-		api.PUT("/icon", authMiddleware(), updateIconHandler)
-		api.PUT("/background", authMiddleware(), updateBackgroundHandler)
+		api.PUT("/icon", authMiddleware(), imageLimitMiddleware(), updateIconHandler)
+		api.PUT("/background", authMiddleware(), imageLimitMiddleware(), updateBackgroundHandler)
 	}
 
 	log.Println("Profile service starting on port 8084")
