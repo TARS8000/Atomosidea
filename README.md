@@ -198,7 +198,7 @@ graph LR
 | 分類 | 技術 |
 |---|---|
 | フロントエンド | React、Vite、TypeScript、MUI、Axios、React Router、hls.js、jwt-decode、react-image-crop |
-| バックエンド | Go 1.25、Gin（監視サービスは gorilla/mux）、pgx/v5、minio-go/v7、go-redis/v8、golang-jwt/v5 |
+| バックエンド | Go 1.27、Gin（監視サービスは gorilla/mux）、pgx/v5、minio-go/v7、go-redis/v8、golang-jwt/v5 |
 | データ | PostgreSQL 16、Redis 7、MinIO（S3 互換） |
 | セキュリティ | ClamAV、YARA（Docker サンドボックスで実行） |
 | 動画処理 | FFmpeg |

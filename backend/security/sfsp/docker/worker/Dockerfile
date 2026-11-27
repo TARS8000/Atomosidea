@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
-# Use Go 1.25 as required by dependencies
-FROM golang:1.25-alpine AS builder
+# Go 1.27 系（go.mod の go 1.27.4 と揃える。上げるときは全 Dockerfile と go.mod をまとめて変える）
+FROM golang:1.27.4-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ RUN go mod download
 # Build the sfsp-worker application
 RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/sfsp-worker ./cmd/sfsp-worker
 
-FROM alpine:latest
+FROM alpine:3.24.4
 
 WORKDIR /app
 

@@ -1,5 +1,5 @@
 # ビルドステージ
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27.4-alpine3.24 AS builder
 
 # Git や証明書など依存ライブラリの取得に必要なツールをインストール
 RUN apk add --no-cache git ca-certificates
@@ -21,7 +21,7 @@ COPY . .
 RUN GOOS=linux go build -o /monitoring-backend .
 
 # 実行ステージ
-FROM alpine:latest
+FROM alpine:3.24.4
 
 # TLS通信等に必要なルート証明書をコピー
 RUN apk add --no-cache ca-certificates

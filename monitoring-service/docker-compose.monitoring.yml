@@ -26,15 +26,16 @@ services:
   # ここから読むので、もともと必要）・ログ・archive / export でのファイルの読み取りなど）。
   # GET の /containers/{id}/attach/ws（WebSocket）も通るので、stdin_open のコンテナがあればその標準入力には書き込める（今は無い）
   mon-docker-proxy:
-    image: tecnativa/docker-socket-proxy:0.3.0 # ルートの docker-compose.yml の sfsp-docker-proxy と同じ版
+    image: tecnativa/docker-socket-proxy:v0.5.0 # ルートの docker-compose.yml の sfsp-docker-proxy と同じ版
     container_name: mon-docker-proxy
     restart: always
     # ログの追従（/ws/logs）が、ログの出ないコンテナで HAProxy の既定のタイムアウト（10 分）で切れないよう 24 時間に延ばしてから
     # 元の entrypoint を実行する
+    # （v0.4 以降の docker-entrypoint.sh は haproxy.cfg を /tmp/haproxy.cfg に書き出す）
     entrypoint:
       - sh
       - -c
-      - sed -i -e 's/timeout client 10m/timeout client 24h/' -e 's/timeout server 10m/timeout server 24h/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      - sed -i -e 's/timeout client 10m/timeout client 24h/' -e 's/timeout server 10m/timeout server 24h/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /tmp/haproxy.cfg
     environment:
       CONTAINERS: 1 # ContainerList / ContainerInspect / ContainerStats / ContainerLogs（GET だけ）
       VOLUMES: 1 # VolumeList
@@ -63,6 +64,8 @@ services:
       ALLOW_RESTARTS: 0
       ALLOW_START: 0
       ALLOW_STOP: 0
+      ALLOW_PAUSE: 0 # v0.4 で増えた項目（既定でも拒否だが明示する）
+      ALLOW_UNPAUSE: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     security_opt:

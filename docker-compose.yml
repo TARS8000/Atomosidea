@@ -182,7 +182,7 @@ services:
   # Cache Service (内部接続のみ。パスワード必須)
   # ==========================================
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine
     container_name: atmosidea-redis
     restart: always
     deploy: *limits-medium
@@ -207,7 +207,7 @@ services:
   minio:
     build:
       context: ./backend/minio
-    image: atmosidea-minio:RELEASE.2025-09-07T16-13-09Z
+    image: atmosidea-minio:RELEASE.2025-10-15T17-29-55Z
     container_name: atmosidea-minio
     restart: always
     deploy:
@@ -234,7 +234,7 @@ services:
   # ==========================================
   # minio サービスがビルドしたイメージ（mc と sh も入っている）を使う。レジストリへは取りに行かない
   minio-init:
-    image: atmosidea-minio:RELEASE.2025-09-07T16-13-09Z
+    image: atmosidea-minio:RELEASE.2025-10-15T17-29-55Z
     pull_policy: never
     container_name: atmosidea-minio-init
     restart: "no"
@@ -808,15 +808,16 @@ services:
   # リクエスト本文（Privileged や Binds など）は検査しないので、sfsp-worker からは直接つながず、
   # 本文まで検査する sfsp-docker-guard を間に置く。ここに届くのは sfsp-docker-guard だけ（sfsp-docker-net）
   sfsp-docker-proxy:
-    image: tecnativa/docker-socket-proxy:0.3.0
+    image: tecnativa/docker-socket-proxy:v0.5.0
     container_name: sfsp-docker-proxy
     restart: always
     # 既定の HAProxy のタイムアウト（10 分）はサンドボックスの上限（sandboxTimeout = 30 分）より短く、
     # 長いスキャンの ContainerWait が 504 で切れるため 35 分に延ばしてから元の entrypoint を実行する
+    # （v0.4 以降の docker-entrypoint.sh は haproxy.cfg を /tmp/haproxy.cfg に書き出す）
     entrypoint:
       - sh
       - -c
-      - sed -i -e 's/timeout client 10m/timeout client 35m/' -e 's/timeout server 10m/timeout server 35m/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      - sed -i -e 's/timeout client 10m/timeout client 35m/' -e 's/timeout server 10m/timeout server 35m/' /usr/local/etc/haproxy/haproxy.cfg.template && exec docker-entrypoint.sh haproxy -f /tmp/haproxy.cfg
     environment:
       CONTAINERS: 1 # create / start / wait / logs / delete / inspect
       IMAGES: 1 # ImageInspect / ImagePull（イメージが無いとき）
@@ -843,6 +844,8 @@ services:
       SESSION: 0
       GRPC: 0
       ALLOW_RESTARTS: 0
+      ALLOW_PAUSE: 0 # v0.4 で増えた項目（既定でも拒否だが明示する）
+      ALLOW_UNPAUSE: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     security_opt:

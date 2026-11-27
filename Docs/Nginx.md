@@ -43,7 +43,7 @@ NginxはDocker Composeにより`frontend`サービスとして定義され、`ht
 
 ### ビルドフロー（`frontend/Dockerfile`）
 
-1. **ビルドステージ:** `node:20-alpine` で `npm ci --legacy-peer-deps`（`package-lock.json` どおりに依存を入れる）→ `npm run build` を実行し、`dist` を生成。`VITE_STATIC_SITE_DOMAIN` などのビルド引数を取り込みます。
+1. **ビルドステージ:** `node:24.22.3-alpine` で `npm ci --legacy-peer-deps`（`package-lock.json` どおりに依存を入れる）→ `npm run build` を実行し、`dist` を生成。`VITE_STATIC_SITE_DOMAIN` などのビルド引数を取り込みます。
 2. **プロダクションステージ:** `nginx:stable-alpine` にビルド成果物を `/usr/share/nginx/html` へ、`nginx.conf` を `/etc/nginx/nginx.conf` へコピーします。
 3. コンテナ起動時は `nginx -g "daemon off;"` でフォアグラウンド起動します。
 
@@ -82,6 +82,8 @@ Atomosideaは**1つのMinIOインスタンス**（`minio:9000`）を持ち、Ngi
 | `video_storage` | `minio:9000` | 動画・サムネイル（`videos`バケット） |
 
 すべてのMinIOストレージは内部ポート`9000`で統一されています。
+
+MinIO へ転送する location（サブドメイン配信の `location /`・`@fallback_static_site`、HLS、各サムネイル、プロフィール画像）には `limit_except GET HEAD { deny all; }` を入れ、外からの PUT・POST・DELETE などは 403 にしています。正規のアップロードは各 upload-api が MinIO SDK で直接書き込むので、nginx 経由で MinIO に書き込む経路はありません（MinIO の脆弱性 CVE-2025-62506 などを外から突かれないようにするため）。
 
 > **補足:** サムネイルは専用バケットではなく、動画サムネイルが`videos`バケット内の`thumbnails/<id>`キー、static-siteサムネイルが`static-sites`バケット内の`thumbnails/<id>`キーに格納されます。独立した`thumbnails`バケットは存在しません（ゲームのサムネイルも`games`バケットの`thumbnails/`以下です）。
 

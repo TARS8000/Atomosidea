@@ -1,5 +1,5 @@
-# Build stage (Node.js 20 へ変更)
-FROM node:20-alpine AS builder
+# Build stage（Node.js 24 LTS。版を固定する）
+FROM node:24.22.3-alpine AS builder
 WORKDIR /app
 
 # Set build arguments

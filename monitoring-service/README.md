@@ -13,9 +13,9 @@
 | コンテナ | 画像 / ビルド | 役割 |
 |---|---|---|
 | `mon-nginx` | `nginx:alpine` | `127.0.0.1:8090`→80。静的フロントを`auth_request`による認証付きで配信し、`/api/`（REST のみ）と`/ws`（WebSocket の Upgrade ヘッダーを転送）を`mon-backend:8080`へプロキシ。`client_max_body_size 32m`（MinIO へのアップロード用。既定の 1MB だと 413 になる） |
-| `mon-backend` | `golang:1.25-alpine`（マルチステージビルド） | `mon-docker-proxy` 経由でコンテナ一覧・統計・MinIO操作・WebSocketログストリーミングを提供。全ルートでHost/Origin検証とHTTP Basic認証を行う。内部ポート8080 |
-| `mon-docker-proxy` | `tecnativa/docker-socket-proxy:0.3.0` | `mon-backend` 専用の読み取り専用 Docker API プロキシ（`docker.sock` を `:ro` でマウントするのはこれだけ）。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけを通し、`POST=0`（コンテナの作成・exec・restart・stop・削除などは 403）。ただし `/containers` の GET はすべて通るので、inspect（環境変数）・ログ・archive / export でのファイルの読み取りはでき、GET の `/containers/{id}/attach/ws`（WebSocket）も通るので、標準入力を開いた（`stdin_open: true` の）コンテナがあれば、その標準入力に書き込めてしまう（今の compose にそのようなコンテナは無い）。ログの追従が切れないよう HAProxy のタイムアウトを 24 時間にしている |
-| `mon-frontend`（コンテナ名`mon-frontend-builder`） | `node:20-alpine` | `npm run build`で`./frontend/dist`へ出力して終了（ビルド専用、稼働しない） |
+| `mon-backend` | `golang:1.27.4-alpine3.24`（マルチステージビルド） | `mon-docker-proxy` 経由でコンテナ一覧・統計・MinIO操作・WebSocketログストリーミングを提供。全ルートでHost/Origin検証とHTTP Basic認証を行う。内部ポート8080 |
+| `mon-docker-proxy` | `tecnativa/docker-socket-proxy:v0.5.0` | `mon-backend` 専用の読み取り専用 Docker API プロキシ（`docker.sock` を `:ro` でマウントするのはこれだけ）。`CONTAINERS` / `VOLUMES` / `PING` の GET/HEAD だけを通し、`POST=0`（コンテナの作成・exec・restart・stop・削除などは 403）。ただし `/containers` の GET はすべて通るので、inspect（環境変数）・ログ・archive / export でのファイルの読み取りはでき、GET の `/containers/{id}/attach/ws`（WebSocket）も通るので、標準入力を開いた（`stdin_open: true` の）コンテナがあれば、その標準入力に書き込めてしまう（今の compose にそのようなコンテナは無い）。ログの追従が切れないよう HAProxy のタイムアウトを 24 時間にしている |
+| `mon-frontend`（コンテナ名`mon-frontend-builder`） | `node:24.22.3-alpine` | `npm run build`で`./frontend/dist`へ出力して終了（ビルド専用、稼働しない） |
 
 ### 依存関係
 
@@ -193,12 +193,12 @@ docker compose --env-file ../.env -f docker-compose.monitoring.yml up -d --build
 ```
 monitoring-service/
 ├── backend/                    # Goバックエンド
-│   ├── Dockerfile              # golang:1.25-alpine (multi-stage build)。go.mod / go.sum をコピーして go mod download（go mod tidy はしない）
+│   ├── Dockerfile              # golang:1.27.4-alpine3.24 (multi-stage build)。go.mod / go.sum をコピーして go mod download（go mod tidy はしない）
 │   ├── go.mod
 │   ├── go.sum                  # コミット済み（ビルド時の整合性検証に使う）
 │   └── main.go                 # 全API・WebSocket・MinIOロジック
 ├── frontend/                   # React/Viteフロントエンド
-│   ├── Dockerfile              # node:20-alpine、`npm run build`でdist出力
+│   ├── Dockerfile              # node:24.22.3-alpine、`npm ci` → `npm run build`でdist出力
 │   ├── .eslintrc.cjs           # ESLint の設定（`npm run lint`）
 │   ├── package.json
 │   └── src/App.jsx             # 分類・状態判定・エラー検出・ツリー/詳細UI

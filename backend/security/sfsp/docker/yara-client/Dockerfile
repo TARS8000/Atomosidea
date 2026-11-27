@@ -1,5 +1,5 @@
 # Use a minimal base image
-FROM alpine:latest
+FROM alpine:3.24.4
 
 # Install YARA
 RUN apk add --no-cache yara
